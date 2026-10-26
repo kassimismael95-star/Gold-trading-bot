@@ -5,18 +5,16 @@ import threading
 import datetime
 from flask import Flask, request, jsonify
 from metaapi_cloud_sdk import MetaApi
-
-# --- THE CRITICAL PATCH TO FIX RENDER ERROR ---
-import nest_asyncio
-nest_asyncio.apply()
-# ----------------------------------------------
+from waitress import serve
 
 app = Flask(__name__)
 
 # --- SECURE CREDENTIAL RECEPTACLES ---
-TELEGRAM_TOKEN = "PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE"
-METAAPI_TOKEN = "PASTE_YOUR_METAAPI_TOKEN_HERE"
-metaapi = MetaApi(METAAPI_TOKEN)
+TELEGRAM_TOKEN = "8926217564:AAFUiGwHb3PNFT8pIsTAWXsKlQG92UeojPA
+"
+METAAPI_TOKEN = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJfaWQiOiI3NTQ4ZGE1ODFjMzY1YTQzN2E1MjA5ODU0MTZhNThhNyIsImFjY2Vzc1J1bGVzIjpbeyJpZCI6InRyYWRpbmctYWNjb3VudC1tYW5hZ2VtZW50LWFwaSIsIm1ldGhvZHMiOlsidHJhZGluZy1hY2NvdW50LW1hbmFnZW1lbnQtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVzdC1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcnBjLWFwaSIsIm1ldGhvZHMiOlsibWV0YWFwaS1hcGk6d3M6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6Im1ldGFhcGktcmVhbC10aW1lLXN0cmVhbWluZy1hcGkiLCJtZXRob2RzIjpbIm1ldGFhcGktYXBpOndzOnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJtZXRhc3RhdHMtYXBpIiwibWV0aG9kcyI6WyJtZXRhc3RhdHMtYXBpOnJlc3Q6cHVibGljOio6KiJdLCJyb2xlcyI6WyJyZWFkZXIiLCJ3cml0ZXIiXSwicmVzb3VyY2VzIjpbIio6JFVTRVJfSUQkOioiXX0seyJpZCI6InJpc2stbWFuYWdlbWVudC1hcGkiLCJtZXRob2RzIjpbInJpc2stbWFuYWdlbWVudC1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoiY29weWZhY3RvcnktYXBpIiwibWV0aG9kcyI6WyJjb3B5ZmFjdG9yeS1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciIsIndyaXRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfSx7ImlkIjoibXQtbWFuYWdlci1hcGkiLCJtZXRob2RzIjpbIm10LW1hbmFnZXItYXBpOnJlc3Q6ZGVhbGluZzoqOioiLCJtdC1tYW5hZ2VyLWFwaTpyZXN0OnB1YmxpYzoqOioiXSwicm9sZXMiOlsicmVhZGVyIiwid3JpdGVyIl0sInJlc291cmNlcyI6WyIqOiRVU0VSX0lEJDoqIl19LHsiaWQiOiJiaWxsaW5nLWFwaSIsIm1ldGhvZHMiOlsiYmlsbGluZy1hcGk6cmVzdDpwdWJsaWM6KjoqIl0sInJvbGVzIjpbInJlYWRlciJdLCJyZXNvdXJjZXMiOlsiKjokVVNFUl9JRCQ6KiJdfV0sImlnbm9yZVJhdGVMaW1pdHMiOmZhbHNlLCJ0b2tlbklkIjoiMjAyMTAyMTMiLCJpbXBlcnNvbmF0ZWQiOmZhbHNlLCJyZWFsVXNlcklkIjoiNzU0OGRhNTgxYzM2NWE0MzdhNTIwOTg1NDE2YTU4YTciLCJpYXQiOjE3OTI4NjM5MTEsImV4cCI6MTgwMDYzOTkxMX0.erA0_aOLYnZLKKF3fl7pqSweGKTvMc7W70o6moKhQwn3a1Ax7J6XDs1cjJ510nfQMvinvQl4z4BegW6FcUp2JHyF7An8zLjdFTSq8MBS_nY2BjxzscSovvLZK_wHx6QpZWIguM1lhIJwCjLLe-eoz16rj7QCXGoroTrdjTzuba-wEiEw7y4VSks6cTpkwchzrtI0dMf6H2FiIDGiP7aCl51hm7FaIiyqfDbrlQi9t2oAPekBd5lBCB_doQgVDLnktsD4oKQDE4G_2hkt-TkBWggsQ3izpaRS6LaloWzHdWt1saYcFjzyNVa8a2H99XWVzix3uF7byGWi2aRUpN83SuP0o0od5jqtHeSD3eB9sH1TGXmUIPA6jLmzYZGlx8wJIstgmIlvnsfIFYGzqJ1cWiTPaRr8BJd9aho36Q_xvyqERLIfoZHV2mrp5d0_NujVVNykA8g1oxX9OeiKKH7hjZyDp9WVo6j9XZawpx2OC-fVwFfcqsZfmM8lWOB_JL3w-CItEr2D9nKOEW6TyQRf_ZnOSOGvPWSVYvF1j3xZBhbsXIvji9TfgsWFdAo0ZT6JCXl10nao431677miA5p41mi0kl2ofxtLJqIU5PZHjzEv1fjf61_Em8d1s6CeOIu_cvO0ZkgSOgoigyfgr68HmDFcvz6yVDb49gH79HKUvLQ"
+# We initialize this inside our safe runtime thread setup later to prevent boot crashes
+metaapi = None 
 
 # Active execution registry tracking running sessions
 active_trading_nodes = {}
@@ -43,8 +41,12 @@ def check_market_execution_safeties():
     return True
 
 async def live_gold_compounding_grid(login, password):
+    global metaapi
     print(f"[Engine] Deploying grid path for account: {login}")
     try:
+        if metaapi is None:
+            metaapi = MetaApi(METAAPI_TOKEN)
+            
         account = await metaapi.metatrader_account_api.create_account({
             'name': f"Node_{login}",
             'type': 'cloud',
@@ -103,11 +105,12 @@ async def live_gold_compounding_grid(login, password):
         print(f"Error on execution loop node {login}: {e}")
         active_trading_nodes[login] = False
 
-# SAFE ASYNC RUNNER FIX
-def launch_asynchronous_loop_context(login, password):
+def start_async_loop(login, password):
+    # This completely overrides Render's thread framework and builds a fresh, isolated native event channel
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(live_gold_compounding_grid(login, password))
+    loop.close()
 
 @app.route('/control', methods=['POST'])
 def control_endpoint():
@@ -126,7 +129,7 @@ def control_endpoint():
     if command == "START":
         if mt5_login not in active_trading_nodes or active_trading_nodes[mt5_login] == False:
             active_trading_nodes[mt5_login] = True
-            threading.Thread(target=launch_asynchronous_loop_context, args=(mt5_login, mt5_password), daemon=True).start()
+            threading.Thread(target=start_async_loop, args=(mt5_login, mt5_password), daemon=True).start()
         return jsonify({"status": "success", "message": "Bot engine activated in cloud."})
         
     elif command == "STOP":
@@ -136,4 +139,9 @@ def control_endpoint():
     return jsonify({"status": "error", "message": "Unknown command."}), 400
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+    # Force initialize a default event loop on the main startup thread so libraries don't panic
+    main_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(main_loop)
+    
+    print("Starting production Waitress loop server on port 10000...")
+    serve(app, host='0.0.0.0', port=10000)
