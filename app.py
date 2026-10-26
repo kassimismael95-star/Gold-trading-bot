@@ -6,11 +6,16 @@ import datetime
 from flask import Flask, request, jsonify
 from metaapi_cloud_sdk import MetaApi
 
+# --- THE CRITICAL PATCH TO FIX RENDER ERROR ---
+import nest_asyncio
+nest_asyncio.apply()
+# ----------------------------------------------
+
 app = Flask(__name__)
 
 # --- SECURE CREDENTIAL RECEPTACLES ---
-TELEGRAM_TOKEN = "PASTE_YOUR_TELEGRAM_BOT_TOKEN_FROM_STEP_1"
-METAAPI_TOKEN = "PASTE_YOUR_METAAPI_TOKEN_FROM_STEP_2"
+TELEGRAM_TOKEN = "PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE"
+METAAPI_TOKEN = "PASTE_YOUR_METAAPI_TOKEN_HERE"
 metaapi = MetaApi(METAAPI_TOKEN)
 
 # Active execution registry tracking running sessions
@@ -28,13 +33,10 @@ def check_market_execution_safeties():
         return False
 
     # 2. Macro Data Blackout Filter (NFP / CPI / FOMC)
-    # NFP Check: First Friday of the month between 13:15 and 13:45 UTC
     if day_of_week == 4 and day_of_month <= 7 and hour == 13 and (15 <= minute <= 45):
         return False
-    # CPI Check: Mid-week releases between 13:15 and 13:45 UTC
     if day_of_week in [1, 2, 3] and hour == 13 and (15 <= minute <= 45):
         return False
-    # FOMC Check: Wednesday or Thursday afternoons between 18:00 and 21:00 UTC
     if day_of_week in [2, 3] and (18 <= hour <= 20):
         return False
 
@@ -48,7 +50,7 @@ async def live_gold_compounding_grid(login, password):
             'type': 'cloud',
             'login': str(login),
             'password': password,
-            'server': "Exness-MT5Real9",  # Hardcoded default broker network server
+            'server': "Exness-MT5Real9",
             'platform': 'mt5',
             'magic': 774411
         })
@@ -67,7 +69,6 @@ async def live_gold_compounding_grid(login, password):
             account_info = account.account_information
             equity = account_info['equity']
             
-            # v65 Dynamic Lot Sizing: 1 micro-lot per every $3.00 USD of active equity
             calculated_volume = max(0.01, round((equity / 3.0) * 0.01, 2))
             
             terminal_state = connection.terminal_state
@@ -77,25 +78,23 @@ async def live_gold_compounding_grid(login, password):
                 open_positions = terminal_state.positions
                 gold_trades = [p for p in open_positions if p['symbol'] == 'XAUUSD']
                 
-                # Global Basket Profit Tracker
                 total_floating_payout = sum(p['profit'] for p in gold_trades)
-                target_basket_profit = max(1.0, equity * 0.015)  # Dynamic target: 1.5% profit sweep
+                target_basket_profit = max(1.0, equity * 0.015)
                 
                 if len(gold_trades) > 0 and total_floating_payout >= target_basket_profit:
                     print(f"[Liquidation] Target met (${total_floating_payout}). Sweeping all lines.")
                     for position in gold_trades:
                         await connection.close_position(position['id'])
-                    await asyncio.sleep(15)  # Cooldown breath window phase
+                    await asyncio.sleep(15)
                     continue
 
-                # Continuous Micro-Grid Stacking Engine (The Video Look)
-                if len(gold_trades) < 6:  # Hard safety ceiling guard limit
+                if len(gold_trades) < 6:
                     spread = price['ask'] - price['bid']
-                    if spread <= 0.50:   # Max spread safeguard filter constraint
+                    if spread <= 0.50:
                         print(f"[Grid Entry] Deploying high-aggression trade layer for user {login}")
                         await connection.create_market_buy_order('XAUUSD', calculated_volume, 0, 0)
                         
-            await asyncio.sleep(0.4)  # High-frequency iteration speed heartbeat
+            await asyncio.sleep(0.4)
             
         print(f"[Engine] Stop clicked. Deallocating terminal context for {login}")
         await account.remove()
@@ -104,8 +103,11 @@ async def live_gold_compounding_grid(login, password):
         print(f"Error on execution loop node {login}: {e}")
         active_trading_nodes[login] = False
 
+# SAFE ASYNC RUNNER FIX
 def launch_asynchronous_loop_context(login, password):
-    asyncio.run(live_gold_compounding_grid(login, password))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(live_gold_compounding_grid(login, password))
 
 @app.route('/control', methods=['POST'])
 def control_endpoint():
@@ -117,7 +119,6 @@ def control_endpoint():
         return jsonify({"status": "error", "message": "Invalid parameters."}), 400
         
     try:
-        # Unpacks the compact all-in-one key format: LICENSE/LOGIN/PASSWORD
         license_key, mt5_login, mt5_password = user_input.split('/')
     except ValueError:
         return jsonify({"status": "error", "message": "Key format incorrect. Use: LICENSE/LOGIN/PASSWORD"}), 400
