@@ -3,5 +3,5 @@ services:
     name: gold-scalper-backend
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    startCommand: gunicorn main:app
     plan: free
