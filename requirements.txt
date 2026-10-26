@@ -3,3 +3,4 @@ metaapi-cloud-sdk
 requests
 asyncio
 gunicorn
+nest_asyncio
