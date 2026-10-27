@@ -5,10 +5,12 @@ import datetime
 import traceback
 
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # Line 8: Added CORS import
 from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
+CORS(app)  # Line 14: Added CORS wrapper to fix "Failed to fetch" browser errors
 
 # ============================================================
 # ENVIRONMENT
@@ -410,7 +412,7 @@ def status_endpoint():
 
 
 # ============================================================
-# CONTROL ENDPOINT
+# CONTROL ENDPOINT (Updated for multi-format JSON requests)
 # ============================================================
 
 @app.route("/control", methods=["POST"])
@@ -420,91 +422,91 @@ def control_endpoint():
     command = str(data.get("command", "")).strip().upper()
     user_input = str(data.get("key_payload", "")).strip()
 
-    if not command or not user_input:
+    # Direct JSON parameters sent by Bolt form inputs
+    license_key = data.get("license_key") or data.get("license") or data.get("key") or ""
+    mt5_login = data.get("mt5_login") or data.get("login") or data.get("account") or ""
+    mt5_password = data.get("mt5_password") or data.get("password") or ""
+    mt5_server = data.get("mt5_server") or data.get("server") or ""
+    mt5_symbol = data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
+
+    # Fallback if key_payload slash-string format was used
+    if user_input and "/" in user_input:
+        parts = user_input.split("/")
+        if len(parts) == 5:
+            license_key, mt5_login, mt5_password, mt5_server, mt5_symbol = [
+                part.strip() for part in parts
+            ]
+
+    if not command:
         return jsonify(
             {
                 "status": "error",
-                "message": "Invalid request payload parameters.",
+                "message": "Missing command execution parameter.",
             }
         ), 400
 
-    parts = user_input.split("/")
-
-    if len(parts) != 5:
+    license_str = str(license_key).strip()
+    if len(license_str) < 6:
         return jsonify(
             {
                 "status": "error",
-                "message": (
-                    "Key structure incorrect. "
-                    "Use: LICENSE/LOGIN/PASSWORD/SERVER/SYMBOL"
-                ),
+                "message": "Invalid or expired License Authorization key.",
             }
         ), 400
 
-    license_key, mt5_login, mt5_password, mt5_server, mt5_symbol = [
-        part.strip() for part in parts
-    ]
-
-    # Preserves the original license-string behavior.
-    if len(license_key) < 6:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Invalid or expired License Authorization string.",
-            }
-        ), 400
+    login_str = str(mt5_login).strip()
 
     if command == "START":
-        if active_trading_nodes.get(mt5_login, False):
+        if active_trading_nodes.get(login_str, False):
             return jsonify(
                 {
                     "status": "success",
                     "message": "Bot engine is already active.",
-                    "login": mt5_login,
+                    "login": login_str,
                 }
             ), 200
 
-        active_trading_nodes[mt5_login] = True
+        active_trading_nodes[login_str] = True
 
         worker = threading.Thread(
             target=start_async_loop,
             args=(
-                mt5_login,
-                mt5_password,
-                mt5_server,
-                mt5_symbol,
+                login_str,
+                str(mt5_password).strip(),
+                str(mt5_server).strip(),
+                str(mt5_symbol).strip(),
             ),
             daemon=True,
-            name=f"TradingNode-{mt5_login}",
+            name=f"TradingNode-{login_str}",
         )
 
-        trading_threads[mt5_login] = worker
+        trading_threads[login_str] = worker
         worker.start()
 
         print(
             f"[CONTROL] START accepted: "
-            f"{mt5_login} / {mt5_symbol}"
+            f"{login_str} / {mt5_symbol}"
         )
 
         return jsonify(
             {
                 "status": "success",
                 "message": "Trading engine started.",
-                "login": mt5_login,
+                "login": login_str,
                 "symbol": mt5_symbol,
             }
         ), 200
 
     if command == "STOP":
-        active_trading_nodes[mt5_login] = False
+        active_trading_nodes[login_str] = False
 
-        print(f"[CONTROL] STOP accepted: {mt5_login}")
+        print(f"[CONTROL] STOP accepted: {login_str}")
 
         return jsonify(
             {
                 "status": "success",
                 "message": "Cloud termination instruction synchronized.",
-                "login": mt5_login,
+                "login": login_str,
             }
         ), 200
 
