@@ -1,5 +1,3 @@
 flask
 metaapi-cloud-sdk
-requests
-asyncio
-gunicorn
+waitress
