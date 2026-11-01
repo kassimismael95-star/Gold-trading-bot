@@ -205,3 +205,186 @@ async def high_frequency_trading_engine(login, password, server, symbol):
             await asyncio.sleep(0.02)
 
     except Exception as e:
+        print(f"[CRITICAL ENGINE ERROR] Node failure for {login}: {e}")
+        traceback.print_exc()
+    finally:
+        if account is not None:
+            try:
+                await account.remove()
+                print(f"[CLEANUP] Account resource removed for {login}")
+            except Exception as cleanup_err:
+                print(f"[CLEANUP ERROR] Failed to remove account {login}: {cleanup_err}")
+        active_trading_nodes.pop(str(login), None)
+        trading_threads.pop(str(login), None)
+        print(f"[ENGINE STOPPED] Trading node completely terminated for: {login}")
+
+# ============================================================
+# THREAD DISPATCH GATEWAY WRAPPER
+# ============================================================
+def launch_async_worker_thread(login, password, server, symbol):
+    """Safely spawns and manages an isolated asyncio event loop thread per trading account."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol))
+    except Exception as thread_err:
+        print(f"[THREAD FATAL ERROR] Account {login} thread crashed: {thread_err}")
+        traceback.print_exc()
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+# ============================================================
+# API ENDPOINTS & CONTROL CONSOLE ROUTING
+# ============================================================
+@app.route("/", methods=["GET"])
+def health_check():
+    active_count = len([node for node, running in active_trading_nodes.items() if running])
+    return jsonify({
+        "status": "online",
+        "service": "KimBot Hyper-Aggressive Cloud Grid Scalper",
+        "active_nodes": active_count
+    }), 200
+
+@app.route("/status", methods=["GET"])
+def status_endpoint():
+    active_accounts = [login for login, running in active_trading_nodes.items() if running]
+    return jsonify({
+        "status": "online",
+        "active_accounts": active_accounts
+    }), 200
+
+@app.route("/control", methods=["POST"])
+def control_endpoint():
+    """
+    Bulletproof control gateway supporting JSON, Form-Data, and URL arguments.
+    Enforces BOSSMODE99 permanent lifetime bypass and returns descriptive error messages.
+    """
+    try:
+        data = {}
+        if request.is_json:
+            data = request.get_json(silent=True) or {}
+        if not data:
+            data = request.form.to_dict() or request.values.to_dict() or {}
+
+        command = str(data.get("command", "START")).strip().upper()
+        
+        # Universal parameter normalization mapping all front-end naming variations
+        license_key = str(
+            data.get("license_key") or data.get("license") or data.get("key") or 
+            data.get("licenseKey") or data.get("activationKey") or ""
+        ).strip()
+
+        mt5_login = str(
+            data.get("mt5_login") or data.get("login") or data.get("account") or 
+            data.get("accountNumber") or data.get("mt5Login") or ""
+        ).strip()
+
+        mt5_password = str(
+            data.get("mt5_password") or data.get("password") or data.get("pass") or 
+            data.get("pwd") or ""
+        ).strip()
+
+        mt5_server = str(
+            data.get("mt5_server") or data.get("server") or data.get("brokerServer") or ""
+        ).strip()
+
+        mt5_symbol = str(
+            data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
+        ).strip()
+
+        # Fallback to query arguments if body parameters are empty
+        if not license_key:
+            license_key = request.args.get("license_key", "").strip()
+        if not mt5_login:
+            mt5_login = request.args.get("mt5_login", "").strip()
+        if not mt5_password:
+            mt5_password = request.args.get("mt5_password", "").strip()
+        if not mt5_server:
+            mt5_server = request.args.get("mt5_server", "").strip()
+
+        # Fallback support if key_payload slash-string format is passed
+        user_input = str(data.get("key_payload", "")).strip()
+        if user_input and "/" in user_input:
+            parts = user_input.split("/")
+            if len(parts) >= 4:
+                license_key = parts[0].strip()
+                mt5_login = parts[1].strip()
+                mt5_password = parts[2].strip()
+                mt5_server = parts[3].strip()
+                if len(parts) >= 5:
+                    mt5_symbol = parts[4].strip()
+
+        # ============================================================
+        # LICENSE VALIDATION CHECK
+        # ============================================================
+        if license_key.upper() != PERMANENT_LICENSE_KEY:
+            return jsonify({
+                "status": "error",
+                "message": "License Error: Invalid key. Use BOSSMODE99 for lifetime access."
+            }), 400
+
+        # ============================================================
+        # FIELD VALIDATIONS
+        # ============================================================
+        if not mt5_login:
+            return jsonify({"status": "error", "message": "Login Error: MT5 account number is required."}), 400
+        if not mt5_password:
+            return jsonify({"status": "error", "message": "Password Error: Master trading password is required."}), 400
+        if not mt5_server:
+            return jsonify({"status": "error", "message": "Server Error: MT5 live server name is required."}), 400
+
+        login_str = str(mt5_login).strip()
+
+        if command == "STOP":
+            active_trading_nodes[login_str] = False
+            return jsonify({
+                "status": "success",
+                "message": "Cloud termination instruction synchronized.",
+                "login": login_str
+            }), 200
+
+        if command == "START":
+            if active_trading_nodes.get(login_str, False):
+                return jsonify({
+                    "status": "success",
+                    "message": "Bot engine is already active for this account.",
+                    "login": login_str
+                }), 200
+
+            # Activate runtime flag and spin up isolated background worker thread
+            active_trading_nodes[login_str] = True
+
+            worker = threading.Thread(
+                target=launch_async_worker_thread,
+                args=(login_str, mt5_password, mt5_server, mt5_symbol),
+                daemon=True,
+                name=f"TradingWorker-{login_str}"
+            )
+            trading_threads[login_str] = worker
+            worker.start()
+
+            print(f"[CONTROL GATEWAY] START command accepted for account {login_str} on {mt5_server} trading {mt5_symbol}")
+            return jsonify({
+                "status": "success",
+                "message": "START command dispatched successfully.",
+                "login": login_str,
+                "symbol": mt5_symbol
+            }), 200
+
+        return jsonify({"status": "error", "message": "Unknown command instruction."}), 400
+
+    except Exception as err:
+        print(f"[CONTROL CRITICAL FAULT] {err}")
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": f"Server Control Fault: {str(err)}"}), 500
+
+# ============================================================
+# PRODUCTION SERVER ENTRYPOINT (WAITRESS WSGI)
+# ============================================================
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    print(f"[PRODUCTION SERVER] Launching Waitress WSGI server on 0.0.0.0:{port}...")
+    serve(app, host="0.0.0.0", port=port, threads=8)
