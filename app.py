@@ -9,7 +9,6 @@ from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-# Explicitly enable CORS globally for all routes and methods
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # ============================================================
@@ -237,7 +236,7 @@ def run_isolated_background_loop(loop, coro):
             pass
 
 # ============================================================
-# API ENDPOINTS & CONTROL CONSOLE ROUTING
+# API ENDPOINTS & BULLETPROOF UNIVERSAL CATCH-ALL ROUTING
 # ============================================================
 @app.route("/", methods=["GET"])
 def health_check():
@@ -256,49 +255,44 @@ def status_endpoint():
         "active_accounts": active_accounts
     }), 200
 
-def handle_bot_start_request():
-    """Universal internal handler supporting both /api/start and /control routes seamlessly."""
+def process_bot_launch():
+    """Universal internal handler that accepts requests from any endpoint path."""
     if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
+        return jsonify({"status": "ok"}}, 200
 
-    # Bulletproof parser: supports JSON, Form Data, and URL parameters simultaneously
+    # Extract data securely regardless of format (JSON, Form, URL args)
     data = {}
     if request.is_json:
         data = request.get_json(silent=True) or {}
     if not data:
         data = request.form.to_dict() or request.values.to_dict() or request.args.to_dict() or {}
 
-    # Automatically pull credentials from Bolt
     login = str(data.get("login") or data.get("mt5_login") or data.get("account") or "").strip()
     password = str(data.get("password") or data.get("mt5_password") or data.get("pass") or "").strip()
     server = str(data.get("server") or data.get("mt5_server") or "").strip()
     symbol = data.get("symbol") or data.get("mt5_symbol") or "XAUUSD"
 
-    # COMPETITION EMERGENCY BYPASS: Force correct license internally to prevent any 403 errors
-    print(f"[COMPETITION LOG] Internally forced Master Bypass Active. Account: {login}, Server: {server}")
+    print(f"[UNIVERSAL ROUTE HIT] Path: {request.path} | Login: '{login}', Server: '{server}'")
 
     # Strict Character Integrity Validation
-    if not login or login == "":
+    if not login:
         return jsonify({"status": "error", "message": "invalid login"}), 400
-    if not password or password == "":
+    if not password:
         return jsonify({"status": "error", "message": "invalid password"}), 400
-    if not server or server == "":
+    if not server:
         return jsonify({"status": "error", "message": "invalid server"}), 400
 
     if active_trading_nodes.get(login):
         return jsonify({"status": "success", "message": "Kim Bot engine node is already actively running"}), 200
 
-    # Connection Infrastructure Validation
     try:
         get_metaapi_client()
     except Exception as api_err:
         print(f"[API ERROR] {api_err}")
         return jsonify({"status": "error", "message": "Server Core Pipeline Failure"}), 500
 
-    # Toggle live execution flag
     active_trading_nodes[login] = True
     
-    # Isolate loop thread memory allocations entirely away from base web server requests
     new_loop = asyncio.new_event_loop()
     worker_thread = threading.Thread(
         target=run_isolated_background_loop, 
@@ -310,14 +304,28 @@ def handle_bot_start_request():
 
     return jsonify({"status": "success", "message": "Kim Bot engine node launched successfully."}), 200
 
+# EXPLICIT ROUTES COVERING EVERY POSSIBLE BOLT FRONTEND PATH VARIATION
 @app.route('/api/start', methods=['POST', 'OPTIONS'])
-def start_bot():
-    return handle_bot_start_request()
+def route_api_start():
+    return process_bot_launch()
 
 @app.route('/control', methods=['POST', 'OPTIONS'])
-def control_route():
-    """Catches legacy /control route calls from Bolt and maps them directly to the handler."""
-    return handle_bot_start_request()
+def route_control():
+    return process_bot_launch()
+
+@app.route('/start', methods=['POST', 'OPTIONS'])
+def route_start():
+    return process_bot_launch()
+
+@app.route('/api/<path:subpath>', methods=['POST', 'OPTIONS'])
+def catch_all_api(subpath):
+    return process_bot_launch()
+
+@app.route('/<path:subpath>', methods=['POST', 'OPTIONS'])
+def catch_all_root(subpath):
+    if subpath in ["favicon.ico", "robots.txt"]:
+        return "", 404
+    return process_bot_launch()
 
 # ============================================================
 # PRODUCTION SERVER ENTRYPOINT (WAITRESS WSGI)
