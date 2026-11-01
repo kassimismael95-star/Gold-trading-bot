@@ -258,7 +258,7 @@ def status_endpoint():
 def process_bot_launch():
     """Universal internal handler that accepts requests from any endpoint path."""
     if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}}, 200
+        return jsonify({"status": "ok"}), 200
 
     # Extract data securely regardless of format (JSON, Form, URL args)
     data = {}
