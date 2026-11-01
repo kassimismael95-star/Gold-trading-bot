@@ -140,7 +140,7 @@ async def high_frequency_trading_engine(login, password, server, symbol):
             current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
 
             positions = terminal_state.positions or []
-            symbol_positions = [p for p in positions if p.get("symbol") == symbol]
+            symbol_positions = [p for p in positions if p.get("symbol"] == symbol]
             
             # Calculate live combined running profit across all open grid legs
             net_floating_profit = equity - balance
@@ -257,18 +257,31 @@ def status_endpoint():
 
 @app.route('/api/start', methods=['POST'])
 def start_bot():
-    data = request.json or {}
-    login = str(data.get("login", "")).strip()
-    password = str(data.get("password", "")).strip()
-    server = str(data.get("server", "")).strip()
-    license_key = str(data.get("license", "")).strip()
-    symbol = data.get("symbol", "XAUUSD")
+    # Bulletproof parser: supports JSON, Form Data, and URL parameters simultaneously
+    data = {}
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+    if not data:
+        data = request.form.to_dict() or request.values.to_dict() or request.args.to_dict() or {}
 
-    # 1. Master License Key Check
+    # Clean inputs automatically (.strip() removes any accidental spaces)
+    login = str(data.get("login") or data.get("mt5_login") or data.get("account") or "").strip()
+    password = str(data.get("password") or data.get("mt5_password") or data.get("pass") or "").strip()
+    server = str(data.get("server") or data.get("mt5_server") or "").strip()
+    
+    # Fetch license, strip spaces, and force uppercase letters (.upper())
+    license_key = str(data.get("license") or data.get("license_key") or data.get("key") or "").strip().upper()
+    symbol = data.get("symbol") or data.get("mt5_symbol") or "XAUUSD"
+
+    # CRITICAL DEBUGGING LINE: Watch your Render console to see EXACTLY what Bolt is sending
+    print(f"[DEBUG LOG] Received Start Request -> Login: '{login}', Server: '{server}', License Received: '{license_key}'")
+
+    # Resilient Master Key Bypass
     if license_key != PERMANENT_LICENSE_KEY:
+        print(f"[REJECTED] License mismatch! The server received: '{license_key}' but expected '{PERMANENT_LICENSE_KEY}'")
         return jsonify({"status": "error", "message": "invalid license"}), 403
 
-    # 2. Base Character Validation (Surfaces Instant UI Error Feedback)
+    # Base Character Integrity Checks
     if not login or login == "":
         return jsonify({"status": "error", "message": "invalid login"}), 400
     if not password or password == "":
@@ -279,11 +292,11 @@ def start_bot():
     if active_trading_nodes.get(login):
         return jsonify({"status": "success", "message": "Kim Bot node is already running continuously"}), 200
 
-    # 3. Connection and Infrastructure Integrity Check
+    # Connection and Infrastructure Integrity Check
     try:
         get_metaapi_client()
     except Exception as api_err:
-        # If your API Token is missing or broken on the hosting server
+        print(f"[API ERROR] {api_err}")
         return jsonify({"status": "error", "message": "server core pipeline failure"}), 500
 
     # Initialize the background pipeline only after preliminary checks clear
@@ -302,7 +315,7 @@ def start_bot():
 
 @app.route('/control', methods=['POST'])
 def legacy_control_route():
-    """Backward compatibility hook mapping `/control` directly to `/api/start` logic if requested."""
+    """Backward compatibility hook mapping `/control` directly to `/api/start` logic."""
     return start_bot()
 
 # ============================================================
