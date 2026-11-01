@@ -30,7 +30,7 @@ active_trading_nodes = {}
 trading_threads = {}
 
 # ============================================================
-# GRID SETTINGS (100% UNTOUCHED)
+# GRID SETTINGS (100% UNTOUCHED STRATEGY)
 # ============================================================
 
 PIP_SPACING = 1.5
@@ -57,7 +57,7 @@ def check_market_execution_safeties():
 
 
 # ============================================================
-# METAAPI
+# METAAPI CLIENT
 # ============================================================
 
 def get_metaapi_client():
@@ -105,7 +105,7 @@ async def open_initial_basket(connection, symbol, volume, login):
 
 
 # ============================================================
-# CONTINUOUS TRADING ENGINE (100% UNTOUCHED LOGIC)
+# CONTINUOUS TRADING ENGINE (100% UNTOUCHED TRADING LOGIC)
 # ============================================================
 
 async def live_gold_compounding_grid(login, password, server, symbol):
@@ -347,35 +347,7 @@ async def live_gold_compounding_grid(login, password, server, symbol):
 
 
 # ============================================================
-# THREAD WRAPPER
-# ============================================================
-
-def start_async_loop(login, password, server, symbol):
-    loop = asyncio.new_event_loop()
-
-    try:
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(
-            live_gold_compounding_grid(
-                login,
-                password,
-                server,
-                symbol,
-            )
-        )
-    except Exception as e:
-        print(f"[THREAD ERROR] {login}: {e}")
-        traceback.print_exc()
-        active_trading_nodes[login] = False
-    finally:
-        try:
-            loop.close()
-        except Exception:
-            pass
-
-
-# ============================================================
-# HEALTH ENDPOINT
+# HEALTH & STATUS ENDPOINTS
 # ============================================================
 
 @app.route("/", methods=["GET"])
@@ -394,10 +366,6 @@ def health_check():
     )
 
 
-# ============================================================
-# STATUS ENDPOINT
-# ============================================================
-
 @app.route("/status", methods=["GET"])
 def status_endpoint():
     return jsonify(
@@ -412,7 +380,7 @@ def status_endpoint():
 
 
 # ============================================================
-# CONTROL ENDPOINT (Permanent BOSSMODE99 Bypass & Auto-Mapper)
+# CONTROL ENDPOINT (BOSSMODE99 BYPASS & DIRECT ERROR VALIDATION)
 # ============================================================
 
 @app.route("/control", methods=["POST"])
@@ -423,33 +391,29 @@ def control_endpoint():
         data = {}
 
     command = str(data.get("command", "START")).strip().upper()
-    if not command:
-        command = "START"
+    
+    # Extract request payload values
+    license_key = str(
+        data.get("license_key") or data.get("license") or data.get("key") or ""
+    ).strip()
+    
+    mt5_login = str(
+        data.get("mt5_login") or data.get("login") or data.get("account") or ""
+    ).strip()
+    
+    mt5_password = str(
+        data.get("mt5_password") or data.get("password") or data.get("pass") or ""
+    ).strip()
+    
+    mt5_server = str(
+        data.get("mt5_server") or data.get("server") or ""
+    ).strip()
+    
+    mt5_symbol = str(
+        data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
+    ).strip()
 
-    # Master Creator Key bypass for BOSSMODE99
-    license_key = (
-        data.get("license_key") or data.get("license") or data.get("key") or 
-        data.get("licenseKey") or data.get("activationKey") or "BOSSMODE99"
-    )
-    
-    mt5_login = (
-        data.get("mt5_login") or data.get("login") or data.get("account") or 
-        data.get("accountNumber") or data.get("mt5Login") or data.get("account_number") or ""
-    )
-    
-    mt5_password = (
-        data.get("mt5_password") or data.get("password") or data.get("pass") or 
-        data.get("pwd") or data.get("secret") or data.get("mt5Password") or ""
-    )
-    
-    mt5_server = (
-        data.get("mt5_server") or data.get("server") or data.get("brokerServer") or 
-        data.get("mt5Server") or data.get("serverName") or ""
-    )
-    
-    mt5_symbol = data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
-
-    # Fallback if slash-string format was used
+    # Fallback if slash-string format (key_payload) was used
     user_input = str(data.get("key_payload", "")).strip()
     if user_input and "/" in user_input:
         parts = user_input.split("/")
@@ -461,64 +425,113 @@ def control_endpoint():
             if len(parts) >= 5:
                 mt5_symbol = parts[4].strip()
 
-    login_str = str(mt5_login).strip()
-    if not login_str or login_str == "None":
-        login_str = "81823532"  # Fallback to your active test account
-
-    password_str = str(mt5_password).strip()
-    server_str = str(mt5_server).strip()
-    if not server_str or server_str == "None":
-        server_str = "Exness-MT5Trial10"  # Fallback to your active server
-
-    # Accept BOSSMODE99 permanently without restriction
-    if str(license_key).strip().upper() != "BOSSMODE99" and len(str(license_key).strip()) < 6:
+    # 1. PERMANENT LIFETIME LICENSE VALIDATION (BOSSMODE99)
+    if license_key.upper() != "BOSSMODE99":
         return jsonify({
             "status": "error",
-            "message": "Invalid or expired License Authorization key."
+            "message": "License Error: Invalid key. Use BOSSMODE99 for lifetime access."
         }), 400
 
-    if command == "START":
-        if active_trading_nodes.get(login_str, False):
-            return jsonify({
-                "status": "success",
-                "message": "Bot engine is already active.",
-                "login": login_str
-            }), 200
-
-        active_trading_nodes[login_str] = True
-
-        worker = threading.Thread(
-            target=start_async_loop,
-            args=(login_str, password_str, server_str, str(mt5_symbol).strip()),
-            daemon=True,
-            name=f"TradingNode-{login_str}",
-        )
-        trading_threads[login_str] = worker
-        worker.start()
-
-        print(f"[CONTROL] START accepted: {login_str} / {mt5_symbol} on {server_str}")
-
+    # 2. INPUT VALIDATION CHECKS
+    if not mt5_login or not mt5_login.isdigit():
         return jsonify({
-            "status": "success",
-            "message": "Trading engine started successfully.",
-            "login": login_str,
-            "symbol": mt5_symbol
-        }), 200
+            "status": "error",
+            "message": "Login Error: Please enter a valid numeric MT5 account number."
+        }), 400
+
+    if not mt5_password:
+        return jsonify({
+            "status": "error",
+            "message": "Password Error: Master trading password cannot be empty."
+        }), 400
+
+    if not mt5_server:
+        return jsonify({
+            "status": "error",
+            "message": "Server Error: MT5 live server name cannot be empty."
+        }), 400
 
     if command == "STOP":
-        active_trading_nodes[login_str] = False
-        print(f"[CONTROL] STOP accepted: {login_str}")
+        active_trading_nodes[mt5_login] = False
+        print(f"[CONTROL] STOP accepted: {mt5_login}")
         return jsonify({
             "status": "success",
             "message": "Cloud termination instruction synchronized.",
-            "login": login_str
+            "login": mt5_login
         }), 200
 
+    if command == "START":
+        if active_trading_nodes.get(mt5_login, False):
+            return jsonify({
+                "status": "success",
+                "message": "Bot engine is already active.",
+                "login": mt5_login
+            }), 200
+
+        # Perform explicit MetaApi validation before accepting execution
+        try:
+            api = get_metaapi_client()
+
+            async def test_connect():
+                acc = await api.metatrader_account_api.create_account({
+                    "name": f"Temp_Validation_{mt5_login}",
+                    "type": "cloud",
+                    "login": str(mt5_login),
+                    "password": mt5_password,
+                    "server": mt5_server,
+                    "platform": "mt5",
+                    "magic": 24102401,
+                })
+                try:
+                    await asyncio.wait_for(acc.wait_connected(), timeout=12.0)
+                finally:
+                    await acc.remove()
+
+            asyncio.run(test_connect())
+
+            # Start persistent background trading node once validated
+            active_trading_nodes[mt5_login] = True
+            worker = threading.Thread(
+                target=lambda: asyncio.run(
+                    live_gold_compounding_grid(mt5_login, mt5_password, mt5_server, mt5_symbol)
+                ),
+                daemon=True,
+                name=f"TradingNode-{mt5_login}",
+            )
+            trading_threads[mt5_login] = worker
+            worker.start()
+
+            print(f"[CONTROL] START accepted: {mt5_login} / {mt5_symbol} on {mt5_server}")
+
+            return jsonify({
+                "status": "success",
+                "message": "Credentials verified! Trading engine started.",
+                "login": mt5_login,
+                "symbol": mt5_symbol
+            }), 200
+
+        except Exception as e:
+            err_str = str(e).lower()
+            active_trading_nodes[mt5_login] = False
+
+            if "auth" in err_str or "password" in err_str or "credentials" in err_str:
+                user_msg = "Password Error: Incorrect master trading password."
+            elif "server" in err_str or "not found" in err_str:
+                user_msg = "Server Error: MT5 live server name is invalid."
+            elif "login" in err_str or "account" in err_str:
+                user_msg = "Login Error: MT5 account number not recognized."
+            else:
+                user_msg = f"Connection Error: {str(e)}"
+
+            return jsonify({
+                "status": "error",
+                "message": user_msg
+            }), 400
+
     return jsonify({
-        "status": "success",
-        "message": "Command processed.",
-        "login": login_str
-    }), 200
+        "status": "error",
+        "message": "Unknown command instruction."
+    }), 400
 
 
 # ============================================================
@@ -528,9 +541,7 @@ def control_endpoint():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
 
-    print(
-        f"Starting Waitress server on 0.0.0.0:{port}"
-    )
+    print(f"Starting Waitress server on 0.0.0.0:{port}")
 
     serve(
         app,
