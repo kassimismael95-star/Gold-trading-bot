@@ -12,6 +12,25 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # ============================================================
+# BULLETPROOF CORS PREFLIGHT INTERCEPTOR (ELIMINATES 403 ERRORS)
+# ============================================================
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = jsonify({"status": "ok"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Requested-With")
+        response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS,PUT,DELETE")
+        return response, 200
+
+@app.after_request
+def inject_cors_headers(response):
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Requested-With")
+    response.headers.add("Access-Control-Allow-Methods", "GET,POST,OPTIONS,PUT,DELETE")
+    return response
+
+# ============================================================
 # MASTER LICENSE & SECURITY INTEGRITY
 # ============================================================
 METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN")
@@ -154,8 +173,8 @@ async def high_frequency_trading_engine(login, password, server, symbol):
                 await asyncio.sleep(0.02)
                 continue
 
-            buys = [p for p in symbol_positions if p.get("type") == "POSITION_TYPE_BUY"]
-            sells = [p for p in symbol_positions if p.get("type") == "POSITION_TYPE_SELL"]
+            buys = [p for p in symbol_positions if p.get("type"] == "POSITION_TYPE_BUY"]
+            sells = [p for p in symbol_positions if p.get("type"] == "POSITION_TYPE_SELL"]
             total_positions = len(buys) + len(sells)
 
             # ============================================================
@@ -236,7 +255,7 @@ def run_isolated_background_loop(loop, coro):
             pass
 
 # ============================================================
-# API ENDPOINTS & BULLETPROOF UNIVERSAL CATCH-ALL ROUTING
+# API ENDPOINTS & UNIVERSAL ROUTING CATCH-ALL
 # ============================================================
 @app.route("/", methods=["GET"])
 def health_check():
@@ -257,10 +276,6 @@ def status_endpoint():
 
 def process_bot_launch():
     """Universal internal handler that accepts requests from any endpoint path."""
-    if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
-
-    # Extract data securely regardless of format (JSON, Form, URL args)
     data = {}
     if request.is_json:
         data = request.get_json(silent=True) or {}
@@ -304,7 +319,7 @@ def process_bot_launch():
 
     return jsonify({"status": "success", "message": "Kim Bot engine node launched successfully."}), 200
 
-# EXPLICIT ROUTES COVERING EVERY POSSIBLE BOLT FRONTEND PATH VARIATION
+# MULTI-PATH ROUTING MAP TO CATCH ANY REQUEST FROM BOLT
 @app.route('/api/start', methods=['POST', 'OPTIONS'])
 def route_api_start():
     return process_bot_launch()
