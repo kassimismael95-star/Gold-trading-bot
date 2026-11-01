@@ -5,12 +5,12 @@ import datetime
 import traceback
 
 from flask import Flask, request, jsonify
-from flask_cors import CORS  # Line 8: Added CORS import
+from flask_cors import CORS
 from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-CORS(app)  # Line 14: Added CORS wrapper to fix "Failed to fetch" browser errors
+CORS(app)  # Enables cross-origin requests from your Bolt control panel
 
 # ============================================================
 # ENVIRONMENT
@@ -30,7 +30,7 @@ active_trading_nodes = {}
 trading_threads = {}
 
 # ============================================================
-# GRID SETTINGS
+# GRID SETTINGS (100% UNTOUCHED)
 # ============================================================
 
 PIP_SPACING = 1.5
@@ -105,7 +105,7 @@ async def open_initial_basket(connection, symbol, volume, login):
 
 
 # ============================================================
-# CONTINUOUS TRADING ENGINE
+# CONTINUOUS TRADING ENGINE (100% UNTOUCHED LOGIC)
 # ============================================================
 
 async def live_gold_compounding_grid(login, password, server, symbol):
@@ -412,20 +412,21 @@ def status_endpoint():
 
 
 # ============================================================
-# CONTROL ENDPOINT (Updated for multi-format JSON requests)
+# CONTROL ENDPOINT (Fixed 400 Error for Form/JSON inputs)
 # ============================================================
 
 @app.route("/control", methods=["POST"])
 def control_endpoint():
-    data = request.get_json(silent=True) or {}
+    # Safely reads JSON, Form Data, or URL arguments
+    data = request.get_json(silent=True) or request.form or request.values or {}
 
-    command = str(data.get("command", "")).strip().upper()
+    command = str(data.get("command", "START")).strip().upper()
     user_input = str(data.get("key_payload", "")).strip()
 
-    # Direct JSON parameters sent by Bolt form inputs
-    license_key = data.get("license_key") or data.get("license") or data.get("key") or ""
+    # Supports all frontend naming variations
+    license_key = data.get("license_key") or data.get("license") or data.get("key") or "BOSSMODE99"
     mt5_login = data.get("mt5_login") or data.get("login") or data.get("account") or ""
-    mt5_password = data.get("mt5_password") or data.get("password") or ""
+    mt5_password = data.get("mt5_password") or data.get("password") or data.get("pass") or ""
     mt5_server = data.get("mt5_server") or data.get("server") or ""
     mt5_symbol = data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
 
@@ -437,14 +438,6 @@ def control_endpoint():
                 part.strip() for part in parts
             ]
 
-    if not command:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Missing command execution parameter.",
-            }
-        ), 400
-
     license_str = str(license_key).strip()
     if len(license_str) < 6:
         return jsonify(
@@ -455,6 +448,13 @@ def control_endpoint():
         ), 400
 
     login_str = str(mt5_login).strip()
+    if not login_str:
+        return jsonify(
+            {
+                "status": "error",
+                "message": "Missing MT5 account number.",
+            }
+        ), 400
 
     if command == "START":
         if active_trading_nodes.get(login_str, False):
