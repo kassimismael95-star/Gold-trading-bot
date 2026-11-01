@@ -57,7 +57,7 @@ def check_market_execution_safeties():
 
 
 # ============================================================
-# METAAPI CLIENT
+# METAAPI
 # ============================================================
 
 def get_metaapi_client():
@@ -347,7 +347,35 @@ async def live_gold_compounding_grid(login, password, server, symbol):
 
 
 # ============================================================
-# HEALTH & STATUS ENDPOINTS
+# THREAD WRAPPER
+# ============================================================
+
+def start_async_loop(login, password, server, symbol):
+    loop = asyncio.new_event_loop()
+
+    try:
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(
+            live_gold_compounding_grid(
+                login,
+                password,
+                server,
+                symbol,
+            )
+        )
+    except Exception as e:
+        print(f"[THREAD ERROR] {login}: {e}")
+        traceback.print_exc()
+        active_trading_nodes[login] = False
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+# ============================================================
+# HEALTH ENDPOINT
 # ============================================================
 
 @app.route("/", methods=["GET"])
@@ -366,6 +394,10 @@ def health_check():
     )
 
 
+# ============================================================
+# STATUS ENDPOINT
+# ============================================================
+
 @app.route("/status", methods=["GET"])
 def status_endpoint():
     return jsonify(
@@ -380,41 +412,54 @@ def status_endpoint():
 
 
 # ============================================================
-# CONTROL ENDPOINT (BOSSMODE99 BYPASS & DIRECT ERROR VALIDATION)
+# CONTROL ENDPOINT (Live Handshake & Exact Error Reporting)
 # ============================================================
 
 @app.route("/control", methods=["POST"])
 def control_endpoint():
-    try:
-        data = request.get_json(silent=True) or request.form or request.values or {}
-    except Exception:
-        data = {}
+    # Robust data parser for JSON and Form URL-encoded data
+    data = {}
+    if request.is_json:
+        data = request.get_json(silent=True) or {}
+    if not data:
+        data = request.form.to_dict() or request.values.to_dict() or {}
 
     command = str(data.get("command", "START")).strip().upper()
-    
-    # Extract request payload values
-    license_key = str(
-        data.get("license_key") or data.get("license") or data.get("key") or ""
-    ).strip()
-    
-    mt5_login = str(
-        data.get("mt5_login") or data.get("login") or data.get("account") or ""
-    ).strip()
-    
-    mt5_password = str(
-        data.get("mt5_password") or data.get("password") or data.get("pass") or ""
-    ).strip()
-    
-    mt5_server = str(
-        data.get("mt5_server") or data.get("server") or ""
-    ).strip()
-    
-    mt5_symbol = str(
-        data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
-    ).strip()
-
-    # Fallback if slash-string format (key_payload) was used
     user_input = str(data.get("key_payload", "")).strip()
+
+    # Capture all frontend naming variations
+    license_key = (
+        data.get("license_key") or data.get("license") or data.get("key") or 
+        data.get("licenseKey") or data.get("activationKey") or ""
+    )
+    
+    mt5_login = (
+        data.get("mt5_login") or data.get("login") or data.get("account") or 
+        data.get("accountNumber") or data.get("mt5Login") or ""
+    )
+    
+    mt5_password = (
+        data.get("mt5_password") or data.get("password") or data.get("pass") or 
+        data.get("pwd") or ""
+    )
+    
+    mt5_server = (
+        data.get("mt5_server") or data.get("server") or data.get("brokerServer") or ""
+    )
+    
+    mt5_symbol = data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
+
+    # Fallback to query arguments if fields are empty
+    if not license_key:
+        license_key = request.args.get("license_key", "")
+    if not mt5_login:
+        mt5_login = request.args.get("mt5_login", "")
+    if not mt5_password:
+        mt5_password = request.args.get("mt5_password", "")
+    if not mt5_server:
+        mt5_server = request.args.get("mt5_server", "")
+
+    # Fallback if key_payload slash-string format was used
     if user_input and "/" in user_input:
         parts = user_input.split("/")
         if len(parts) >= 4:
@@ -425,112 +470,115 @@ def control_endpoint():
             if len(parts) >= 5:
                 mt5_symbol = parts[4].strip()
 
-    # 1. PERMANENT LIFETIME LICENSE VALIDATION (BOSSMODE99)
-    if license_key.upper() != "BOSSMODE99":
+    # 1. LIFETIME LICENSE CHECK (BOSSMODE99)
+    license_str = str(license_key).strip().upper()
+    if license_str != "BOSSMODE99":
         return jsonify({
             "status": "error",
             "message": "License Error: Invalid key. Use BOSSMODE99 for lifetime access."
         }), 400
 
-    # 2. INPUT VALIDATION CHECKS
-    if not mt5_login or not mt5_login.isdigit():
-        return jsonify({
-            "status": "error",
-            "message": "Login Error: Please enter a valid numeric MT5 account number."
-        }), 400
+    # 2. FIELD VALIDATIONS
+    login_str = str(mt5_login).strip()
+    if not login_str:
+        return jsonify({"status": "error", "message": "Login Error: MT5 account number is required."}), 400
 
-    if not mt5_password:
-        return jsonify({
-            "status": "error",
-            "message": "Password Error: Master trading password cannot be empty."
-        }), 400
+    password_str = str(mt5_password).strip()
+    if not password_str:
+        return jsonify({"status": "error", "message": "Password Error: Master trading password is required."}), 400
 
-    if not mt5_server:
-        return jsonify({
-            "status": "error",
-            "message": "Server Error: MT5 live server name cannot be empty."
-        }), 400
+    server_str = str(mt5_server).strip()
+    if not server_str:
+        return jsonify({"status": "error", "message": "Server Error: MT5 live server name is required."}), 400
 
     if command == "STOP":
-        active_trading_nodes[mt5_login] = False
-        print(f"[CONTROL] STOP accepted: {mt5_login}")
+        active_trading_nodes[login_str] = False
+        print(f"[CONTROL] STOP accepted: {login_str}")
         return jsonify({
             "status": "success",
-            "message": "Cloud termination instruction synchronized.",
-            "login": mt5_login
+            "message": "Trading engine stopped.",
+            "login": login_str
         }), 200
 
     if command == "START":
-        if active_trading_nodes.get(mt5_login, False):
+        if active_trading_nodes.get(login_str, False):
             return jsonify({
                 "status": "success",
                 "message": "Bot engine is already active.",
-                "login": mt5_login
+                "login": login_str
             }), 200
 
-        # Perform explicit MetaApi validation before accepting execution
+        # LIVE METAAPI VERIFICATION HANDSHAKE
         try:
             api = get_metaapi_client()
 
-            async def test_connect():
-                acc = await api.metatrader_account_api.create_account({
-                    "name": f"Temp_Validation_{mt5_login}",
+            async def verify_credentials():
+                temp_acc = await api.metatrader_account_api.create_account({
+                    "name": f"Validation_{login_str}",
                     "type": "cloud",
-                    "login": str(mt5_login),
-                    "password": mt5_password,
-                    "server": mt5_server,
+                    "login": str(login_str),
+                    "password": password_str,
+                    "server": server_str,
                     "platform": "mt5",
                     "magic": 24102401,
                 })
                 try:
-                    await asyncio.wait_for(acc.wait_connected(), timeout=12.0)
+                    await asyncio.wait_for(temp_acc.wait_connected(), timeout=12.0)
                 finally:
-                    await acc.remove()
+                    await temp_acc.remove()
 
-            asyncio.run(test_connect())
+            # Run the test connection synchronously inside Flask
+            asyncio.run(verify_credentials())
 
-            # Start persistent background trading node once validated
-            active_trading_nodes[mt5_login] = True
+            # If connection handshake succeeds, start permanent background trading loop
+            active_trading_nodes[login_str] = True
+
             worker = threading.Thread(
-                target=lambda: asyncio.run(
-                    live_gold_compounding_grid(mt5_login, mt5_password, mt5_server, mt5_symbol)
+                target=start_async_loop,
+                args=(
+                    login_str,
+                    password_str,
+                    server_str,
+                    str(mt5_symbol).strip(),
                 ),
                 daemon=True,
-                name=f"TradingNode-{mt5_login}",
+                name=f"TradingNode-{login_str}",
             )
-            trading_threads[mt5_login] = worker
+
+            trading_threads[login_str] = worker
             worker.start()
 
-            print(f"[CONTROL] START accepted: {mt5_login} / {mt5_symbol} on {mt5_server}")
+            print(f"[CONTROL] START verified and accepted: {login_str} / {mt5_symbol} on {server_str}")
 
             return jsonify({
                 "status": "success",
                 "message": "Credentials verified! Trading engine started.",
-                "login": mt5_login,
-                "symbol": mt5_symbol
+                "login": login_str,
+                "symbol": mt5_symbol,
             }), 200
 
         except Exception as e:
-            err_str = str(e).lower()
-            active_trading_nodes[mt5_login] = False
+            err_text = str(e).lower()
+            active_trading_nodes[login_str] = False
 
-            if "auth" in err_str or "password" in err_str or "credentials" in err_str:
-                user_msg = "Password Error: Incorrect master trading password."
-            elif "server" in err_str or "not found" in err_str:
-                user_msg = "Server Error: MT5 live server name is invalid."
-            elif "login" in err_str or "account" in err_str:
-                user_msg = "Login Error: MT5 account number not recognized."
+            # Translate MetaApi exceptions into exact user-friendly errors for the screen
+            if "auth" in err_text or "password" in err_text or "credentials" in err_text or "invalid" in err_text:
+                error_msg = "Password Error: Incorrect master trading password."
+            elif "server" in err_text or "not found" in err_text or "broker" in err_text:
+                error_msg = "Server Error: MT5 live server name is invalid or unrecognized."
+            elif "login" in err_text or "account" in err_text or "not exist" in err_text:
+                error_msg = "Login Error: MT5 account number does not exist."
             else:
-                user_msg = f"Connection Error: {str(e)}"
+                error_msg = f"Connection Error: {str(e)}"
 
             return jsonify({
                 "status": "error",
-                "message": user_msg
+                "message": error_msg
             }), 400
 
     return jsonify({
         "status": "error",
-        "message": "Unknown command instruction."
+        "message": "Unknown command instruction.",
     }), 400
 
 
