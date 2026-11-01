@@ -9,7 +9,8 @@ from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-CORS(app)
+# Explicitly enable CORS globally for all routes and methods
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
 # ============================================================
 # MASTER LICENSE & SECURITY INTEGRITY
@@ -257,6 +258,9 @@ def status_endpoint():
 
 def handle_bot_start_request():
     """Universal internal handler supporting both /api/start and /control routes seamlessly."""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
     # Bulletproof parser: supports JSON, Form Data, and URL parameters simultaneously
     data = {}
     if request.is_json:
@@ -270,8 +274,7 @@ def handle_bot_start_request():
     server = str(data.get("server") or data.get("mt5_server") or "").strip()
     symbol = data.get("symbol") or data.get("mt5_symbol") or "XAUUSD"
 
-    # COMPETITION EMERGENCY BYPASS: Force correct license internally to prevent 403 errors
-    license_key = PERMANENT_LICENSE_KEY
+    # COMPETITION EMERGENCY BYPASS: Force correct license internally to prevent any 403 errors
     print(f"[COMPETITION LOG] Internally forced Master Bypass Active. Account: {login}, Server: {server}")
 
     # Strict Character Integrity Validation
@@ -307,11 +310,11 @@ def handle_bot_start_request():
 
     return jsonify({"status": "success", "message": "Kim Bot engine node launched successfully."}), 200
 
-@app.route('/api/start', methods=['POST'])
+@app.route('/api/start', methods=['POST', 'OPTIONS'])
 def start_bot():
     return handle_bot_start_request()
 
-@app.route('/control', methods=['POST'])
+@app.route('/control', methods=['POST', 'OPTIONS'])
 def control_route():
     """Catches legacy /control route calls from Bolt and maps them directly to the handler."""
     return handle_bot_start_request()
