@@ -140,7 +140,7 @@ async def high_frequency_trading_engine(login, password, server, symbol):
             current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
 
             positions = terminal_state.positions or []
-            symbol_positions = [p for p in positions if p.get("symbol"] == symbol]
+            symbol_positions = [p for p in positions if p.get("symbol") == symbol]
             
             # Calculate live combined running profit across all open grid legs
             net_floating_profit = equity - balance
