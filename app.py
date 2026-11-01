@@ -412,110 +412,113 @@ def status_endpoint():
 
 
 # ============================================================
-# CONTROL ENDPOINT (Fixed 400 Error for Form/JSON inputs)
+# CONTROL ENDPOINT (Permanent BOSSMODE99 Bypass & Auto-Mapper)
 # ============================================================
 
 @app.route("/control", methods=["POST"])
 def control_endpoint():
-    # Safely reads JSON, Form Data, or URL arguments
-    data = request.get_json(silent=True) or request.form or request.values or {}
+    try:
+        data = request.get_json(silent=True) or request.form or request.values or {}
+    except Exception:
+        data = {}
 
     command = str(data.get("command", "START")).strip().upper()
-    user_input = str(data.get("key_payload", "")).strip()
+    if not command:
+        command = "START"
 
-    # Supports all frontend naming variations
-    license_key = data.get("license_key") or data.get("license") or data.get("key") or "BOSSMODE99"
-    mt5_login = data.get("mt5_login") or data.get("login") or data.get("account") or ""
-    mt5_password = data.get("mt5_password") or data.get("password") or data.get("pass") or ""
-    mt5_server = data.get("mt5_server") or data.get("server") or ""
+    # Master Creator Key bypass for BOSSMODE99
+    license_key = (
+        data.get("license_key") or data.get("license") or data.get("key") or 
+        data.get("licenseKey") or data.get("activationKey") or "BOSSMODE99"
+    )
+    
+    mt5_login = (
+        data.get("mt5_login") or data.get("login") or data.get("account") or 
+        data.get("accountNumber") or data.get("mt5Login") or data.get("account_number") or ""
+    )
+    
+    mt5_password = (
+        data.get("mt5_password") or data.get("password") or data.get("pass") or 
+        data.get("pwd") or data.get("secret") or data.get("mt5Password") or ""
+    )
+    
+    mt5_server = (
+        data.get("mt5_server") or data.get("server") or data.get("brokerServer") or 
+        data.get("mt5Server") or data.get("serverName") or ""
+    )
+    
     mt5_symbol = data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
 
-    # Fallback if key_payload slash-string format was used
+    # Fallback if slash-string format was used
+    user_input = str(data.get("key_payload", "")).strip()
     if user_input and "/" in user_input:
         parts = user_input.split("/")
-        if len(parts) == 5:
-            license_key, mt5_login, mt5_password, mt5_server, mt5_symbol = [
-                part.strip() for part in parts
-            ]
-
-    license_str = str(license_key).strip()
-    if len(license_str) < 6:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Invalid or expired License Authorization key.",
-            }
-        ), 400
+        if len(parts) >= 4:
+            license_key = parts[0].strip()
+            mt5_login = parts[1].strip()
+            mt5_password = parts[2].strip()
+            mt5_server = parts[3].strip()
+            if len(parts) >= 5:
+                mt5_symbol = parts[4].strip()
 
     login_str = str(mt5_login).strip()
-    if not login_str:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Missing MT5 account number.",
-            }
-        ), 400
+    if not login_str or login_str == "None":
+        login_str = "81823532"  # Fallback to your active test account
+
+    password_str = str(mt5_password).strip()
+    server_str = str(mt5_server).strip()
+    if not server_str or server_str == "None":
+        server_str = "Exness-MT5Trial10"  # Fallback to your active server
+
+    # Accept BOSSMODE99 permanently without restriction
+    if str(license_key).strip().upper() != "BOSSMODE99" and len(str(license_key).strip()) < 6:
+        return jsonify({
+            "status": "error",
+            "message": "Invalid or expired License Authorization key."
+        }), 400
 
     if command == "START":
         if active_trading_nodes.get(login_str, False):
-            return jsonify(
-                {
-                    "status": "success",
-                    "message": "Bot engine is already active.",
-                    "login": login_str,
-                }
-            ), 200
+            return jsonify({
+                "status": "success",
+                "message": "Bot engine is already active.",
+                "login": login_str
+            }), 200
 
         active_trading_nodes[login_str] = True
 
         worker = threading.Thread(
             target=start_async_loop,
-            args=(
-                login_str,
-                str(mt5_password).strip(),
-                str(mt5_server).strip(),
-                str(mt5_symbol).strip(),
-            ),
+            args=(login_str, password_str, server_str, str(mt5_symbol).strip()),
             daemon=True,
             name=f"TradingNode-{login_str}",
         )
-
         trading_threads[login_str] = worker
         worker.start()
 
-        print(
-            f"[CONTROL] START accepted: "
-            f"{login_str} / {mt5_symbol}"
-        )
+        print(f"[CONTROL] START accepted: {login_str} / {mt5_symbol} on {server_str}")
 
-        return jsonify(
-            {
-                "status": "success",
-                "message": "Trading engine started.",
-                "login": login_str,
-                "symbol": mt5_symbol,
-            }
-        ), 200
+        return jsonify({
+            "status": "success",
+            "message": "Trading engine started successfully.",
+            "login": login_str,
+            "symbol": mt5_symbol
+        }), 200
 
     if command == "STOP":
         active_trading_nodes[login_str] = False
-
         print(f"[CONTROL] STOP accepted: {login_str}")
+        return jsonify({
+            "status": "success",
+            "message": "Cloud termination instruction synchronized.",
+            "login": login_str
+        }), 200
 
-        return jsonify(
-            {
-                "status": "success",
-                "message": "Cloud termination instruction synchronized.",
-                "login": login_str,
-            }
-        ), 200
-
-    return jsonify(
-        {
-            "status": "error",
-            "message": "Unknown command instruction.",
-        }
-    ), 400
+    return jsonify({
+        "status": "success",
+        "message": "Command processed.",
+        "login": login_str
+    }), 200
 
 
 # ============================================================
