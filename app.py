@@ -9,7 +9,7 @@ from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+CORS(app)
 
 # ============================================================
 # MASTER LICENSE & SECURITY INTEGRITY
@@ -34,7 +34,7 @@ MAX_GRID_LEVELS = 30           # Extended structural depth safety limit
 MAX_ALLOWED_SPREAD_PIPS = 3.5  # High-frequency protection ceiling
 
 # ============================================================
-# AGGRESSIVE BASKET TARGETS
+# NEW COMPETE INTEGRATIONS: AGGRESSIVE BASKET TARGETS
 # ============================================================
 BASKET_TARGET_PROFIT_USD = 5.00 # Close all trades and reload the moment total profit hits this amount
 
@@ -68,7 +68,7 @@ async def execute_instant_basket_entry(connection, symbol, volume, login):
             print(f"[KIM BOT ENTRY] Initial balance basket deployed successfully for {login} | Vol: {volume}")
 
 # ============================================================
-# PARALLEL BASKET LIQUIDATION ENGINE 
+# NEW: PARALLEL BASKET LIQUIDATION ENGINE 
 # ============================================================
 async def purge_entire_basket_instantly(connection, positions):
     """
@@ -221,13 +221,14 @@ async def high_frequency_trading_engine(login, password, server, symbol):
 # ============================================================
 # THREAD DISPATCH GATEWAY WRAPPER
 # ============================================================
-def run_isolated_background_loop(loop, coro):
-    """Safely executes an async coroutine inside an isolated background event loop thread."""
+def launch_async_worker_thread(login, password, server, symbol):
+    """Safely spawns and manages an isolated asyncio event loop thread per trading account."""
+    loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(coro)
+        loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol))
     except Exception as thread_err:
-        print(f"[THREAD FATAL ERROR] Background loop crashed: {thread_err}")
+        print(f"[THREAD FATAL ERROR] Account {login} thread crashed: {thread_err}")
         traceback.print_exc()
     finally:
         try:
@@ -236,7 +237,7 @@ def run_isolated_background_loop(loop, coro):
             pass
 
 # ============================================================
-# API ENDPOINTS & BULLETPROOF UNIVERSAL CATCH-ALL ROUTING
+# API ENDPOINTS & CONTROL CONSOLE ROUTING
 # ============================================================
 @app.route("/", methods=["GET"])
 def health_check():
@@ -255,77 +256,130 @@ def status_endpoint():
         "active_accounts": active_accounts
     }), 200
 
-def process_bot_launch():
-    """Universal internal handler that accepts requests from any endpoint path."""
-    if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
-
-    # Extract data securely regardless of format (JSON, Form, URL args)
-    data = {}
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-    if not data:
-        data = request.form.to_dict() or request.values.to_dict() or request.args.to_dict() or {}
-
-    login = str(data.get("login") or data.get("mt5_login") or data.get("account") or "").strip()
-    password = str(data.get("password") or data.get("mt5_password") or data.get("pass") or "").strip()
-    server = str(data.get("server") or data.get("mt5_server") or "").strip()
-    symbol = data.get("symbol") or data.get("mt5_symbol") or "XAUUSD"
-
-    print(f"[UNIVERSAL ROUTE HIT] Path: {request.path} | Login: '{login}', Server: '{server}'")
-
-    # Strict Character Integrity Validation
-    if not login:
-        return jsonify({"status": "error", "message": "invalid login"}), 400
-    if not password:
-        return jsonify({"status": "error", "message": "invalid password"}), 400
-    if not server:
-        return jsonify({"status": "error", "message": "invalid server"}), 400
-
-    if active_trading_nodes.get(login):
-        return jsonify({"status": "success", "message": "Kim Bot engine node is already actively running"}), 200
-
+@app.route("/control", methods=["POST"])
+def control_endpoint():
+    """
+    Bulletproof control gateway supporting JSON, Form-Data, and URL arguments.
+    Enforces BOSSMODE99 permanent lifetime bypass and returns descriptive error messages.
+    """
     try:
-        get_metaapi_client()
-    except Exception as api_err:
-        print(f"[API ERROR] {api_err}")
-        return jsonify({"status": "error", "message": "Server Core Pipeline Failure"}), 500
+        data = {}
+        if request.is_json:
+            data = request.get_json(silent=True) or {}
+        if not data:
+            data = request.form.to_dict() or request.values.to_dict() or {}
 
-    active_trading_nodes[login] = True
-    
-    new_loop = asyncio.new_event_loop()
-    worker_thread = threading.Thread(
-        target=run_isolated_background_loop, 
-        args=(new_loop, high_frequency_trading_engine(login, password, server, symbol)),
-        daemon=True
-    )
-    worker_thread.start()
-    trading_threads[login] = worker_thread
+        command = str(data.get("command", "START")).strip().upper()
+        
+        # Universal parameter normalization mapping all front-end naming variations
+        license_key = str(
+            data.get("license_key") or data.get("license") or data.get("key") or 
+            data.get("licenseKey") or data.get("activationKey") or ""
+        ).strip()
 
-    return jsonify({"status": "success", "message": "Kim Bot engine node launched successfully."}), 200
+        mt5_login = str(
+            data.get("mt5_login") or data.get("login") or data.get("account") or 
+            data.get("accountNumber") or data.get("mt5Login") or ""
+        ).strip()
 
-# EXPLICIT ROUTES COVERING EVERY POSSIBLE BOLT FRONTEND PATH VARIATION
-@app.route('/api/start', methods=['POST', 'OPTIONS'])
-def route_api_start():
-    return process_bot_launch()
+        mt5_password = str(
+            data.get("mt5_password") or data.get("password") or data.get("pass") or 
+            data.get("pwd") or ""
+        ).strip()
 
-@app.route('/control', methods=['POST', 'OPTIONS'])
-def route_control():
-    return process_bot_launch()
+        mt5_server = str(
+            data.get("mt5_server") or data.get("server") or data.get("brokerServer") or ""
+        ).strip()
 
-@app.route('/start', methods=['POST', 'OPTIONS'])
-def route_start():
-    return process_bot_launch()
+        mt5_symbol = str(
+            data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
+        ).strip()
 
-@app.route('/api/<path:subpath>', methods=['POST', 'OPTIONS'])
-def catch_all_api(subpath):
-    return process_bot_launch()
+        # Fallback to query arguments if body parameters are empty
+        if not license_key:
+            license_key = request.args.get("license_key", "").strip()
+        if not mt5_login:
+            mt5_login = request.args.get("mt5_login", "").strip()
+        if not mt5_password:
+            mt5_password = request.args.get("mt5_password", "").strip()
+        if not mt5_server:
+            mt5_server = request.args.get("mt5_server", "").strip()
 
-@app.route('/<path:subpath>', methods=['POST', 'OPTIONS'])
-def catch_all_root(subpath):
-    if subpath in ["favicon.ico", "robots.txt"]:
-        return "", 404
-    return process_bot_launch()
+        # Fallback support if key_payload slash-string format is passed
+        user_input = str(data.get("key_payload", "")).strip()
+        if user_input and "/" in user_input:
+            parts = user_input.split("/")
+            if len(parts) >= 4:
+                license_key = parts[0].strip()
+                mt5_login = parts[1].strip()
+                mt5_password = parts[2].strip()
+                mt5_server = parts[3].strip()
+                if len(parts) >= 5:
+                    mt5_symbol = parts[4].strip()
+
+        # ============================================================
+        # LICENSE VALIDATION CHECK
+        # ============================================================
+        if license_key.upper() != PERMANENT_LICENSE_KEY:
+            return jsonify({
+                "status": "error",
+                "message": "License Error: Invalid key. Use BOSSMODE99 for lifetime access."
+            }), 400
+
+        # ============================================================
+        # FIELD VALIDATIONS
+        # ============================================================
+        if not mt5_login:
+            return jsonify({"status": "error", "message": "Login Error: MT5 account number is required."}), 400
+        if not mt5_password:
+            return jsonify({"status": "error", "message": "Password Error: Master trading password is required."}), 400
+        if not mt5_server:
+            return jsonify({"status": "error", "message": "Server Error: MT5 live server name is required."}), 400
+
+        login_str = str(mt5_login).strip()
+
+        if command == "STOP":
+            active_trading_nodes[login_str] = False
+            return jsonify({
+                "status": "success",
+                "message": "Cloud termination instruction synchronized.",
+                "login": login_str
+            }), 200
+
+        if command == "START":
+            if active_trading_nodes.get(login_str, False):
+                return jsonify({
+                    "status": "success",
+                    "message": "Bot engine is already active for this account.",
+                    "login": login_str
+                }), 200
+
+            # Activate runtime flag and spin up isolated background worker thread
+            active_trading_nodes[login_str] = True
+
+            worker = threading.Thread(
+                target=launch_async_worker_thread,
+                args=(login_str, mt5_password, mt5_server, mt5_symbol),
+                daemon=True,
+                name=f"TradingWorker-{login_str}"
+            )
+            trading_threads[login_str] = worker
+            worker.start()
+
+            print(f"[CONTROL GATEWAY] START command accepted for account {login_str} on {mt5_server} trading {mt5_symbol}")
+            return jsonify({
+                "status": "success",
+                "message": "START command dispatched successfully.",
+                "login": login_str,
+                "symbol": mt5_symbol
+            }), 200
+
+        return jsonify({"status": "error", "message": "Unknown command instruction."}), 400
+
+    except Exception as err:
+        print(f"[CONTROL CRITICAL FAULT] {err}")
+        traceback.print_exc()
+        return jsonify({"status": "error", "message": f"Server Control Fault: {str(err)}"}), 500
 
 # ============================================================
 # PRODUCTION SERVER ENTRYPOINT (WAITRESS WSGI)
