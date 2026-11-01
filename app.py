@@ -34,7 +34,7 @@ MAX_GRID_LEVELS = 30           # Extended structural depth safety limit
 MAX_ALLOWED_SPREAD_PIPS = 3.5  # High-frequency protection ceiling
 
 # ============================================================
-# NEW COMPETE INTEGRATIONS: AGGRESSIVE BASKET TARGETS
+# AGGRESSIVE BASKET TARGETS
 # ============================================================
 BASKET_TARGET_PROFIT_USD = 5.00 # Close all trades and reload the moment total profit hits this amount
 
@@ -68,7 +68,7 @@ async def execute_instant_basket_entry(connection, symbol, volume, login):
             print(f"[KIM BOT ENTRY] Initial balance basket deployed successfully for {login} | Vol: {volume}")
 
 # ============================================================
-# NEW: PARALLEL BASKET LIQUIDATION ENGINE 
+# PARALLEL BASKET LIQUIDATION ENGINE 
 # ============================================================
 async def purge_entire_basket_instantly(connection, positions):
     """
@@ -221,14 +221,13 @@ async def high_frequency_trading_engine(login, password, server, symbol):
 # ============================================================
 # THREAD DISPATCH GATEWAY WRAPPER
 # ============================================================
-def launch_async_worker_thread(login, password, server, symbol):
-    """Safely spawns and manages an isolated asyncio event loop thread per trading account."""
-    loop = asyncio.new_event_loop()
+def run_isolated_background_loop(loop, coro):
+    """Safely executes an async coroutine inside an isolated background event loop thread."""
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol))
+        loop.run_until_complete(coro)
     except Exception as thread_err:
-        print(f"[THREAD FATAL ERROR] Account {login} thread crashed: {thread_err}")
+        print(f"[THREAD FATAL ERROR] Background loop crashed: {thread_err}")
         traceback.print_exc()
     finally:
         try:
@@ -256,130 +255,55 @@ def status_endpoint():
         "active_accounts": active_accounts
     }), 200
 
-@app.route("/control", methods=["POST"])
-def control_endpoint():
-    """
-    Bulletproof control gateway supporting JSON, Form-Data, and URL arguments.
-    Enforces BOSSMODE99 permanent lifetime bypass and returns descriptive error messages.
-    """
+@app.route('/api/start', methods=['POST'])
+def start_bot():
+    data = request.json or {}
+    login = str(data.get("login", "")).strip()
+    password = str(data.get("password", "")).strip()
+    server = str(data.get("server", "")).strip()
+    license_key = str(data.get("license", "")).strip()
+    symbol = data.get("symbol", "XAUUSD")
+
+    # 1. Master License Key Check
+    if license_key != PERMANENT_LICENSE_KEY:
+        return jsonify({"status": "error", "message": "invalid license"}), 403
+
+    # 2. Base Character Validation (Surfaces Instant UI Error Feedback)
+    if not login or login == "":
+        return jsonify({"status": "error", "message": "invalid login"}), 400
+    if not password or password == "":
+        return jsonify({"status": "error", "message": "invalid password"}), 400
+    if not server or server == "":
+        return jsonify({"status": "error", "message": "invalid server"}), 400
+
+    if active_trading_nodes.get(login):
+        return jsonify({"status": "success", "message": "Kim Bot node is already running continuously"}), 200
+
+    # 3. Connection and Infrastructure Integrity Check
     try:
-        data = {}
-        if request.is_json:
-            data = request.get_json(silent=True) or {}
-        if not data:
-            data = request.form.to_dict() or request.values.to_dict() or {}
+        get_metaapi_client()
+    except Exception as api_err:
+        # If your API Token is missing or broken on the hosting server
+        return jsonify({"status": "error", "message": "server core pipeline failure"}), 500
 
-        command = str(data.get("command", "START")).strip().upper()
-        
-        # Universal parameter normalization mapping all front-end naming variations
-        license_key = str(
-            data.get("license_key") or data.get("license") or data.get("key") or 
-            data.get("licenseKey") or data.get("activationKey") or ""
-        ).strip()
+    # Initialize the background pipeline only after preliminary checks clear
+    active_trading_nodes[login] = True
+    
+    new_loop = asyncio.new_event_loop()
+    worker_thread = threading.Thread(
+        target=run_isolated_background_loop, 
+        args=(new_loop, high_frequency_trading_engine(login, password, server, symbol)),
+        daemon=True
+    )
+    worker_thread.start()
+    trading_threads[login] = worker_thread
 
-        mt5_login = str(
-            data.get("mt5_login") or data.get("login") or data.get("account") or 
-            data.get("accountNumber") or data.get("mt5Login") or ""
-        ).strip()
+    return jsonify({"status": "success", "message": "Kim Bot engine node launched successfully."}), 200
 
-        mt5_password = str(
-            data.get("mt5_password") or data.get("password") or data.get("pass") or 
-            data.get("pwd") or ""
-        ).strip()
-
-        mt5_server = str(
-            data.get("mt5_server") or data.get("server") or data.get("brokerServer") or ""
-        ).strip()
-
-        mt5_symbol = str(
-            data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
-        ).strip()
-
-        # Fallback to query arguments if body parameters are empty
-        if not license_key:
-            license_key = request.args.get("license_key", "").strip()
-        if not mt5_login:
-            mt5_login = request.args.get("mt5_login", "").strip()
-        if not mt5_password:
-            mt5_password = request.args.get("mt5_password", "").strip()
-        if not mt5_server:
-            mt5_server = request.args.get("mt5_server", "").strip()
-
-        # Fallback support if key_payload slash-string format is passed
-        user_input = str(data.get("key_payload", "")).strip()
-        if user_input and "/" in user_input:
-            parts = user_input.split("/")
-            if len(parts) >= 4:
-                license_key = parts[0].strip()
-                mt5_login = parts[1].strip()
-                mt5_password = parts[2].strip()
-                mt5_server = parts[3].strip()
-                if len(parts) >= 5:
-                    mt5_symbol = parts[4].strip()
-
-        # ============================================================
-        # LICENSE VALIDATION CHECK
-        # ============================================================
-        if license_key.upper() != PERMANENT_LICENSE_KEY:
-            return jsonify({
-                "status": "error",
-                "message": "License Error: Invalid key. Use BOSSMODE99 for lifetime access."
-            }), 400
-
-        # ============================================================
-        # FIELD VALIDATIONS
-        # ============================================================
-        if not mt5_login:
-            return jsonify({"status": "error", "message": "Login Error: MT5 account number is required."}), 400
-        if not mt5_password:
-            return jsonify({"status": "error", "message": "Password Error: Master trading password is required."}), 400
-        if not mt5_server:
-            return jsonify({"status": "error", "message": "Server Error: MT5 live server name is required."}), 400
-
-        login_str = str(mt5_login).strip()
-
-        if command == "STOP":
-            active_trading_nodes[login_str] = False
-            return jsonify({
-                "status": "success",
-                "message": "Cloud termination instruction synchronized.",
-                "login": login_str
-            }), 200
-
-        if command == "START":
-            if active_trading_nodes.get(login_str, False):
-                return jsonify({
-                    "status": "success",
-                    "message": "Bot engine is already active for this account.",
-                    "login": login_str
-                }), 200
-
-            # Activate runtime flag and spin up isolated background worker thread
-            active_trading_nodes[login_str] = True
-
-            worker = threading.Thread(
-                target=launch_async_worker_thread,
-                args=(login_str, mt5_password, mt5_server, mt5_symbol),
-                daemon=True,
-                name=f"TradingWorker-{login_str}"
-            )
-            trading_threads[login_str] = worker
-            worker.start()
-
-            print(f"[CONTROL GATEWAY] START command accepted for account {login_str} on {mt5_server} trading {mt5_symbol}")
-            return jsonify({
-                "status": "success",
-                "message": "START command dispatched successfully.",
-                "login": login_str,
-                "symbol": mt5_symbol
-            }), 200
-
-        return jsonify({"status": "error", "message": "Unknown command instruction."}), 400
-
-    except Exception as err:
-        print(f"[CONTROL CRITICAL FAULT] {err}")
-        traceback.print_exc()
-        return jsonify({"status": "error", "message": f"Server Control Fault: {str(err)}"}), 500
+@app.route('/control', methods=['POST'])
+def legacy_control_route():
+    """Backward compatibility hook mapping `/control` directly to `/api/start` logic if requested."""
+    return start_bot()
 
 # ============================================================
 # PRODUCTION SERVER ENTRYPOINT (WAITRESS WSGI)
