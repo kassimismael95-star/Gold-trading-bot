@@ -447,7 +447,6 @@ def status_endpoint():
 # PRODUCTION SERVER ENTRYPOINT & STANDALONE RUNNER
 # ============================================================
 if __name__ == "__main__":
-    # If launched with --run, execute standalone without requiring frontend
     if len(sys.argv) > 1 and sys.argv[1] in ["--run", "-r", "start"]:
         print("[STANDALONE MODE] Launching direct trading engine from environment variables...")
         login = os.environ.get("MT5_LOGIN")
