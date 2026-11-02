@@ -26,79 +26,97 @@ active_trading_nodes = {}
 trading_threads = {}
 
 # ============================================================
-# PROPRIETARY HYPER-AGGRESSIVE STRATEGY SETTINGS
+# VIDEO-MATCHED HYPER-AGGRESSIVE STRATEGY PARAMETERS
 # ============================================================
-PIP_SPACING = 1.0              # Hyper-tight spacing for maximum trade frequency
-MARTINGALE_MULTIPLIER = 2.0    # 100% video-accurate scaling (0.01 -> 0.02 -> 0.04 -> 0.08)
-MAX_GRID_LEVELS = 30           # Extended structural depth safety limit
-MAX_ALLOWED_SPREAD_PIPS = 3.5  # High-frequency protection ceiling
-
-# ============================================================
-# NEW COMPETE INTEGRATIONS: AGGRESSIVE BASKET TARGETS
-# ============================================================
-BASKET_TARGET_PROFIT_USD = 5.00 # Close all trades and reload the moment total profit hits this amount
+BURST_ORDER_COUNT = 8          # Exact video pattern: 6-10 stacked orders per wave
+TARGET_PROFIT_RATIO = 0.20     # Dynamic compounding profit goal per basket (20% of equity)
+MAX_ALLOWED_SPREAD_PIPS = 6.0  # Ultra-tolerant gold spread filter
+POLL_LATENCY_DELAY = 0.05      # High-speed polling interval (50ms)
 
 def get_metaapi_client():
     """Provides thread-safe initialization of the backend controller engine."""
     global metaapi_instance
     if not METAAPI_TOKEN:
-        raise RuntimeError("CRITICAL SERVER FAULT: METAAPI_TOKEN environment configuration is completely empty.")
+        raise RuntimeError("CRITICAL SERVER FAULT: METAAPI_TOKEN environment configuration is missing.")
     with metaapi_lock:
         if metaapi_instance is None:
             metaapi_instance = MetaApi(METAAPI_TOKEN)
     return metaapi_instance
 
-# ============================================================
-# INSTANTANEOUS BALANCED ENTRY DISPATCHER
-# ============================================================
-async def execute_instant_basket_entry(connection, symbol, volume, login):
+def calculate_video_lot_size(equity: float) -> float:
     """
-    Forces instant, synchronized co-directional market entries. 
-    Bypasses standard broker ticks to guarantee immediate market footprint.
+    Replicates the exact tiered lot scaling observed in the video:
+    - Equity < $50: 0.01
+    - Equity $50 - $200: 0.02
+    - Equity $200 - $1,000: 0.10
+    - Equity $1,000 - $5,000: 0.20 - 0.30
+    - Equity $5,000 - $50,000: 0.90 - 2.00
+    - Equity > $50,000: 3.00 (or uncapped compounding)
     """
-    buy_task = connection.create_market_buy_order(symbol, volume, 0, 0)
-    sell_task = connection.create_market_sell_order(symbol, volume, 0, 0)
-    
-    results = await asyncio.gather(buy_task, sell_task, return_exceptions=True)
-    
-    for res in results:
-        if isinstance(res, Exception):
-            print(f"[DISPATCH ERROR] Instant entry block failed for {login}: {res}")
-        else:
-            print(f"[KIM BOT ENTRY] Initial balance basket deployed successfully for {login} | Vol: {volume}")
+    if equity < 15.0:
+        return 0.01
+    elif equity < 50.0:
+        return 0.02
+    elif equity < 300.0:
+        return 0.10
+    elif equity < 1500.0:
+        return 0.20
+    elif equity < 5000.0:
+        return 0.30
+    elif equity < 20000.0:
+        return 0.90
+    elif equity < 80000.0:
+        return 2.00
+    else:
+        return 3.00
 
 # ============================================================
-# NEW: PARALLEL BASKET LIQUIDATION ENGINE 
+# PARALLEL EXECUTION & PURGE ENGINES
 # ============================================================
+async def fire_stacked_directional_burst(connection, symbol: str, direction: str, volume: float, count: int, login: str):
+    """
+    Deploys a dense multi-order burst simultaneously in one direction,
+    matching the exact cluster layout shown on the MT5 mobile screen.
+    """
+    tasks = []
+    for _ in range(count):
+        if direction == "BUY":
+            tasks.append(connection.create_market_buy_order(symbol, volume, 0, 0))
+        else:
+            tasks.append(connection.create_market_sell_order(symbol, volume, 0, 0))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    successful = sum(1 for r in results if not isinstance(r, Exception))
+    print(f"[BURST DEPLOYED] {login} -> {successful}/{count} {direction} orders executed @ {volume} lots on {symbol}")
+
 async def purge_entire_basket_instantly(connection, positions):
     """
-    Liquidates every single active position simultaneously via asynchronous execution.
-    Eliminates execution delay to lock in exact target profits.
+    Simultaneously closes all open positions across the entire terminal.
     """
-    close_tasks = []
-    for pos in positions:
-        pos_id = pos.get("id")
-        if pos_id:
-            close_tasks.append(connection.close_position(pos_id))
-            
+    close_tasks = [
+        connection.close_position(pos["id"])
+        for pos in positions
+        if "id" in pos
+    ]
     if close_tasks:
         results = await asyncio.gather(*close_tasks, return_exceptions=True)
         print(f"[LIQUIDATOR] Complete basket purge finalized. Closed {len(results)} positions in parallel.")
 
 # ============================================================
-# RUNTIME HIGH-SPEED EXECUTION CORE (NEVER RESTS)
+# CONTINUOUS HIGH-FREQUENCY EXECUTION CORE
 # ============================================================
 async def high_frequency_trading_engine(login, password, server, symbol):
     """
-    Proprietary high-frequency monitoring engine. Runs indefinitely.
-    Forces zero-downtime execution loops across open trading windows.
+    Continuous trading engine:
+    - Never rests without trades
+    - Immediately restarts a new burst the millisecond old trades are purged
+    - Operates until the user sends a STOP command
     """
     print(f"[SYSTEM INITIATED] Connecting active matrix for account {login} on {server} targeting {symbol}")
     account = None
     try:
         api = get_metaapi_client()
-        
-        # Provision cloud runtime instance resources
+
         account = await api.metatrader_account_api.create_account({
             "name": f"KimBot_Active_Node_{login}",
             "type": "cloud",
@@ -108,101 +126,74 @@ async def high_frequency_trading_engine(login, password, server, symbol):
             "platform": "mt5",
             "magic": 24102401,
         })
-        
+
         await account.wait_connected()
         connection = account.get_streaming_connection()
         await connection.connect()
         await connection.wait_synchronized()
-        print(f"[CORE LIVE] Connection confirmed and running live market scripts for: {login}")
+        print(f"[CORE LIVE] Zero-Downtime trading active for: {login}")
 
-        # The Infinite Aggressive Monitoring Loop
+        last_price = None
+
         while active_trading_nodes.get(str(login), False):
             account_info = account.account_information or {}
             equity = float(account_info.get("equity", 0) or 0)
             balance = float(account_info.get("balance", 0) or 0)
-            
-            # Compounding dynamics: Scales starting baseline position to live equity values
-            calculated_volume = max(0.01, round((equity / 2.0) * 0.01, 2))
-            
+
             terminal_state = connection.terminal_state
             price = terminal_state.price(symbol)
             if not price:
-                await asyncio.sleep(0.01)  # Ultra-low latency polling delay
+                await asyncio.sleep(POLL_LATENCY_DELAY)
                 continue
 
             current_ask = price.get("ask")
             current_bid = price.get("bid")
             if current_ask is None or current_bid is None:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(POLL_LATENCY_DELAY)
                 continue
 
-            # Advanced Pip Spread Evaluation Engine
+            # Spread gatekeeper
             current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
+            if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
+                await asyncio.sleep(POLL_LATENCY_DELAY)
+                continue
 
             positions = terminal_state.positions or []
             symbol_positions = [p for p in positions if p.get("symbol") == symbol]
-            
-            # Calculate live combined running profit across all open grid legs
             net_floating_profit = equity - balance
 
-            # ============================================================
-            # CRITICAL COMPETE MECHANISM: PROFIT TARGET TAKEOUT
-            # ============================================================
-            if symbol_positions and net_floating_profit >= BASKET_TARGET_PROFIT_USD:
-                print(f"[TARGET REACHED] Net Profit: ${net_floating_profit:.2f} >= Target: ${BASKET_TARGET_PROFIT_USD}. Purging basket...")
+            # Dynamic compounding target formula (min $2.00, otherwise % of balance)
+            dynamic_profit_target = max(2.0, balance * TARGET_PROFIT_RATIO)
+
+            # ========================================================
+            # BASKET TAKE-PROFIT PURGE TRIGGER
+            # ========================================================
+            if symbol_positions and net_floating_profit >= dynamic_profit_target:
+                print(f"[TARGET HIT] Purging: +${net_floating_profit:.2f} >= Target: ${dynamic_profit_target:.2f}")
                 await purge_entire_basket_instantly(connection, symbol_positions)
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05)
                 continue
 
-            buys = [p for p in symbol_positions if p.get("type") == "POSITION_TYPE_BUY"]
-            sells = [p for p in symbol_positions if p.get("type") == "POSITION_TYPE_SELL"]
-            total_positions = len(buys) + len(sells)
+            # ========================================================
+            # ZERO DOWNTIME RELOAD (ALWAYS ACTIVE)
+            # ========================================================
+            if len(symbol_positions) == 0:
+                # Determine directional bias via instantaneous micro-tick momentum
+                direction = "BUY"
+                if last_price is not None and current_bid < last_price:
+                    direction = "SELL"
+                last_price = current_bid
 
-            # ============================================================
-            # ZERO POSITION RULES: IMMEDIATE BASKET FORCING
-            # ============================================================
-            if total_positions == 0:
-                if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
-                    print(f"[SPREAD GATEKEEPER] Entry blocked for {login}. Spread: {current_spread_pips} pips")
-                    await asyncio.sleep(0.1)
-                    continue
-
-                print(f"[ZERO DOWNTIME TRIGGER] Portfolio clear on {login}. Instantly forcing entry basket...")
-                await execute_instant_basket_entry(connection, symbol, calculated_volume, login)
-                await asyncio.sleep(0.01)
+                assigned_lot = calculate_video_lot_size(equity)
+                print(f"[RELOAD BURST] Firing instantaneous {direction} cluster on {symbol} (Balance: ${balance:.2f})")
+                await fire_stacked_directional_burst(
+                    connection, symbol, direction, assigned_lot, BURST_ORDER_COUNT, login
+                )
+                await asyncio.sleep(0.1)
                 continue
 
-            # ============================================================
-            # HIGH-FREQUENCY COMPLEMENTARY GRID TIER MANAGEMENT
-            # ============================================================
-            # Long Grid Accumulation Tracker
-            if len(buys) < MAX_GRID_LEVELS and buys:
-                lowest_buy = min(float(p.get("openPrice", current_bid)) for p in buys)
-                if current_bid <= lowest_buy - PIP_SPACING:
-                    if current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS:
-                        previous_volume = float(buys[-1].get("volume", calculated_volume))
-                        next_lot = min(5.0, round(previous_volume * MARTINGALE_MULTIPLIER, 2))
-                        try:
-                            await connection.create_market_buy_order(symbol, next_lot, 0, 0)
-                            print(f"[GRID TIER EXPANSION] Additional Long added for {login} | Next Lot: {next_lot}")
-                        except Exception as e:
-                            print(f"[GRID TIER FAULT] Buy order failed: {e}")
-
-            # Short Grid Accumulation Tracker
-            if len(sells) < MAX_GRID_LEVELS and sells:
-                highest_sells = max(float(p.get("openPrice", current_ask)) for p in sells)
-                if current_ask >= highest_sells + PIP_SPACING:
-                    if current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS:
-                        previous_volume = float(sells[-1].get("volume", calculated_volume))
-                        next_lot = min(5.0, round(previous_volume * MARTINGALE_MULTIPLIER, 2))
-                        try:
-                            await connection.create_market_sell_order(symbol, next_lot, 0, 0)
-                            print(f"[GRID TIER EXPANSION] Additional Short added for {login} | Next Lot: {next_lot}")
-                        except Exception as e:
-                            print(f"[GRID TIER FAULT] Sell order failed: {e}")
-
-            # High-intensity tracking frequency throttle sleep
-            await asyncio.sleep(0.02)
+            last_price = current_bid
+            await asyncio.sleep(POLL_LATENCY_DELAY)
 
     except Exception as e:
         print(f"[CRITICAL ENGINE ERROR] Node failure for {login}: {e}")
@@ -216,13 +207,13 @@ async def high_frequency_trading_engine(login, password, server, symbol):
                 print(f"[CLEANUP ERROR] Failed to remove account {login}: {cleanup_err}")
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
-        print(f"[ENGINE STOPPED] Trading node completely terminated for: {login}")
+        print(f"[ENGINE STOPPED] Trading node terminated for: {login}")
 
 # ============================================================
 # THREAD DISPATCH GATEWAY WRAPPER
 # ============================================================
 def launch_async_worker_thread(login, password, server, symbol):
-    """Safely spawns and manages an isolated asyncio event loop thread per trading account."""
+    """Spawns an isolated asyncio loop per MT5 account."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
@@ -244,7 +235,7 @@ def health_check():
     active_count = len([node for node, running in active_trading_nodes.items() if running])
     return jsonify({
         "status": "online",
-        "service": "KimBot Hyper-Aggressive Cloud Grid Scalper",
+        "service": "KimBot Hyper-Aggressive Burst Scalper",
         "active_nodes": active_count
     }), 200
 
@@ -259,8 +250,7 @@ def status_endpoint():
 @app.route("/control", methods=["POST"])
 def control_endpoint():
     """
-    Bulletproof control gateway supporting JSON, Form-Data, and URL arguments.
-    Enforces BOSSMODE99 permanent lifetime bypass and returns descriptive error messages.
+    Universal control endpoint supporting JSON and form data.
     """
     try:
         data = {}
@@ -271,70 +261,35 @@ def control_endpoint():
 
         command = str(data.get("command", "START")).strip().upper()
         
-        # Universal parameter normalization mapping all front-end naming variations
         license_key = str(
-            data.get("license_key") or data.get("license") or data.get("key") or 
-            data.get("licenseKey") or data.get("activationKey") or ""
+            data.get("license_key") or data.get("license") or data.get("key") or ""
         ).strip()
 
         mt5_login = str(
-            data.get("mt5_login") or data.get("login") or data.get("account") or 
-            data.get("accountNumber") or data.get("mt5Login") or ""
+            data.get("mt5_login") or data.get("login") or data.get("account") or ""
         ).strip()
 
         mt5_password = str(
-            data.get("mt5_password") or data.get("password") or data.get("pass") or 
-            data.get("pwd") or ""
+            data.get("mt5_password") or data.get("password") or data.get("pass") or ""
         ).strip()
 
         mt5_server = str(
-            data.get("mt5_server") or data.get("server") or data.get("brokerServer") or ""
+            data.get("mt5_server") or data.get("server") or ""
         ).strip()
 
         mt5_symbol = str(
-            data.get("mt5_symbol") or data.get("symbol") or "XAUUSD"
+            data.get("mt5_symbol") or data.get("symbol") or "XAUUSDm"
         ).strip()
 
-        # Fallback to query arguments if body parameters are empty
-        if not license_key:
-            license_key = request.args.get("license_key", "").strip()
-        if not mt5_login:
-            mt5_login = request.args.get("mt5_login", "").strip()
-        if not mt5_password:
-            mt5_password = request.args.get("mt5_password", "").strip()
-        if not mt5_server:
-            mt5_server = request.args.get("mt5_server", "").strip()
-
-        # Fallback support if key_payload slash-string format is passed
-        user_input = str(data.get("key_payload", "")).strip()
-        if user_input and "/" in user_input:
-            parts = user_input.split("/")
-            if len(parts) >= 4:
-                license_key = parts[0].strip()
-                mt5_login = parts[1].strip()
-                mt5_password = parts[2].strip()
-                mt5_server = parts[3].strip()
-                if len(parts) >= 5:
-                    mt5_symbol = parts[4].strip()
-
-        # ============================================================
-        # LICENSE VALIDATION CHECK
-        # ============================================================
+        # License verification
         if license_key.upper() != PERMANENT_LICENSE_KEY:
             return jsonify({
                 "status": "error",
                 "message": "License Error: Invalid key. Use BOSSMODE99 for lifetime access."
             }), 400
 
-        # ============================================================
-        # FIELD VALIDATIONS
-        # ============================================================
-        if not mt5_login:
-            return jsonify({"status": "error", "message": "Login Error: MT5 account number is required."}), 400
-        if not mt5_password:
-            return jsonify({"status": "error", "message": "Password Error: Master trading password is required."}), 400
-        if not mt5_server:
-            return jsonify({"status": "error", "message": "Server Error: MT5 live server name is required."}), 400
+        if not mt5_login or not mt5_password or not mt5_server:
+            return jsonify({"status": "error", "message": "Missing required MT5 credentials."}), 400
 
         login_str = str(mt5_login).strip()
 
@@ -342,7 +297,7 @@ def control_endpoint():
             active_trading_nodes[login_str] = False
             return jsonify({
                 "status": "success",
-                "message": "Cloud termination instruction synchronized.",
+                "message": "STOP command accepted. Bot will complete current purge and disconnect.",
                 "login": login_str
             }), 200
 
@@ -350,11 +305,10 @@ def control_endpoint():
             if active_trading_nodes.get(login_str, False):
                 return jsonify({
                     "status": "success",
-                    "message": "Bot engine is already active for this account.",
+                    "message": "Bot is already running for this account.",
                     "login": login_str
                 }), 200
 
-            # Activate runtime flag and spin up isolated background worker thread
             active_trading_nodes[login_str] = True
 
             worker = threading.Thread(
@@ -366,15 +320,14 @@ def control_endpoint():
             trading_threads[login_str] = worker
             worker.start()
 
-            print(f"[CONTROL GATEWAY] START command accepted for account {login_str} on {mt5_server} trading {mt5_symbol}")
             return jsonify({
                 "status": "success",
-                "message": "START command dispatched successfully.",
+                "message": "START command accepted. Immediate continuous burst trading initiated.",
                 "login": login_str,
                 "symbol": mt5_symbol
             }), 200
 
-        return jsonify({"status": "error", "message": "Unknown command instruction."}), 400
+        return jsonify({"status": "error", "message": "Unknown command."}), 400
 
     except Exception as err:
         print(f"[CONTROL CRITICAL FAULT] {err}")
