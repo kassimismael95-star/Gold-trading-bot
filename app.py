@@ -13,7 +13,7 @@ app = Flask(__name__)
 # Enable full CORS across all origins
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Global header injector to eliminate browser & proxy 403 CORS blocks
+# Global header injector to eliminate browser & proxy CORS blocks
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -103,14 +103,14 @@ class InstantCandleTracker:
             return "BUY"
         current_price = self.ticks[-1]
         
-        # 1-Minute Candle Directional Bias
+        # 1. 1-Minute Candle Directional Bias
         if self.candle_open is not None:
             if current_price > self.candle_open:
                 return "BUY"
             elif current_price < self.candle_open:
                 return "SELL"
         
-        # Tick Velocity Fallback
+        # 2. Tick Velocity Fallback
         if len(self.ticks) >= 3:
             delta = self.ticks[-1] - self.ticks[0]
             return "BUY" if delta >= 0 else "SELL"
@@ -148,9 +148,7 @@ async def purge_entire_basket_instantly(connection, positions):
 # BULLETPROOF ACCOUNT PROVISIONING & CONNECTION RESOLVER
 # ============================================================
 async def get_or_create_metaapi_account(api, login, password, server):
-    """
-    Prevents 403 API errors by reusing existing accounts across all SDK versions.
-    """
+    """Prevents API errors by reusing existing accounts across all SDK versions."""
     login_str = str(login).strip()
     existing_account = None
 
@@ -315,7 +313,7 @@ def status_endpoint():
 
 @app.route("/control", methods=["POST", "OPTIONS"])
 def control_endpoint():
-    """Universal control endpoint with auto-bypass for license keys to prevent 403 blocks."""
+    """Universal control endpoint supporting all possible JSON and form key variations."""
     if request.method == "OPTIONS":
         response = make_response(jsonify({"status": "ok"}), 200)
         response.headers["Access-Control-Allow-Origin"] = "*"
@@ -330,32 +328,33 @@ def control_endpoint():
         if not data:
             data = request.form.to_dict() or request.values.to_dict() or {}
 
-        command = str(data.get("command", "START")).strip().upper()
+        command = str(data.get("command", data.get("action", "START"))).strip().upper()
         
         token_override = str(
-            data.get("metaapi_token") or data.get("token") or request.headers.get("Authorization", "")
+            data.get("metaapi_token") or data.get("token") or data.get("apiKey") or request.headers.get("Authorization", "")
         ).replace("Bearer ", "").strip()
 
+        # Universal fallback support for camelCase, snake_case, and short forms from any frontend template
         mt5_login = str(
-            data.get("mt5_login") or data.get("login") or data.get("account") or ""
+            data.get("mt5_login") or data.get("login") or data.get("account") or data.get("mt5Login") or data.get("mt5Account") or ""
         ).strip()
 
         mt5_password = str(
-            data.get("mt5_password") or data.get("password") or data.get("pass") or ""
+            data.get("mt5_password") or data.get("password") or data.get("pass") or data.get("mt5Password") or data.get("tradingPassword") or ""
         ).strip()
 
         mt5_server = str(
-            data.get("mt5_server") or data.get("server") or ""
+            data.get("mt5_server") or data.get("server") or data.get("mt5Server") or data.get("serverName") or ""
         ).strip()
 
         mt5_symbol = str(
-            data.get("mt5_symbol") or data.get("symbol") or "XAUUSDm"
+            data.get("mt5_symbol") or data.get("symbol") or data.get("mt5Symbol") or "XAUUSDm"
         ).strip()
 
         if not mt5_login or not mt5_password or not mt5_server:
             return jsonify({
                 "status": "error",
-                "message": "Missing required MT5 credentials (mt5_login, mt5_password, mt5_server)."
+                "message": f"Missing required MT5 credentials. Received login='{mt5_login}', server='{mt5_server}'."
             }), 400
 
         login_str = str(mt5_login).strip()
