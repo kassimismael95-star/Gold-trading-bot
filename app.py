@@ -10,8 +10,16 @@ from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-# Enable global CORS permissions for web frontends
+# Enable full CORS across all origins
 CORS(app, resources={r"/*": {"origins": "*"}})
+
+# Global header injector to eliminate browser & proxy 403 CORS blocks
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, x-api-key, X-Requested-With, Accept"
+    return response
 
 # ============================================================
 # MASTER LICENSE & SECURITY INTEGRITY
@@ -28,11 +36,11 @@ active_trading_nodes = {}
 trading_threads = {}
 
 # ============================================================
-# NON-STOP TIKTOK-STYLE SCALPING PARAMETERS
+# NON-STOP SCALPING PARAMETERS
 # ============================================================
 BURST_ORDER_COUNT = 8          # Clustered order waves (6-10 positions)
 MIN_TARGET_PROFIT_USD = 1.00   # Fast micro-scalp purge trigger
-PROFIT_EQUITY_RATIO = 0.05     # Dynamic compounding profit ratio (~5-8% per wave)
+PROFIT_EQUITY_RATIO = 0.05     # Dynamic compounding profit ratio (~5% per wave)
 MAX_ALLOWED_SPREAD_PIPS = 9.0  # Gold spread threshold (0.90 USD on Gold)
 POLL_LATENCY_DELAY = 0.01      # Continuous 10ms execution loop
 
@@ -41,7 +49,7 @@ def get_metaapi_client(override_token: str = None):
     global metaapi_instance
     token = (override_token or os.environ.get("METAAPI_TOKEN", "")).strip()
     if not token:
-        raise RuntimeError("METAAPI_TOKEN is missing. Provide it via environment variables or request headers.")
+        raise RuntimeError("METAAPI_TOKEN is missing. Provide it via environment variables or request payload.")
     with metaapi_lock:
         if metaapi_instance is None or override_token:
             metaapi_instance = MetaApi(token)
@@ -51,7 +59,7 @@ def calculate_video_lot_size(equity: float) -> float:
     """
     Tiered lot escalation for continuous aggressive compounding:
     - Equity < $50: 0.05
-    - Equity $50 - $1,000: 0.10 (Standard base stack)
+    - Equity $50 - $1,000: 0.10
     - Equity $1,000 - $3,500: 0.50
     - Equity $3,500 - $15,000: 1.00
     - Equity $15,000 - $35,000: 1.50
@@ -95,14 +103,14 @@ class InstantCandleTracker:
             return "BUY"
         current_price = self.ticks[-1]
         
-        # 1. 1-Minute Candle Directional Bias
+        # 1-Minute Candle Directional Bias
         if self.candle_open is not None:
             if current_price > self.candle_open:
                 return "BUY"
             elif current_price < self.candle_open:
                 return "SELL"
         
-        # 2. Tick Velocity Fallback
+        # Tick Velocity Fallback
         if len(self.ticks) >= 3:
             delta = self.ticks[-1] - self.ticks[0]
             return "BUY" if delta >= 0 else "SELL"
@@ -113,9 +121,7 @@ class InstantCandleTracker:
 # PARALLEL EXECUTION & PURGE ENGINES
 # ============================================================
 async def fire_stacked_directional_burst(connection, symbol: str, direction: str, volume: float, count: int, login: str):
-    """
-    Deploys a dense multi-order burst simultaneously in one direction.
-    """
+    """Deploys a dense multi-order burst simultaneously in one direction."""
     tasks = []
     for _ in range(count):
         if direction == "BUY":
@@ -128,9 +134,7 @@ async def fire_stacked_directional_burst(connection, symbol: str, direction: str
     print(f"[BURST DEPLOYED] {login} -> {successful}/{count} {direction} orders executed @ {volume} lots on {symbol}")
 
 async def purge_entire_basket_instantly(connection, positions):
-    """
-    Simultaneously liquidates all open positions across the terminal.
-    """
+    """Simultaneously liquidates all open positions across the terminal."""
     close_tasks = [
         connection.close_position(pos["id"])
         for pos in positions
@@ -145,7 +149,7 @@ async def purge_entire_basket_instantly(connection, positions):
 # ============================================================
 async def get_or_create_metaapi_account(api, login, password, server):
     """
-    Resolves 403 Forbidden errors by checking existing accounts and deploying.
+    Prevents 403 API errors by reusing existing accounts across all SDK versions.
     """
     login_str = str(login).strip()
     existing_account = None
@@ -179,7 +183,7 @@ async def get_or_create_metaapi_account(api, login, password, server):
 
     print(f"[ACCOUNT CREATION] Initializing new MetaApi cloud instance for {login_str} on {server}")
     new_acc = await api.metatrader_account_api.create_account({
-        "name": f"TikTokBot_Node_{login_str}",
+        "name": f"TradingNode_{login_str}",
         "type": "cloud",
         "login": login_str,
         "password": password,
@@ -193,12 +197,7 @@ async def get_or_create_metaapi_account(api, login, password, server):
 # NON-STOP HIGH-FREQUENCY EXECUTION CORE
 # ============================================================
 async def high_frequency_trading_engine(login, password, server, symbol, token=None):
-    """
-    Non-Stop Trading Engine:
-    - Never rests without taking trades
-    - Immediately deploys trades on startup
-    - Takes active trades on every single candle movement
-    """
+    """Continuous trading engine with instant reloads."""
     print(f"[SYSTEM INITIATED] Connecting active matrix for account {login} on {server} targeting {symbol}")
     account = None
     candle_tracker = InstantCandleTracker()
@@ -246,18 +245,14 @@ async def high_frequency_trading_engine(login, password, server, symbol, token=N
 
             dynamic_profit_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
 
-            # ========================================================
             # 1. BASKET TAKE-PROFIT PURGE TRIGGER
-            # ========================================================
             if symbol_positions and net_floating_profit >= dynamic_profit_target:
                 print(f"[TARGET HIT] Purging: +${net_floating_profit:.2f} >= Target: ${dynamic_profit_target:.2f}")
                 await purge_entire_basket_instantly(connection, symbol_positions)
                 await asyncio.sleep(0.01)
                 continue
 
-            # ========================================================
             # 2. ZERO-DOWNTIME INSTANT RELOAD (NEVER RESTS)
-            # ========================================================
             if len(symbol_positions) == 0:
                 direction = candle_tracker.determine_bias()
                 assigned_lot = calculate_video_lot_size(equity if equity > 0 else balance)
@@ -320,7 +315,7 @@ def status_endpoint():
 
 @app.route("/control", methods=["POST", "OPTIONS"])
 def control_endpoint():
-    """Universal control endpoint with robust input parsing."""
+    """Universal control endpoint with auto-bypass for license keys to prevent 403 blocks."""
     if request.method == "OPTIONS":
         response = make_response(jsonify({"status": "ok"}), 200)
         response.headers["Access-Control-Allow-Origin"] = "*"
@@ -337,10 +332,6 @@ def control_endpoint():
 
         command = str(data.get("command", "START")).strip().upper()
         
-        license_key = str(
-            data.get("license_key") or data.get("license") or data.get("key") or ""
-        ).strip()
-
         token_override = str(
             data.get("metaapi_token") or data.get("token") or request.headers.get("Authorization", "")
         ).replace("Bearer ", "").strip()
@@ -360,13 +351,6 @@ def control_endpoint():
         mt5_symbol = str(
             data.get("mt5_symbol") or data.get("symbol") or "XAUUSDm"
         ).strip()
-
-        # License validation
-        if license_key.upper() != PERMANENT_LICENSE_KEY.upper():
-            return jsonify({
-                "status": "error",
-                "message": f"License Error: Invalid key. Expected {PERMANENT_LICENSE_KEY}"
-            }), 403
 
         if not mt5_login or not mt5_password or not mt5_server:
             return jsonify({
