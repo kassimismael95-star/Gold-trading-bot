@@ -4,18 +4,20 @@ import threading
 import datetime
 import traceback
 from collections import deque
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-CORS(app)
+# Enable global CORS permissions for web frontends
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ============================================================
 # MASTER LICENSE & SECURITY INTEGRITY
 # ============================================================
-METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN")
+# Default fallback token placeholder if env variable is unset
+METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
 PERMANENT_LICENSE_KEY = "BOSSMODE99"
 
 # ============================================================
@@ -31,29 +33,31 @@ trading_threads = {}
 # ============================================================
 BURST_ORDER_COUNT = 8          # Clustered order waves (6-10 positions)
 MIN_TARGET_PROFIT_USD = 1.50   # Minimum base profit dollar threshold
-PROFIT_EQUITY_RATIO = 0.08     # Target profit per scalp wave (~8-12% equity target)
+PROFIT_EQUITY_RATIO = 0.08     # Dynamic compounding profit ratio (~8% equity)
 MAX_ALLOWED_SPREAD_PIPS = 8.0  # Gold spread threshold (0.80 USD on Gold)
 POLL_LATENCY_DELAY = 0.02      # Ultra-fast polling interval (20ms)
 
-def get_metaapi_client():
-    """Provides thread-safe initialization of the backend controller engine."""
+def get_metaapi_client(override_token: str = None):
+    """Provides thread-safe initialization of the MetaApi controller."""
     global metaapi_instance
-    if not METAAPI_TOKEN:
-        raise RuntimeError("CRITICAL SERVER FAULT: METAAPI_TOKEN environment configuration is missing.")
+    token = (override_token or os.environ.get("METAAPI_TOKEN", "")).strip()
+    if not token:
+        raise RuntimeError("METAAPI_TOKEN is missing. Provide it via environment variables or request headers.")
     with metaapi_lock:
-        if metaapi_instance is None:
-            metaapi_instance = MetaApi(METAAPI_TOKEN)
+        if metaapi_instance is None or override_token:
+            metaapi_instance = MetaApi(token)
     return metaapi_instance
 
 def calculate_video_lot_size(equity: float) -> float:
     """
-    Replicates the exact tiered lot escalation observed on XAUUSD:
+    Tiered lot escalation observed on XAUUSD:
     - Equity < $50: 0.05
-    - Equity $50 - $1,000: 0.10 (Standard base stack from video start)
-    - Equity $1,000 - $3,500: 0.30 - 0.50
-    - Equity $3,500 - $15,000: 1.00 (Exact video transition tier)
+    - Equity $50 - $1,000: 0.10
+    - Equity $1,000 - $3,500: 0.50
+    - Equity $3,500 - $15,000: 1.00
     - Equity $15,000 - $35,000: 1.50
-    - Equity $35,000+: 2.00 - 3.00+
+    - Equity $35,000 - $60,000: 2.00
+    - Equity $60,000+: 3.00
     """
     if equity < 50.0:
         return 0.05
@@ -83,9 +87,8 @@ class MicroTickTracker:
 
     def determine_bias(self) -> str:
         if len(self.ticks) < 3:
-            return "SELL"  # Default bias
+            return "SELL"
         
-        # Calculate recent velocity
         delta_short = self.ticks[-1] - self.ticks[-3]
         delta_total = self.ticks[-1] - self.ticks[0]
         
@@ -99,8 +102,7 @@ class MicroTickTracker:
 # ============================================================
 async def fire_stacked_directional_burst(connection, symbol: str, direction: str, volume: float, count: int, login: str):
     """
-    Deploys a dense multi-order burst simultaneously in one direction,
-    matching the exact cluster layout shown on the MT5 terminal screen.
+    Deploys a dense multi-order burst simultaneously in one direction.
     """
     tasks = []
     for _ in range(count):
@@ -127,32 +129,76 @@ async def purge_entire_basket_instantly(connection, positions):
         print(f"[LIQUIDATOR] Complete basket purge finalized. Closed {len(results)} positions in parallel.")
 
 # ============================================================
+# BULLETPROOF ACCOUNT PROVISIONING & CONNECTION RESOLVER
+# ============================================================
+async def get_or_create_metaapi_account(api, login, password, server):
+    """
+    Bulletproof account retriever that handles API changes across SDK versions,
+    preventing 403 Forbidden errors caused by duplicate account creation.
+    """
+    login_str = str(login).strip()
+    existing_account = None
+
+    try:
+        # Search via classic pagination
+        if hasattr(api.metatrader_account_api, 'get_accounts_with_classic_pagination'):
+            res = await api.metatrader_account_api.get_accounts_with_classic_pagination()
+            accounts = res.get('items', []) if isinstance(res, dict) else res
+        elif hasattr(api.metatrader_account_api, 'get_accounts'):
+            accounts = await api.metatrader_account_api.get_accounts()
+        else:
+            accounts = []
+
+        for acc in accounts:
+            acc_login = str(getattr(acc, 'login', ''))
+            acc_server = str(getattr(acc, 'server', ''))
+            if acc_login == login_str and acc_server.lower() == server.lower():
+                existing_account = acc
+                break
+    except Exception as fetch_err:
+        print(f"[ACCOUNT SEARCH NOTICE] Could not query list directly ({fetch_err}), attempting direct resolution...")
+
+    if existing_account:
+        print(f"[ACCOUNT FOUND] Attaching to existing MetaApi cloud instance for {login_str}")
+        if getattr(existing_account, 'state', '') != 'DEPLOYED':
+            try:
+                await existing_account.deploy()
+            except Exception:
+                pass
+        return existing_account
+
+    # Create new account only if none exists
+    print(f"[ACCOUNT CREATION] Initializing new MetaApi cloud instance for {login_str} on {server}")
+    new_acc = await api.metatrader_account_api.create_account({
+        "name": f"Node_{login_str}",
+        "type": "cloud",
+        "login": login_str,
+        "password": password,
+        "server": server,
+        "platform": "mt5",
+        "magic": 9924102,
+    })
+    return new_acc
+
+# ============================================================
 # CONTINUOUS HIGH-FREQUENCY EXECUTION CORE
 # ============================================================
-async def high_frequency_trading_engine(login, password, server, symbol):
+async def high_frequency_trading_engine(login, password, server, symbol, token=None):
     """
     Continuous trading engine:
-    - Zero resting state (immediately enters upon launch and reloads upon basket close)
-    - Automatically compounds lot sizes and dynamic take profits
-    - Operates continuously until STOP is received
+    - Never rests without taking trades
+    - Immediately fires upon start
+    - Immediately reloads new orders upon basket liquidation
     """
     print(f"[SYSTEM INITIATED] Connecting active matrix for account {login} on {server} targeting {symbol}")
     account = None
     tick_tracker = MicroTickTracker()
 
     try:
-        api = get_metaapi_client()
+        api = get_metaapi_client(token)
+        account = await get_or_create_metaapi_account(api, login, password, server)
 
-        account = await api.metatrader_account_api.create_account({
-            "name": f"VideoBot_Node_{login}",
-            "type": "cloud",
-            "login": str(login),
-            "password": password,
-            "server": server,
-            "platform": "mt5",
-            "magic": 9924102,
-        })
-
+        print(f"[CONNECTING] Waiting for account synchronization: {login}")
         await account.wait_connected()
         connection = account.get_streaming_connection()
         await connection.connect()
@@ -176,7 +222,6 @@ async def high_frequency_trading_engine(login, password, server, symbol):
                 await asyncio.sleep(POLL_LATENCY_DELAY)
                 continue
 
-            # Track tick flow
             mid_price = (current_ask + current_bid) / 2.0
             tick_tracker.record_tick(mid_price)
 
@@ -190,21 +235,16 @@ async def high_frequency_trading_engine(login, password, server, symbol):
             symbol_positions = [p for p in positions if p.get("symbol") == symbol]
             net_floating_profit = equity - balance
 
-            # Target calculation (scales as balance grows from $18 up to $50k+)
             dynamic_profit_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
 
-            # ========================================================
             # 1. BASKET TAKE-PROFIT PURGE TRIGGER
-            # ========================================================
             if symbol_positions and net_floating_profit >= dynamic_profit_target:
                 print(f"[TARGET HIT] Purging: +${net_floating_profit:.2f} >= Target: ${dynamic_profit_target:.2f}")
                 await purge_entire_basket_instantly(connection, symbol_positions)
                 await asyncio.sleep(0.01)
                 continue
 
-            # ========================================================
             # 2. ZERO-DOWNTIME INSTANT RELOAD (ALWAYS ACTIVE)
-            # ========================================================
             if len(symbol_positions) == 0:
                 direction = tick_tracker.determine_bias()
                 assigned_lot = calculate_video_lot_size(equity if equity > 0 else balance)
@@ -222,12 +262,6 @@ async def high_frequency_trading_engine(login, password, server, symbol):
         print(f"[CRITICAL ENGINE ERROR] Node failure for {login}: {e}")
         traceback.print_exc()
     finally:
-        if account is not None:
-            try:
-                await account.remove()
-                print(f"[CLEANUP] Account node disconnected for {login}")
-            except Exception as cleanup_err:
-                print(f"[CLEANUP ERROR] Failed to clean node {login}: {cleanup_err}")
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
         print(f"[ENGINE STOPPED] Trading node terminated for: {login}")
@@ -235,12 +269,12 @@ async def high_frequency_trading_engine(login, password, server, symbol):
 # ============================================================
 # THREAD DISPATCH GATEWAY WRAPPER
 # ============================================================
-def launch_async_worker_thread(login, password, server, symbol):
+def launch_async_worker_thread(login, password, server, symbol, token=None):
     """Spawns an isolated asyncio loop per MT5 account."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol))
+        loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol, token))
     except Exception as thread_err:
         print(f"[THREAD ERROR] Account {login} thread terminated: {thread_err}")
         traceback.print_exc()
@@ -259,7 +293,8 @@ def health_check():
     return jsonify({
         "status": "online",
         "service": "Hyper-Aggressive Scalper Engine",
-        "active_nodes": active_count
+        "active_nodes": active_count,
+        "token_configured": bool(os.environ.get("METAAPI_TOKEN"))
     }), 200
 
 @app.route("/status", methods=["GET"])
@@ -270,9 +305,16 @@ def status_endpoint():
         "active_accounts": active_accounts
     }), 200
 
-@app.route("/control", methods=["POST"])
+@app.route("/control", methods=["POST", "OPTIONS"])
 def control_endpoint():
-    """Universal control endpoint supporting JSON and form data."""
+    """Universal control endpoint with bulletproof input parsing."""
+    if request.method == "OPTIONS":
+        response = make_response(jsonify({"status": "ok"}), 200)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, x-api-key"
+        return response
+
     try:
         data = {}
         if request.is_json:
@@ -282,9 +324,14 @@ def control_endpoint():
 
         command = str(data.get("command", "START")).strip().upper()
         
+        # Universal field parsers
         license_key = str(
             data.get("license_key") or data.get("license") or data.get("key") or ""
         ).strip()
+
+        token_override = str(
+            data.get("metaapi_token") or data.get("token") or request.headers.get("Authorization", "")
+        ).replace("Bearer ", "").strip()
 
         mt5_login = str(
             data.get("mt5_login") or data.get("login") or data.get("account") or ""
@@ -302,15 +349,18 @@ def control_endpoint():
             data.get("mt5_symbol") or data.get("symbol") or "XAUUSDm"
         ).strip()
 
-        # License verification
-        if license_key.upper() != PERMANENT_LICENSE_KEY:
+        # License validation check
+        if license_key.upper() != PERMANENT_LICENSE_KEY.upper():
             return jsonify({
                 "status": "error",
-                "message": "License Error: Invalid key. Use BOSSMODE99 for lifetime access."
-            }), 400
+                "message": f"License Error: Invalid key. Expected {PERMANENT_LICENSE_KEY}"
+            }), 403
 
         if not mt5_login or not mt5_password or not mt5_server:
-            return jsonify({"status": "error", "message": "Missing required MT5 credentials."}), 400
+            return jsonify({
+                "status": "error",
+                "message": "Missing required MT5 credentials (mt5_login, mt5_password, mt5_server)."
+            }), 400
 
         login_str = str(mt5_login).strip()
 
@@ -318,7 +368,7 @@ def control_endpoint():
             active_trading_nodes[login_str] = False
             return jsonify({
                 "status": "success",
-                "message": "STOP command accepted. Active engine will disconnect.",
+                "message": "STOP command accepted. Engine is stopping.",
                 "login": login_str
             }), 200
 
@@ -326,7 +376,7 @@ def control_endpoint():
             if active_trading_nodes.get(login_str, False):
                 return jsonify({
                     "status": "success",
-                    "message": "Bot is already running for this account.",
+                    "message": "Bot is already actively trading for this account.",
                     "login": login_str
                 }), 200
 
@@ -334,7 +384,7 @@ def control_endpoint():
 
             worker = threading.Thread(
                 target=launch_async_worker_thread,
-                args=(login_str, mt5_password, mt5_server, mt5_symbol),
+                args=(login_str, mt5_password, mt5_server, mt5_symbol, token_override if token_override else None),
                 daemon=True,
                 name=f"ScalperWorker-{login_str}"
             )
@@ -348,7 +398,7 @@ def control_endpoint():
                 "symbol": mt5_symbol
             }), 200
 
-        return jsonify({"status": "error", "message": "Unknown command."}), 400
+        return jsonify({"status": "error", "message": f"Unknown command: {command}"}), 400
 
     except Exception as err:
         print(f"[CONTROL FAULT] {err}")
