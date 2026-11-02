@@ -3,6 +3,7 @@ import asyncio
 import threading
 import datetime
 import traceback
+from collections import deque
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from metaapi_cloud_sdk import MetaApi
@@ -26,12 +27,13 @@ active_trading_nodes = {}
 trading_threads = {}
 
 # ============================================================
-# VIDEO-MATCHED HYPER-AGGRESSIVE STRATEGY PARAMETERS
+# VIDEO-MATCHED SCALPING PARAMETERS
 # ============================================================
-BURST_ORDER_COUNT = 8          # Exact video pattern: 6-10 stacked orders per wave
-TARGET_PROFIT_RATIO = 0.20     # Dynamic compounding profit goal per basket (20% of equity)
-MAX_ALLOWED_SPREAD_PIPS = 6.0  # Ultra-tolerant gold spread filter
-POLL_LATENCY_DELAY = 0.05      # High-speed polling interval (50ms)
+BURST_ORDER_COUNT = 8          # Clustered order waves (6-10 positions)
+MIN_TARGET_PROFIT_USD = 1.50   # Minimum base profit dollar threshold
+PROFIT_EQUITY_RATIO = 0.08     # Target profit per scalp wave (~8-12% equity target)
+MAX_ALLOWED_SPREAD_PIPS = 8.0  # Gold spread threshold (0.80 USD on Gold)
+POLL_LATENCY_DELAY = 0.02      # Ultra-fast polling interval (20ms)
 
 def get_metaapi_client():
     """Provides thread-safe initialization of the backend controller engine."""
@@ -45,30 +47,52 @@ def get_metaapi_client():
 
 def calculate_video_lot_size(equity: float) -> float:
     """
-    Replicates the exact tiered lot scaling observed in the video:
-    - Equity < $50: 0.01
-    - Equity $50 - $200: 0.02
-    - Equity $200 - $1,000: 0.10
-    - Equity $1,000 - $5,000: 0.20 - 0.30
-    - Equity $5,000 - $50,000: 0.90 - 2.00
-    - Equity > $50,000: 3.00 (or uncapped compounding)
+    Replicates the exact tiered lot escalation observed on XAUUSD:
+    - Equity < $50: 0.05
+    - Equity $50 - $1,000: 0.10 (Standard base stack from video start)
+    - Equity $1,000 - $3,500: 0.30 - 0.50
+    - Equity $3,500 - $15,000: 1.00 (Exact video transition tier)
+    - Equity $15,000 - $35,000: 1.50
+    - Equity $35,000+: 2.00 - 3.00+
     """
-    if equity < 15.0:
-        return 0.01
-    elif equity < 50.0:
-        return 0.02
-    elif equity < 300.0:
+    if equity < 50.0:
+        return 0.05
+    elif equity < 1000.0:
         return 0.10
-    elif equity < 1500.0:
-        return 0.20
-    elif equity < 5000.0:
-        return 0.30
-    elif equity < 20000.0:
-        return 0.90
-    elif equity < 80000.0:
+    elif equity < 3500.0:
+        return 0.50
+    elif equity < 15000.0:
+        return 1.00
+    elif equity < 35000.0:
+        return 1.50
+    elif equity < 60000.0:
         return 2.00
     else:
         return 3.00
+
+# ============================================================
+# FAST MOMENTUM TRACKER
+# ============================================================
+class MicroTickTracker:
+    """Tracks sub-second directional pressure on Gold."""
+    def __init__(self, max_ticks=20):
+        self.ticks = deque(maxlen=max_ticks)
+
+    def record_tick(self, price: float):
+        self.ticks.append(price)
+
+    def determine_bias(self) -> str:
+        if len(self.ticks) < 3:
+            return "SELL"  # Default bias
+        
+        # Calculate recent velocity
+        delta_short = self.ticks[-1] - self.ticks[-3]
+        delta_total = self.ticks[-1] - self.ticks[0]
+        
+        if delta_short > 0 or delta_total > 0:
+            return "BUY"
+        else:
+            return "SELL"
 
 # ============================================================
 # PARALLEL EXECUTION & PURGE ENGINES
@@ -76,7 +100,7 @@ def calculate_video_lot_size(equity: float) -> float:
 async def fire_stacked_directional_burst(connection, symbol: str, direction: str, volume: float, count: int, login: str):
     """
     Deploys a dense multi-order burst simultaneously in one direction,
-    matching the exact cluster layout shown on the MT5 mobile screen.
+    matching the exact cluster layout shown on the MT5 terminal screen.
     """
     tasks = []
     for _ in range(count):
@@ -91,7 +115,7 @@ async def fire_stacked_directional_burst(connection, symbol: str, direction: str
 
 async def purge_entire_basket_instantly(connection, positions):
     """
-    Simultaneously closes all open positions across the entire terminal.
+    Simultaneously liquidates all open positions across the terminal.
     """
     close_tasks = [
         connection.close_position(pos["id"])
@@ -108,23 +132,25 @@ async def purge_entire_basket_instantly(connection, positions):
 async def high_frequency_trading_engine(login, password, server, symbol):
     """
     Continuous trading engine:
-    - Never rests without trades
-    - Immediately restarts a new burst the millisecond old trades are purged
-    - Operates until the user sends a STOP command
+    - Zero resting state (immediately enters upon launch and reloads upon basket close)
+    - Automatically compounds lot sizes and dynamic take profits
+    - Operates continuously until STOP is received
     """
     print(f"[SYSTEM INITIATED] Connecting active matrix for account {login} on {server} targeting {symbol}")
     account = None
+    tick_tracker = MicroTickTracker()
+
     try:
         api = get_metaapi_client()
 
         account = await api.metatrader_account_api.create_account({
-            "name": f"KimBot_Active_Node_{login}",
+            "name": f"VideoBot_Node_{login}",
             "type": "cloud",
             "login": str(login),
             "password": password,
             "server": server,
             "platform": "mt5",
-            "magic": 24102401,
+            "magic": 9924102,
         })
 
         await account.wait_connected()
@@ -132,8 +158,6 @@ async def high_frequency_trading_engine(login, password, server, symbol):
         await connection.connect()
         await connection.wait_synchronized()
         print(f"[CORE LIVE] Zero-Downtime trading active for: {login}")
-
-        last_price = None
 
         while active_trading_nodes.get(str(login), False):
             account_info = account.account_information or {}
@@ -152,6 +176,10 @@ async def high_frequency_trading_engine(login, password, server, symbol):
                 await asyncio.sleep(POLL_LATENCY_DELAY)
                 continue
 
+            # Track tick flow
+            mid_price = (current_ask + current_bid) / 2.0
+            tick_tracker.record_tick(mid_price)
+
             # Spread gatekeeper
             current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
             if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
@@ -162,37 +190,32 @@ async def high_frequency_trading_engine(login, password, server, symbol):
             symbol_positions = [p for p in positions if p.get("symbol") == symbol]
             net_floating_profit = equity - balance
 
-            # Dynamic compounding target formula (min $2.00, otherwise % of balance)
-            dynamic_profit_target = max(2.0, balance * TARGET_PROFIT_RATIO)
+            # Target calculation (scales as balance grows from $18 up to $50k+)
+            dynamic_profit_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
 
             # ========================================================
-            # BASKET TAKE-PROFIT PURGE TRIGGER
+            # 1. BASKET TAKE-PROFIT PURGE TRIGGER
             # ========================================================
             if symbol_positions and net_floating_profit >= dynamic_profit_target:
                 print(f"[TARGET HIT] Purging: +${net_floating_profit:.2f} >= Target: ${dynamic_profit_target:.2f}")
                 await purge_entire_basket_instantly(connection, symbol_positions)
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
                 continue
 
             # ========================================================
-            # ZERO DOWNTIME RELOAD (ALWAYS ACTIVE)
+            # 2. ZERO-DOWNTIME INSTANT RELOAD (ALWAYS ACTIVE)
             # ========================================================
             if len(symbol_positions) == 0:
-                # Determine directional bias via instantaneous micro-tick momentum
-                direction = "BUY"
-                if last_price is not None and current_bid < last_price:
-                    direction = "SELL"
-                last_price = current_bid
-
-                assigned_lot = calculate_video_lot_size(equity)
-                print(f"[RELOAD BURST] Firing instantaneous {direction} cluster on {symbol} (Balance: ${balance:.2f})")
+                direction = tick_tracker.determine_bias()
+                assigned_lot = calculate_video_lot_size(equity if equity > 0 else balance)
+                
+                print(f"[INSTANT RELOAD] Firing {direction} cluster on {symbol} (Balance: ${balance:.2f}, Lots: {assigned_lot})")
                 await fire_stacked_directional_burst(
                     connection, symbol, direction, assigned_lot, BURST_ORDER_COUNT, login
                 )
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
                 continue
 
-            last_price = current_bid
             await asyncio.sleep(POLL_LATENCY_DELAY)
 
     except Exception as e:
@@ -202,9 +225,9 @@ async def high_frequency_trading_engine(login, password, server, symbol):
         if account is not None:
             try:
                 await account.remove()
-                print(f"[CLEANUP] Account resource removed for {login}")
+                print(f"[CLEANUP] Account node disconnected for {login}")
             except Exception as cleanup_err:
-                print(f"[CLEANUP ERROR] Failed to remove account {login}: {cleanup_err}")
+                print(f"[CLEANUP ERROR] Failed to clean node {login}: {cleanup_err}")
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
         print(f"[ENGINE STOPPED] Trading node terminated for: {login}")
@@ -219,7 +242,7 @@ def launch_async_worker_thread(login, password, server, symbol):
     try:
         loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol))
     except Exception as thread_err:
-        print(f"[THREAD FATAL ERROR] Account {login} thread crashed: {thread_err}")
+        print(f"[THREAD ERROR] Account {login} thread terminated: {thread_err}")
         traceback.print_exc()
     finally:
         try:
@@ -235,7 +258,7 @@ def health_check():
     active_count = len([node for node, running in active_trading_nodes.items() if running])
     return jsonify({
         "status": "online",
-        "service": "KimBot Hyper-Aggressive Burst Scalper",
+        "service": "Hyper-Aggressive Scalper Engine",
         "active_nodes": active_count
     }), 200
 
@@ -249,9 +272,7 @@ def status_endpoint():
 
 @app.route("/control", methods=["POST"])
 def control_endpoint():
-    """
-    Universal control endpoint supporting JSON and form data.
-    """
+    """Universal control endpoint supporting JSON and form data."""
     try:
         data = {}
         if request.is_json:
@@ -297,7 +318,7 @@ def control_endpoint():
             active_trading_nodes[login_str] = False
             return jsonify({
                 "status": "success",
-                "message": "STOP command accepted. Bot will complete current purge and disconnect.",
+                "message": "STOP command accepted. Active engine will disconnect.",
                 "login": login_str
             }), 200
 
@@ -315,7 +336,7 @@ def control_endpoint():
                 target=launch_async_worker_thread,
                 args=(login_str, mt5_password, mt5_server, mt5_symbol),
                 daemon=True,
-                name=f"TradingWorker-{login_str}"
+                name=f"ScalperWorker-{login_str}"
             )
             trading_threads[login_str] = worker
             worker.start()
@@ -330,7 +351,7 @@ def control_endpoint():
         return jsonify({"status": "error", "message": "Unknown command."}), 400
 
     except Exception as err:
-        print(f"[CONTROL CRITICAL FAULT] {err}")
+        print(f"[CONTROL FAULT] {err}")
         traceback.print_exc()
         return jsonify({"status": "error", "message": f"Server Control Fault: {str(err)}"}), 500
 
