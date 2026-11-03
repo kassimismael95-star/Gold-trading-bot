@@ -61,6 +61,7 @@ metaapi_lock = threading.Lock()
 
 active_trading_nodes = {}
 trading_threads = {}
+active_connections = {}  # Tracks open streaming sockets for safe cleanup
 live_account_telemetry = {}
 
 # Continuous Scalping Engine Parameters
@@ -242,7 +243,7 @@ async def purge_entire_basket_instantly(connection, positions):
         print(f"[LIQUIDATOR] Liquidated {len(results)} positions in parallel.")
 
 # ============================================================
-# HIGH-FREQUENCY TRADING ENGINE (WITH AUTO-RECONNECT WRAPPER)
+# HIGH-FREQUENCY TRADING ENGINE (CLEAN DISCONNECT & RECONNECT)
 # ============================================================
 class InstantCandleTracker:
     def __init__(self, max_ticks=30):
@@ -271,6 +272,7 @@ class InstantCandleTracker:
         return "BUY"
 
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
+    """Main trading engine with explicit connection cleanup to prevent zombie WebSocket collisions."""
     print(f"[ENGINE INITIALIZED] Starting persistent worker for account {login}...")
     candle_tracker = InstantCandleTracker()
 
@@ -287,6 +289,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
             await account.wait_connected()
             connection = account.get_streaming_connection()
+            active_connections[str(login)] = connection  # Register connection for safe shutdown
             await connection.connect()
 
             await connection.wait_synchronized()
@@ -368,10 +371,18 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 await asyncio.sleep(POLL_LATENCY_DELAY)
 
         except Exception as outer_err:
-            print(f"[CONNECTION DROP / ERROR] {outer_err}. Reconnecting in 5 seconds...")
+            print(f"[CONNECTION DROP / ERROR] {outer_err}. Cleaning up and reconnecting in 5s...")
             live_account_telemetry[str(login)] = {"connected_to_broker": False, "running": False}
+        finally:
+            if connection:
+                try:
+                    await connection.close()
+                except Exception:
+                    pass
+            active_connections.pop(str(login), None)
             await asyncio.sleep(5.0)
 
+    # Cleanup when stopped
     active_trading_nodes.pop(str(login), None)
     trading_threads.pop(str(login), None)
     live_account_telemetry.pop(str(login), None)
@@ -389,7 +400,7 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
         except Exception: pass
 
 # ============================================================
-# EMBEDDED HIGH-SPEED UI (VANILLA JS - ZERO CDN FAILURE)
+# EMBEDDED UI WITH HARD RESET BUTTON
 # ============================================================
 STANDALONE_HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -415,12 +426,13 @@ STANDALONE_HTML_TEMPLATE = """
     input:focus { border-color: #10b981; }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .status-box { background: rgba(0,0,0,0.4); border: 1px solid #1f2937; border-radius: 12px; padding: 12px; font-size: 12px; color: #9ca3af; font-family: monospace; min-height: 48px; display: flex; align-items: center; margin-bottom: 18px; }
-    .btn-group { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .btn-group { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-bottom: 10px; }
     button { padding: 14px; border-radius: 14px; font-weight: 800; font-size: 13px; cursor: pointer; border: none; transition: 0.15s; }
     .btn-launch { background: linear-gradient(135deg, #10b981, #059669); color: #000; box-shadow: 0 0 20px rgba(16, 185, 129, 0.3); }
     .btn-launch:active { transform: scale(0.98); }
     .btn-stop { background: linear-gradient(135deg, #e11d48, #be123c); color: #fff; }
     .btn-stop:active { transform: scale(0.98); }
+    .btn-reset { width: 100%; background: #1e293b; color: #94a3b8; font-size: 11px; padding: 10px; border-radius: 10px; }
   </style>
 </head>
 <body>
@@ -471,8 +483,10 @@ STANDALONE_HTML_TEMPLATE = """
 
     <div class="btn-group">
       <button class="btn-launch" onclick="handleStart()">⚡ LAUNCH BOT</button>
-      <button class="btn-stop" onclick="handleStop()">🛑 STOP BOT</button>
+      <button class="btn-stop" onclick="handleStop()">🛑 STOP</button>
     </div>
+    
+    <button class="btn-reset" onclick="handleHardReset()">🔄 Reset Stale Cloud Connections</button>
   </div>
 
   <script>
@@ -520,7 +534,7 @@ STANDALONE_HTML_TEMPLATE = """
         msg.innerHTML = '<span style="color:#f87171;">❌ Invalid License Key!</span>';
         return;
       }
-      msg.innerHTML = '<span style="color:#34d399;">⚡ Connecting Exness matrix & launching bursts...</span>';
+      msg.innerHTML = '<span style="color:#34d399;">⚡ Connecting fresh Exness socket & launching...</span>';
 
       try {
         const res = await fetch('/api/control', {
@@ -548,10 +562,23 @@ STANDALONE_HTML_TEMPLATE = """
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ command: 'STOP', license_key: key, mt5_login: login })
         });
-        msg.innerHTML = '<span style="color:#9ca3af;">🛑 Scalper terminated.</span>';
+        msg.innerHTML = '<span style="color:#9ca3af;">🛑 Scalper terminated cleanly.</span>';
         pollStatus();
       } catch (e) {
         msg.innerHTML = '<span style="color:#f87171;">❌ Stop command failed.</span>';
+      }
+    }
+
+    async function handleHardReset() {
+      const msg = document.getElementById('msgBox');
+      msg.innerHTML = '<span style="color:#38bdf8;">🔄 Purging stale connections...</span>';
+      try {
+        const res = await fetch('/api/reset', { method: 'POST' });
+        const data = await res.json();
+        msg.innerHTML = '<span style="color:#38bdf8;">✅ ' + (data.message || 'All sockets cleared.') + '</span>';
+        pollStatus();
+      } catch (e) {
+        msg.innerHTML = '<span style="color:#f87171;">❌ Reset failed.</span>';
       }
     }
 
@@ -623,6 +650,30 @@ def get_account_metadata():
             "server": "Exness-MT5Trial",
             "symbol": "XAUUSD"
         }), 200
+
+@app.route("/api/reset", methods=["POST", "OPTIONS"])
+def reset_all_connections():
+    """Forces all background workers and zombie WebSockets to close immediately."""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    
+    # Flag all running loops to stop
+    for login in list(active_trading_nodes.keys()):
+        active_trading_nodes[login] = False
+
+    # Close active streaming connections
+    for login, conn in list(active_connections.items()):
+        try:
+            asyncio.run(conn.close())
+        except Exception:
+            pass
+
+    active_connections.clear()
+    active_trading_nodes.clear()
+    trading_threads.clear()
+    live_account_telemetry.clear()
+
+    return jsonify({"status": "success", "message": "All stale sessions reset."}), 200
 
 @app.route("/status", methods=["GET", "OPTIONS"])
 @app.route("/api/status", methods=["GET", "OPTIONS"])
@@ -713,8 +764,14 @@ def control_dispatcher():
         return jsonify({"status": "success", "success": True, "message": "STOP command accepted."}), 200
 
     if command in ["START", "RUN"]:
-        if active_trading_nodes.get(login_str, False):
-            return jsonify({"status": "success", "success": True, "message": "Bot is already running."}), 200
+        # Stop any existing running worker thread for this account first
+        active_trading_nodes[login_str] = False
+        if login_str in active_connections:
+            try:
+                asyncio.run(active_connections[login_str].close())
+            except Exception:
+                pass
+            active_connections.pop(login_str, None)
 
         active_trading_nodes[login_str] = True
 
@@ -733,7 +790,6 @@ def control_dispatcher():
 
         return jsonify({
             "status": "success",
-            "success": True,
             "message": f"License [{license_key}] Verified. Scalper live with Exness Gold resolution.",
             "login": login_str,
             "symbol": mt5_symbol
