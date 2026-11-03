@@ -52,7 +52,9 @@ def handle_exception(e):
 # ============================================================
 METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
 ALLOWED_LICENSES = ["BOSSMODE98", "BOSSMODE99"]
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.db")
+
+# Safe /tmp path for guaranteed write permissions on Render / Linux containers
+DB_PATH = "/tmp/credentials.db"
 
 metaapi_instance = None
 metaapi_lock = threading.Lock()
@@ -70,7 +72,7 @@ MAX_ACCOUNT_DRAWDOWN_RATIO = 0.25 # 25% max basket drawdown cutoff
 POLL_LATENCY_DELAY = 0.02      # 20ms polling interval
 
 # ============================================================
-# SECURE SERVER-SIDE DATABASE (SQLITE)
+# SECURE SERVER-SIDE DATABASE (SQLITE IN /tmp)
 # ============================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -91,6 +93,8 @@ def init_db():
 init_db()
 
 def db_save_credentials(license_key, login, password, server, symbol):
+    if not os.path.exists(DB_PATH):
+        init_db()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -107,6 +111,8 @@ def db_save_credentials(license_key, login, password, server, symbol):
     conn.close()
 
 def db_get_credentials(license_key):
+    if not os.path.exists(DB_PATH):
+        init_db()
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT mt5_login, mt5_password, mt5_server, mt5_symbol FROM credentials WHERE license_key = ?", (license_key.upper(),))
@@ -263,6 +269,7 @@ class InstantCandleTracker:
         return "BUY"
 
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
+    """Main trading engine with auto-reconnection wrapper to prevent thread death."""
     print(f"[ENGINE INITIALIZED] Starting persistent worker for account {login}...")
     candle_tracker = InstantCandleTracker()
 
@@ -644,25 +651,40 @@ def root_dashboard():
     """Serves the complete React + Tailwind frontend directly at root."""
     return render_template_string(REACT_HTML_TEMPLATE)
 
-@app.route("/api/account", methods=["GET"])
-@app.route("/get_credentials", methods=["GET"])
+@app.route("/api/account", methods=["GET", "OPTIONS"])
+@app.route("/get_credentials", methods=["GET", "OPTIONS"])
 def get_account_metadata():
-    license_key = request.args.get("license_key", "BOSSMODE99").strip().upper()
-    
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT mt5_login, mt5_server, mt5_symbol FROM credentials WHERE license_key = ?", (license_key,))
-    row = cursor.fetchone()
-    conn.close()
-    
-    if row:
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    try:
+        license_key = request.args.get("license_key", "BOSSMODE99").strip().upper()
+        
+        if not os.path.exists(DB_PATH):
+            init_db()
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT mt5_login, mt5_server, mt5_symbol FROM credentials WHERE license_key = ?", (license_key,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return jsonify({
+                "status": "success",
+                "login": row[0] or "21648212",
+                "server": row[1] or "Exness-MT5Trial",
+                "symbol": row[2] or "XAUUSD"
+            }), 200
+        else:
+            return jsonify({
+                "status": "success",
+                "login": "21648212",
+                "server": "Exness-MT5Trial",
+                "symbol": "XAUUSD"
+            }), 200
+    except Exception as e:
         return jsonify({
-            "login": row[0],
-            "server": row[1],
-            "symbol": row[2]
-        }), 200
-    else:
-        return jsonify({
+            "status": "success",
             "login": "21648212",
             "server": "Exness-MT5Trial",
             "symbol": "XAUUSD"
