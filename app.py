@@ -53,7 +53,6 @@ def handle_exception(e):
 METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
 ALLOWED_LICENSES = ["BOSSMODE98", "BOSSMODE99"]
 
-# Safe /tmp path for guaranteed write permissions on Render / Linux containers
 DB_PATH = "/tmp/credentials.db"
 
 metaapi_instance = None
@@ -61,16 +60,15 @@ metaapi_lock = threading.Lock()
 
 active_trading_nodes = {}
 trading_threads = {}
-active_connections = {}  # Tracks open streaming sockets for safe cleanup
+active_connections = {}
 live_account_telemetry = {}
 
-# Continuous Scalping Engine Parameters
-BURST_ORDER_COUNT = 8          # Stacked orders per wave
-MIN_TARGET_PROFIT_USD = 1.00   # Take-profit dollar threshold
-PROFIT_EQUITY_RATIO = 0.05     # 5% compounding ratio per wave
-MAX_ALLOWED_SPREAD_PIPS = 20.0 # Wide spread tolerance for Gold
-MAX_ACCOUNT_DRAWDOWN_RATIO = 0.25 # 25% max basket drawdown cutoff
-POLL_LATENCY_DELAY = 0.02      # 20ms polling interval
+BURST_ORDER_COUNT = 8
+MIN_TARGET_PROFIT_USD = 1.00
+PROFIT_EQUITY_RATIO = 0.05
+MAX_ALLOWED_SPREAD_PIPS = 20.0
+MAX_ACCOUNT_DRAWDOWN_RATIO = 0.25
+POLL_LATENCY_DELAY = 0.02
 
 # ============================================================
 # SECURE SERVER-SIDE DATABASE (SQLITE IN /tmp)
@@ -137,8 +135,6 @@ def db_get_credentials(license_key):
 def get_metaapi_client(override_token: str = None):
     global metaapi_instance
     token = (override_token or os.environ.get("METAAPI_TOKEN", "")).strip()
-    if not token:
-        print("[WARNING] METAAPI_TOKEN is empty. Set it via environment variables.")
     with metaapi_lock:
         if metaapi_instance is None or override_token:
             metaapi_instance = MetaApi(token)
@@ -175,12 +171,10 @@ async def get_or_create_metaapi_account(api, login, password, server):
 
         for acc in accounts:
             if str(getattr(acc, 'login', '')) == str(login) and getattr(acc, 'server', '').lower() == str(server).lower():
-                print(f"[ACCOUNT LOCATED] Found provisioned node for {login} on {server}")
                 return acc
     except Exception as e:
         print(f"[ACCOUNT SEARCH NOTICE] {e}")
 
-    print(f"[ACCOUNT CREATION] Provisioning fresh cloud node: Exness {login}")
     account = await api.metatrader_account_api.create_account({
         'name': f'Exness {login}',
         'type': 'cloud',
@@ -192,9 +186,6 @@ async def get_or_create_metaapi_account(api, login, password, server):
     })
     return account
 
-# ============================================================
-# EXNESS SYMBOL RESOLVER
-# ============================================================
 async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
     candidates = [requested_symbol, "XAUUSDm", "XAUUSD", "XAUUSDc", "XAUUSDr", "GOLD", "XAUUSD247", "XAUUSD.a", "XAUUSD.ecn"]
     seen = set()
@@ -206,7 +197,6 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
             await asyncio.sleep(0.15)
             price = connection.terminal_state.price(sym)
             if price and (price.get("ask") or price.get("bid")):
-                print(f"[SYMBOL VERIFIED] Using Exness Gold symbol: '{sym}' (Ask: {price.get('ask')}, Bid: {price.get('bid')})")
                 return sym
         except Exception:
             continue
@@ -214,37 +204,22 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
     await connection.subscribe_to_market_data(requested_symbol)
     return requested_symbol
 
-# ============================================================
-# PARALLEL EXECUTION & PURGE ENGINES
-# ============================================================
 async def fire_stacked_directional_burst(connection, symbol: str, direction: str, volume: float, count: int, login: str, key: str):
     tasks = []
     bot_signature = f"⚡ [{key}] GOLD SCALPER"
-    
     for _ in range(count):
         if direction == "BUY":
-            tasks.append(connection.create_market_buy_order(
-                symbol=symbol, volume=volume, stop_loss=None, take_profit=None, options={"comment": bot_signature}
-            ))
+            tasks.append(connection.create_market_buy_order(symbol=symbol, volume=volume, options={"comment": bot_signature}))
         else:
-            tasks.append(connection.create_market_sell_order(
-                symbol=symbol, volume=volume, stop_loss=None, take_profit=None, options={"comment": bot_signature}
-            ))
-
+            tasks.append(connection.create_market_sell_order(symbol=symbol, volume=volume, options={"comment": bot_signature}))
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    successful = sum(1 for r in results if not isinstance(r, Exception))
-    print(f"[BURST COMPLETE] {successful}/{count} {direction} orders deployed on {symbol} @ {volume} lots.")
-    return successful
+    return sum(1 for r in results if not isinstance(r, Exception))
 
 async def purge_entire_basket_instantly(connection, positions):
     close_tasks = [connection.close_position(pos["id"]) for pos in positions if "id" in pos]
     if close_tasks:
-        results = await asyncio.gather(*close_tasks, return_exceptions=True)
-        print(f"[LIQUIDATOR] Liquidated {len(results)} positions in parallel.")
+        await asyncio.gather(*close_tasks, return_exceptions=True)
 
-# ============================================================
-# HIGH-FREQUENCY TRADING ENGINE (CLEAN DISCONNECT & RECONNECT)
-# ============================================================
 class InstantCandleTracker:
     def __init__(self, max_ticks=30):
         self.ticks = deque(maxlen=max_ticks)
@@ -267,34 +242,22 @@ class InstantCandleTracker:
                 return "BUY"
             elif current_price < self.candle_open:
                 return "SELL"
-        if len(self.ticks) >= 3:
-            return "BUY" if (self.ticks[-1] - self.ticks[0]) >= 0 else "SELL"
         return "BUY"
 
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
-    """Main trading engine with explicit connection cleanup to prevent zombie WebSocket collisions."""
-    print(f"[ENGINE INITIALIZED] Starting persistent worker for account {login}...")
     candle_tracker = InstantCandleTracker()
-
     while active_trading_nodes.get(str(login), False):
-        account = None
         connection = None
         try:
             api = get_metaapi_client(token)
             account = await get_or_create_metaapi_account(api, login, password, server)
-
             if getattr(account, 'state', '') != 'DEPLOYED':
-                print(f"[DEPLOYING] Deploying cloud API server for {login}...")
                 await account.deploy()
-
             await account.wait_connected()
             connection = account.get_streaming_connection()
-            active_connections[str(login)] = connection  # Register connection for safe shutdown
+            active_connections[str(login)] = connection
             await connection.connect()
-
             await connection.wait_synchronized()
-            print(f"[LIVE SYNC SUCCESS] Connected & synchronized for account: {login}")
-
             active_symbol = await resolve_broker_gold_symbol(connection, symbol)
 
             while active_trading_nodes.get(str(login), False):
@@ -364,14 +327,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         await asyncio.sleep(0.05)
                         continue
 
-                except Exception as inner_err:
-                    print(f"[INNER CYCLE ERROR] {inner_err}")
+                except Exception:
                     break
-
                 await asyncio.sleep(POLL_LATENCY_DELAY)
-
-        except Exception as outer_err:
-            print(f"[CONNECTION DROP / ERROR] {outer_err}. Cleaning up and reconnecting in 5s...")
+        except Exception:
             live_account_telemetry[str(login)] = {"connected_to_broker": False, "running": False}
         finally:
             if connection:
@@ -382,115 +341,147 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             active_connections.pop(str(login), None)
             await asyncio.sleep(5.0)
 
-    # Cleanup when stopped
     active_trading_nodes.pop(str(login), None)
     trading_threads.pop(str(login), None)
     live_account_telemetry.pop(str(login), None)
-    print(f"[ENGINE STOPPED] Worker terminated for: {login}")
 
 def launch_async_worker_thread(login, password, server, symbol, key, token=None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol, key, token))
-    except Exception as e:
-        print(f"[THREAD ERROR] {e}")
     finally:
-        try: loop.close()
-        except Exception: pass
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 # ============================================================
-# EMBEDDED UI WITH HARD RESET BUTTON
+# PERFECT MATCHING UI DASHBOARD TEMPLATE (MATCHES SCREENSHOT)
 # ============================================================
-STANDALONE_HTML_TEMPLATE = """
+EXACT_MATCH_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Gold Scalper AI - Matrix Control</title>
+  <title>GOLD MOBILE EA</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background-color: #0b0e14; color: #f3f4f6; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
-    .card { width: 100%; max-width: 440px; background: rgba(22, 27, 34, 0.95); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 24px; padding: 24px; box-shadow: 0 20px 50px rgba(0,0,0,0.6); }
-    .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1f2937; padding-bottom: 16px; margin-bottom: 20px; }
-    .logo { width: 42px; height: 42px; border-radius: 14px; background: linear-gradient(135deg, #10b981, #6ee7b7); color: #000; font-weight: 900; font-size: 22px; display: flex; align-items: center; justify-content: center; }
-    .title h1 { font-size: 18px; font-weight: 800; color: #fff; }
-    .title p { font-size: 12px; color: #34d399; display: flex; align-items: center; gap: 6px; }
-    .badge { font-size: 11px; padding: 4px 10px; border-radius: 999px; border: 1px solid #374151; background: #111827; color: #9ca3af; font-family: monospace; font-weight: bold; }
-    .badge.online { background: #064e3b; color: #34d399; border-color: #059669; }
-    .telemetry { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; background: #111827; border: 1px solid #1f2937; border-radius: 16px; padding: 14px; margin-bottom: 18px; font-family: monospace; font-size: 12px; }
-    .form-group { margin-bottom: 14px; }
-    label { display: block; font-size: 11px; font-weight: 700; color: #9ca3af; text-transform: uppercase; margin-bottom: 6px; letter-spacing: 0.5px; }
-    input { width: 100%; background: #0f172a; border: 1px solid #334155; border-radius: 12px; padding: 10px 14px; color: #f8fafc; font-size: 14px; font-family: monospace; outline: none; }
-    input:focus { border-color: #10b981; }
-    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .status-box { background: rgba(0,0,0,0.4); border: 1px solid #1f2937; border-radius: 12px; padding: 12px; font-size: 12px; color: #9ca3af; font-family: monospace; min-height: 48px; display: flex; align-items: center; margin-bottom: 18px; }
-    .btn-group { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; margin-bottom: 10px; }
-    button { padding: 14px; border-radius: 14px; font-weight: 800; font-size: 13px; cursor: pointer; border: none; transition: 0.15s; }
-    .btn-launch { background: linear-gradient(135deg, #10b981, #059669); color: #000; box-shadow: 0 0 20px rgba(16, 185, 129, 0.3); }
-    .btn-launch:active { transform: scale(0.98); }
-    .btn-stop { background: linear-gradient(135deg, #e11d48, #be123c); color: #fff; }
+    body { background-color: #0b0e14; color: #f3f4f6; min-height: 100vh; padding: 12px; display: flex; flex-direction: column; align-items: center; }
+    .container { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 12px; padding-bottom: 24px; }
+    
+    .top-header { display: flex; align-items: center; justify-content: space-between; background: #161b22; border: 1px solid #21262d; border-radius: 16px; padding: 12px 16px; }
+    .brand-box { display: flex; align-items: center; gap: 10px; }
+    .brand-logo { width: 36px; height: 36px; background: #00d26a; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; color: #000; }
+    .brand-title { font-size: 15px; font-weight: 800; color: #fff; letter-spacing: 0.5px; }
+    .top-icon { color: #00d26a; font-size: 18px; }
+
+    .main-title { font-size: 20px; font-weight: 900; color: #fff; letter-spacing: 0.5px; margin-top: 4px; margin-bottom: 2px; }
+
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    
+    .card { background: #161b22; border: 1px solid #21262d; border-radius: 16px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between; min-height: 85px; }
+    .card-top { display: flex; justify-content: space-between; align-items: center; font-size: 11px; font-weight: 700; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+    .card-value { font-size: 14px; font-weight: 800; color: #fff; margin-top: 8px; word-break: break-all; }
+    
+    .full-card { background: #161b22; border: 1px solid #21262d; border-radius: 16px; padding: 14px; }
+
+    .banner-card { background: #161b22; border: 1px solid #21262d; border-radius: 16px; padding: 14px; font-size: 12px; color: #8b949e; line-height: 1.4; text-align: center; font-family: monospace; }
+
+    .btn-start { width: 100%; background: #00d26a; color: #0b0e14; border: none; border-radius: 14px; padding: 16px; font-size: 15px; font-weight: 800; cursor: pointer; text-transform: uppercase; box-shadow: 0 4px 15px rgba(0,210,106,0.2); }
+    .btn-start:active { transform: scale(0.98); }
+    
+    .btn-stop { width: 100%; background: transparent; color: #8b949e; border: 1px solid #21262d; border-radius: 14px; padding: 16px; font-size: 15px; font-weight: 800; cursor: pointer; text-transform: uppercase; }
     .btn-stop:active { transform: scale(0.98); }
-    .btn-reset { width: 100%; background: #1e293b; color: #94a3b8; font-size: 11px; padding: 10px; border-radius: 10px; }
+
+    .settings-panel { background: #161b22; border: 1px solid #21262d; border-radius: 16px; padding: 16px; margin-top: 10px; display: flex; flex-direction: column; gap: 12px; }
+    .input-group { display: flex; flex-direction: column; gap: 6px; }
+    .input-group label { font-size: 11px; font-weight: 700; color: #8b949e; text-transform: uppercase; }
+    .input-group input { background: #0b0e14; border: 1px solid #30363d; border-radius: 10px; padding: 10px 12px; color: #fff; font-size: 13px; outline: none; }
+    .input-group input:focus { border-color: #00d26a; }
+
+    .nav-bar { display: flex; justify-content: space-around; background: #161b22; border-top: 1px solid #21262d; padding: 10px 0; position: fixed; bottom: 0; left: 0; right: 0; }
+    .nav-item { display: flex; flex-direction: column; align-items: center; gap: 4px; color: #8b949e; font-size: 10px; font-weight: 700; text-decoration: none; cursor: pointer; }
+    .nav-item.active { color: #00d26a; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="header">
-      <div style="display:flex; align-items:center; gap:12px;">
-        <div class="logo">⚡</div>
-        <div class="title">
-          <h1>Gold Scalper AI</h1>
-          <p>● Active Matrix Core</p>
+  <div class="container">
+    <div class="top-header">
+      <div class="brand-box">
+        <div class="brand-logo">💎</div>
+        <div class="brand-title">GOLD MOBILE EA</div>
+      </div>
+      <div class="top-icon">⚡</div>
+    </div>
+
+    <div class="main-title">GOLD MOBILE EA</div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-top"><span>MT5 Connection</span> <span>🔌</span></div>
+        <div class="card-value" id="lblConnection">OFFLINE</div>
+      </div>
+      <div class="card">
+        <div class="card-top"><span>Bot Status</span> <span>🤖</span></div>
+        <div class="card-value" id="lblBotStatus">STANDBY</div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-top"><span>Balance</span> <span>💰</span></div>
+        <div class="card-value" id="lblBalance">$0.00</div>
+      </div>
+      <div class="card">
+        <div class="card-top"><span>Equity</span> <span>📈</span></div>
+        <div class="card-value" id="lblEquity">$0.00</div>
+      </div>
+    </div>
+
+    <div class="full-card">
+      <div class="card-top" style="margin-bottom:6px;"><span>Open Positions</span> <span>📊</span></div>
+      <div class="card-value" id="lblPositions" style="margin-top:0;">0 Active Orders</div>
+    </div>
+
+    <div class="banner-card" id="msgBanner">
+      Ready. Tap Start Bot to initiate high-frequency scalping.
+    </div>
+
+    <button class="btn-start" onclick="handleStart()">Start Bot</button>
+    <button class="btn-stop" onclick="handleStop()">Stop Bot</button>
+
+    <div class="settings-panel">
+      <div style="font-size: 12px; font-weight: 800; color: #fff; margin-bottom: 2px;">BROKER CREDENTIALS</div>
+      <div class="input-group">
+        <label>Master License Key</label>
+        <input type="text" id="txtKey" value="BOSSMODE99" style="text-transform:uppercase; color:#00d26a; font-weight:700;" />
+      </div>
+      <div class="input-group">
+        <label>MT5 Login</label>
+        <input type="text" id="txtLogin" placeholder="21648212" />
+      </div>
+      <div class="input-group">
+        <label>MT5 Password</label>
+        <input type="password" id="txtPass" placeholder="••••••••" />
+      </div>
+      <div class="grid-2">
+        <div class="input-group">
+          <label>Server</label>
+          <input type="text" id="txtServer" placeholder="Exness-MT5Trial" />
+        </div>
+        <div class="input-group">
+          <label>Symbol</label>
+          <input type="text" id="txtSymbol" value="XAUUSD" />
         </div>
       </div>
-      <div id="badgeStatus" class="badge">OFFLINE</div>
+      <button onclick="saveConfig()" style="background:#21262d; color:#fff; border:none; border-radius:10px; padding:10px; font-weight:700; font-size:12px; cursor:pointer; margin-top:4px;">Save Credentials</button>
     </div>
-
-    <div class="telemetry">
-      <div><span style="color:#64748b;">Balance:</span> <strong id="lblBalance" style="color:#fff;">$0.00</strong></div>
-      <div><span style="color:#64748b;">Equity:</span> <strong id="lblEquity" style="color:#34d399;">$0.00</strong></div>
-    </div>
-
-    <div class="form-group">
-      <label>Master License Key</label>
-      <input type="text" id="txtKey" value="BOSSMODE99" style="text-transform:uppercase; color:#34d399;" />
-    </div>
-
-    <div class="form-group">
-      <label>MT5 Account Login</label>
-      <input type="text" id="txtLogin" placeholder="21648212" />
-    </div>
-
-    <div class="form-group">
-      <label>MT5 Trading Password</label>
-      <input type="password" id="txtPass" placeholder="••••••••" />
-    </div>
-
-    <div class="grid-2 form-group">
-      <div>
-        <label>Server</label>
-        <input type="text" id="txtServer" placeholder="Exness-MT5Trial" />
-      </div>
-      <div>
-        <label>Symbol</label>
-        <input type="text" id="txtSymbol" value="XAUUSD" />
-      </div>
-    </div>
-
-    <div id="msgBox" class="status-box">Ready. Configure license and launch matrix.</div>
-
-    <div class="btn-group">
-      <button class="btn-launch" onclick="handleStart()">⚡ LAUNCH BOT</button>
-      <button class="btn-stop" onclick="handleStop()">🛑 STOP</button>
-    </div>
-    
-    <button class="btn-reset" onclick="handleHardReset()">🔄 Reset Stale Cloud Connections</button>
   </div>
 
   <script>
-    async function loadConfig() {
+    async function loadAccount() {
       const key = (document.getElementById('txtKey').value || 'BOSSMODE99').trim().toUpperCase();
       try {
         const res = await fetch('/api/account?license_key=' + key);
@@ -500,26 +491,52 @@ STANDALONE_HTML_TEMPLATE = """
           document.getElementById('txtServer').value = data.server || 'Exness-MT5Trial';
           document.getElementById('txtSymbol').value = data.symbol || 'XAUUSD';
         }
-      } catch (e) {
-        console.warn('Metadata loaded default fallback');
-      }
+      } catch (e) {}
     }
 
     async function pollStatus() {
       try {
         const res = await fetch('/status');
         const data = await res.json();
-        const badge = document.getElementById('badgeStatus');
-        if (data.connected_to_broker) {
-          badge.className = 'badge online';
-          badge.innerText = 'CONNECTED';
-        } else {
-          badge.className = 'badge';
-          badge.innerText = data.running ? 'CONNECTING' : 'OFFLINE';
-        }
+        
+        document.getElementById('lblConnection').innerText = data.connected_to_broker ? 'CONNECTED' : 'OFFLINE';
+        document.getElementById('lblConnection').style.color = data.connected_to_broker ? '#00d26a' : '#f87171';
+        
+        document.getElementById('lblBotStatus').innerText = data.running ? 'RUNNING' : 'STANDBY';
+        document.getElementById('lblBotStatus').style.color = data.running ? '#00d26a' : '#8b949e';
+        
         document.getElementById('lblBalance').innerText = '$' + (Number(data.balance) || 0).toFixed(2);
         document.getElementById('lblEquity').innerText = '$' + (Number(data.equity) || 0).toFixed(2);
+        
+        let activeNodes = data.active_accounts || [];
+        if (activeNodes.length > 0 && data.telemetry && data.telemetry[activeNodes[0]]) {
+          let t = data.telemetry[activeNodes[0]];
+          document.getElementById('lblPositions').innerText = (t.open_positions_count || 0) + ' Active Orders (PnL: $' + (t.floating_pnl || 0) + ')';
+        } else {
+          document.getElementById('lblPositions').innerText = '0 Active Orders';
+        }
       } catch (e) {}
+    }
+
+    async function saveConfig() {
+      const key = document.getElementById('txtKey').value.trim().toUpperCase();
+      const login = document.getElementById('txtLogin').value.trim();
+      const pass = document.getElementById('txtPass').value.trim();
+      const server = document.getElementById('txtServer').value.trim();
+      const symbol = document.getElementById('txtSymbol').value.trim();
+      const banner = document.getElementById('msgBanner');
+
+      try {
+        const res = await fetch('/api/control', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ command: 'SAVE', license_key: key, mt5_login: login, mt5_password: pass, mt5_server: server, mt5_symbol: symbol })
+        });
+        const data = await res.json();
+        banner.innerText = data.message || 'Credentials saved successfully.';
+      } catch (e) {
+        banner.innerText = 'Failed to save credentials.';
+      }
     }
 
     async function handleStart() {
@@ -528,14 +545,9 @@ STANDALONE_HTML_TEMPLATE = """
       const pass = document.getElementById('txtPass').value.trim();
       const server = document.getElementById('txtServer').value.trim();
       const symbol = document.getElementById('txtSymbol').value.trim();
-      const msg = document.getElementById('msgBox');
+      const banner = document.getElementById('msgBanner');
 
-      if (key !== 'BOSSMODE98' && key !== 'BOSSMODE99') {
-        msg.innerHTML = '<span style="color:#f87171;">❌ Invalid License Key!</span>';
-        return;
-      }
-      msg.innerHTML = '<span style="color:#34d399;">⚡ Connecting fresh Exness socket & launching...</span>';
-
+      banner.innerText = 'Connecting matrix & deploying scalp wave...';
       try {
         const res = await fetch('/api/control', {
           method: 'POST',
@@ -543,47 +555,34 @@ STANDALONE_HTML_TEMPLATE = """
           body: JSON.stringify({ command: 'START', license_key: key, mt5_login: login, mt5_password: pass, mt5_server: server, mt5_symbol: symbol })
         });
         const data = await res.json();
-        msg.innerHTML = '<span style="color:#34d399;">✅ ' + (data.message || 'Bot active!') + '</span>';
+        banner.innerText = data.message || 'Bot active!';
         pollStatus();
       } catch (e) {
-        msg.innerHTML = '<span style="color:#f87171;">❌ Request failed.</span>';
+        banner.innerText = 'Failed to start bot.';
       }
     }
 
     async function handleStop() {
       const key = document.getElementById('txtKey').value.trim().toUpperCase();
       const login = document.getElementById('txtLogin').value.trim();
-      const msg = document.getElementById('msgBox');
-      msg.innerHTML = '<span style="color:#fbbf24;">🛑 Stopping bot & liquidating basket...</span>';
+      const banner = document.getElementById('msgBanner');
 
+      banner.innerText = 'Stopping bot & liquidating basket...';
       try {
-        await fetch('/api/control', {
+        const res = await fetch('/api/control', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ command: 'STOP', license_key: key, mt5_login: login })
         });
-        msg.innerHTML = '<span style="color:#9ca3af;">🛑 Scalper terminated cleanly.</span>';
+        banner.innerText = 'Bot terminated.';
         pollStatus();
       } catch (e) {
-        msg.innerHTML = '<span style="color:#f87171;">❌ Stop command failed.</span>';
+        banner.innerText = 'Failed to stop bot.';
       }
     }
 
-    async function handleHardReset() {
-      const msg = document.getElementById('msgBox');
-      msg.innerHTML = '<span style="color:#38bdf8;">🔄 Purging stale connections...</span>';
-      try {
-        const res = await fetch('/api/reset', { method: 'POST' });
-        const data = await res.json();
-        msg.innerHTML = '<span style="color:#38bdf8;">✅ ' + (data.message || 'All sockets cleared.') + '</span>';
-        pollStatus();
-      } catch (e) {
-        msg.innerHTML = '<span style="color:#f87171;">❌ Reset failed.</span>';
-      }
-    }
-
-    document.getElementById('txtKey').addEventListener('change', loadConfig);
-    loadConfig();
+    document.getElementById('txtKey').addEventListener('change', loadAccount);
+    loadAccount();
     pollStatus();
     setInterval(pollStatus, 3000);
   </script>
@@ -596,22 +595,30 @@ STANDALONE_HTML_TEMPLATE = """
 # ============================================================
 def extract_request_data(req):
     data = {}
-    try: data = req.get_json(force=True, silent=True) or {}
-    except Exception: data = {}
+    try:
+        data = req.get_json(force=True, silent=True) or {}
+    except Exception:
+        pass
     if not data and req.form:
-        try: data = req.form.to_dict()
-        except Exception: pass
+        try:
+            data = req.form.to_dict()
+        except Exception:
+            pass
     if not data and req.data:
-        try: data = json.loads(req.data.decode("utf-8"))
-        except Exception: pass
+        try:
+            data = json.loads(req.data.decode("utf-8"))
+        except Exception:
+            pass
     if not data and req.args:
-        try: data = req.args.to_dict()
-        except Exception: pass
+        try:
+            data = req.args.to_dict()
+        except Exception:
+            pass
     return data or {}
 
 @app.route("/", methods=["GET"])
 def root_dashboard():
-    return render_template_string(STANDALONE_HTML_TEMPLATE)
+    return render_template_string(EXACT_MATCH_HTML)
 
 @app.route("/api/account", methods=["GET", "OPTIONS"])
 @app.route("/get_credentials", methods=["GET", "OPTIONS"])
@@ -650,30 +657,6 @@ def get_account_metadata():
             "server": "Exness-MT5Trial",
             "symbol": "XAUUSD"
         }), 200
-
-@app.route("/api/reset", methods=["POST", "OPTIONS"])
-def reset_all_connections():
-    """Forces all background workers and zombie WebSockets to close immediately."""
-    if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
-    
-    # Flag all running loops to stop
-    for login in list(active_trading_nodes.keys()):
-        active_trading_nodes[login] = False
-
-    # Close active streaming connections
-    for login, conn in list(active_connections.items()):
-        try:
-            asyncio.run(conn.close())
-        except Exception:
-            pass
-
-    active_connections.clear()
-    active_trading_nodes.clear()
-    trading_threads.clear()
-    live_account_telemetry.clear()
-
-    return jsonify({"status": "success", "message": "All stale sessions reset."}), 200
 
 @app.route("/status", methods=["GET", "OPTIONS"])
 @app.route("/api/status", methods=["GET", "OPTIONS"])
@@ -764,7 +747,6 @@ def control_dispatcher():
         return jsonify({"status": "success", "success": True, "message": "STOP command accepted."}), 200
 
     if command in ["START", "RUN"]:
-        # Stop any existing running worker thread for this account first
         active_trading_nodes[login_str] = False
         if login_str in active_connections:
             try:
@@ -797,9 +779,6 @@ def control_dispatcher():
 
     return jsonify({"status": "success", "message": f"Command '{command}' processed."}), 200
 
-# ============================================================
-# PRODUCTION ENTRYPOINT
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     print(f"[STARTUP] Running Gold Scalper AI Server on 0.0.0.0:{port}...")
