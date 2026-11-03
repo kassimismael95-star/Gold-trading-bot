@@ -357,7 +357,7 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
             pass
 
 # ============================================================
-# PERFECT MATCHING UI DASHBOARD TEMPLATE (MATCHES SCREENSHOT)
+# BULLETPROOF UI TEMPLATE WITH SAFE FALLBACK PARSING
 # ============================================================
 EXACT_MATCH_HTML = """
 <!DOCTYPE html>
@@ -400,10 +400,6 @@ EXACT_MATCH_HTML = """
     .input-group label { font-size: 11px; font-weight: 700; color: #8b949e; text-transform: uppercase; }
     .input-group input { background: #0b0e14; border: 1px solid #30363d; border-radius: 10px; padding: 10px 12px; color: #fff; font-size: 13px; outline: none; }
     .input-group input:focus { border-color: #00d26a; }
-
-    .nav-bar { display: flex; justify-content: space-around; background: #161b22; border-top: 1px solid #21262d; padding: 10px 0; position: fixed; bottom: 0; left: 0; right: 0; }
-    .nav-item { display: flex; flex-direction: column; align-items: center; gap: 4px; color: #8b949e; font-size: 10px; font-weight: 700; text-decoration: none; cursor: pointer; }
-    .nav-item.active { color: #00d26a; }
   </style>
 </head>
 <body>
@@ -497,21 +493,27 @@ EXACT_MATCH_HTML = """
     async function pollStatus() {
       try {
         const res = await fetch('/status');
-        const data = await res.json();
+        const text = await res.text();
+        let data;
+        try {
+          data = JSON.parse(text);
+        } catch (err) {
+          return; // Skip cycle safely if response is not valid JSON yet
+        }
         
-        document.getElementById('lblConnection').innerText = data.connected_to_broker ? 'CONNECTED' : 'OFFLINE';
-        document.getElementById('lblConnection').style.color = data.connected_to_broker ? '#00d26a' : '#f87171';
+        document.getElementById('lblConnection').innerText = data?.connected_to_broker ? 'CONNECTED' : 'OFFLINE';
+        document.getElementById('lblConnection').style.color = data?.connected_to_broker ? '#00d26a' : '#f87171';
         
-        document.getElementById('lblBotStatus').innerText = data.running ? 'RUNNING' : 'STANDBY';
-        document.getElementById('lblBotStatus').style.color = data.running ? '#00d26a' : '#8b949e';
+        document.getElementById('lblBotStatus').innerText = data?.running ? 'RUNNING' : 'STANDBY';
+        document.getElementById('lblBotStatus').style.color = data?.running ? '#00d26a' : '#8b949e';
         
-        document.getElementById('lblBalance').innerText = '$' + (Number(data.balance) || 0).toFixed(2);
-        document.getElementById('lblEquity').innerText = '$' + (Number(data.equity) || 0).toFixed(2);
+        document.getElementById('lblBalance').innerText = '$' + (Number(data?.balance) || 0).toFixed(2);
+        document.getElementById('lblEquity').innerText = '$' + (Number(data?.equity) || 0).toFixed(2);
         
-        let activeNodes = data.active_accounts || [];
-        if (activeNodes.length > 0 && data.telemetry && data.telemetry[activeNodes[0]]) {
+        let activeNodes = data?.active_accounts || [];
+        if (activeNodes.length > 0 && data?.telemetry && data.telemetry[activeNodes[0]]) {
           let t = data.telemetry[activeNodes[0]];
-          document.getElementById('lblPositions').innerText = (t.open_positions_count || 0) + ' Active Orders (PnL: $' + (t.floating_pnl || 0) + ')';
+          document.getElementById('lblPositions').innerText = (t?.open_positions_count || 0) + ' Active Orders (PnL: $' + (t?.floating_pnl || 0) + ')';
         } else {
           document.getElementById('lblPositions').innerText = '0 Active Orders';
         }
@@ -533,7 +535,7 @@ EXACT_MATCH_HTML = """
           body: JSON.stringify({ command: 'SAVE', license_key: key, mt5_login: login, mt5_password: pass, mt5_server: server, mt5_symbol: symbol })
         });
         const data = await res.json();
-        banner.innerText = data.message || 'Credentials saved successfully.';
+        banner.innerText = data?.message || 'Credentials saved successfully.';
       } catch (e) {
         banner.innerText = 'Failed to save credentials.';
       }
@@ -555,7 +557,7 @@ EXACT_MATCH_HTML = """
           body: JSON.stringify({ command: 'START', license_key: key, mt5_login: login, mt5_password: pass, mt5_server: server, mt5_symbol: symbol })
         });
         const data = await res.json();
-        banner.innerText = data.message || 'Bot active!';
+        banner.innerText = data?.message || 'Bot active!';
         pollStatus();
       } catch (e) {
         banner.innerText = 'Failed to start bot.';
