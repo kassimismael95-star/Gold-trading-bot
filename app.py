@@ -235,7 +235,7 @@ async def purge_entire_basket_instantly(connection, positions):
         print(f"[LIQUIDATOR] Liquidated {len(results)} positions in parallel.")
 
 # ============================================================
-# HIGH-FREQUENCY TRADING & STREAMING ENGINE
+# HIGH-FREQUENCY TRADING ENGINE (WITH AUTO-RECONNECT WRAPPER)
 # ============================================================
 class InstantCandleTracker:
     def __init__(self, max_ticks=30):
@@ -264,135 +264,121 @@ class InstantCandleTracker:
         return "BUY"
 
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
-    """Main trading and telemetry engine using MetaApi streaming connection."""
-    print(f"[ENGINE INITIALIZED] Connecting account {login} on {server}...")
-    account = None
+    """Main trading engine with auto-reconnection wrapper to prevent thread death."""
+    print(f"[ENGINE INITIALIZED] Starting persistent worker for account {login}...")
     candle_tracker = InstantCandleTracker()
-    consecutive_errors = 0
 
-    try:
-        api = get_metaapi_client(token)
-        
-        # 1. Get or provision the account
-        account = await get_or_create_metaapi_account(api, login, password, server)
+    while active_trading_nodes.get(str(login), False):
+        account = None
+        connection = None
+        try:
+            api = get_metaapi_client(token)
+            
+            # 1. Get or provision the account
+            account = await get_or_create_metaapi_account(api, login, password, server)
 
-        # 2. Ensure account is deployed
-        if getattr(account, 'state', '') != 'DEPLOYED':
-            print(f"[DEPLOYING] Deploying cloud API server for {login}...")
-            await account.deploy()
+            # 2. Ensure account is deployed
+            if getattr(account, 'state', '') != 'DEPLOYED':
+                print(f"[DEPLOYING] Deploying cloud API server for {login}...")
+                await account.deploy()
 
-        # 3. Establish a streaming connection to pull live terminal data
-        await account.wait_connected()
-        connection = account.get_streaming_connection()
-        await connection.connect()
+            # 3. Establish a streaming connection with auto-reconnect
+            await account.wait_connected()
+            connection = account.get_streaming_connection()
+            await connection.connect()
 
-        # Wait for terminal state to synchronize with Exness server
-        await connection.wait_synchronized()
-        print(f"[LIVE SYNC SUCCESS] Terminal state synchronized with Exness server for account: {login}")
+            # Wait for terminal state to synchronize with Exness server
+            await connection.wait_synchronized()
+            print(f"[LIVE SYNC SUCCESS] Connected & synchronized for account: {login}")
 
-        # Resolve broker-specific Gold symbol
-        active_symbol = await resolve_broker_gold_symbol(connection, symbol)
+            active_symbol = await resolve_broker_gold_symbol(connection, symbol)
 
-        # Continuous Zero-Downtime Loop
-        while active_trading_nodes.get(str(login), False):
-            try:
-                # 4. Access live metrics correctly via terminal_state
-                terminal_state = connection.terminal_state
-                account_info = terminal_state.account_information or {}
-                positions = terminal_state.positions or []
+            # Inner trading & telemetry cycle
+            while active_trading_nodes.get(str(login), False):
+                try:
+                    terminal_state = connection.terminal_state
+                    account_info = terminal_state.account_information or {}
+                    positions = terminal_state.positions or []
 
-                balance = float(account_info.get('balance', 0.0) or 0.0)
-                equity = float(account_info.get('equity', 0.0) or 0.0)
-                free_margin = float(account_info.get('freeMargin', 0.0) or 0.0)
-                margin_level = float(account_info.get('marginLevel', 0.0) or 0.0)
+                    balance = float(account_info.get('balance', 0.0) or 0.0)
+                    equity = float(account_info.get('equity', 0.0) or 0.0)
+                    free_margin = float(account_info.get('freeMargin', 0.0) or 0.0)
+                    margin_level = float(account_info.get('marginLevel', 0.0) or 0.0)
 
-                price = terminal_state.price(active_symbol)
-                if not price or not price.get("bid"):
-                    await connection.subscribe_to_market_data(active_symbol)
-                    await asyncio.sleep(0.1)
-                    continue
-
-                current_ask = price.get("ask")
-                current_bid = price.get("bid")
-                mid_price = (current_ask + current_bid) / 2.0
-                candle_tracker.record_tick(mid_price)
-
-                symbol_positions = [p for p in positions if p.get("symbol") == active_symbol]
-                net_floating_profit = equity - balance
-
-                # Update live telemetry for frontend dashboards
-                live_account_telemetry[str(login)] = {
-                    "connected_to_broker": getattr(terminal_state, "connected_to_broker", True),
-                    "balance": balance,
-                    "equity": equity,
-                    "free_margin": free_margin,
-                    "margin_level": margin_level,
-                    "floating_pnl": round(net_floating_profit, 2),
-                    "open_positions_count": len(symbol_positions),
-                    "active_symbol": active_symbol,
-                    "symbol_price": {"ask": current_ask, "bid": current_bid},
-                    "last_updated": datetime.datetime.utcnow().isoformat()
-                }
-
-                # 1. RISK SAFEGUARD: Drawdown Cutoff
-                max_allowed_drawdown = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
-                if symbol_positions and net_floating_profit < -max_allowed_drawdown:
-                    print(f"[CIRCUIT BREAKER] Floating Drawdown -${abs(net_floating_profit):.2f} exceeded limit. Purging basket.")
-                    await purge_entire_basket_instantly(connection, symbol_positions)
-                    await asyncio.sleep(2.0)
-                    continue
-
-                # 2. TAKE-PROFIT PURGE TRIGGER
-                dynamic_profit_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
-                if symbol_positions and net_floating_profit >= dynamic_profit_target:
-                    print(f"[TARGET HIT] Net Profit +${net_floating_profit:.2f} >= Target ${dynamic_profit_target:.2f}. Liquidating.")
-                    await purge_entire_basket_instantly(connection, symbol_positions)
-                    consecutive_errors = 0
-                    await asyncio.sleep(0.02)
-                    continue
-
-                # 3. ZERO-DOWNTIME INSTANT RELOAD
-                if len(symbol_positions) == 0:
-                    current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
-                    if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
-                        await asyncio.sleep(POLL_LATENCY_DELAY)
+                    price = terminal_state.price(active_symbol)
+                    if not price or not price.get("bid"):
+                        await connection.subscribe_to_market_data(active_symbol)
+                        await asyncio.sleep(0.1)
                         continue
 
-                    direction = candle_tracker.determine_bias()
-                    assigned_lot = calculate_dynamic_lot_size(equity if equity > 0 else balance, free_margin)
-                    active_burst_count = BURST_ORDER_COUNT if free_margin >= 25.0 else 2
+                    current_ask = price.get("ask")
+                    current_bid = price.get("bid")
+                    mid_price = (current_ask + current_bid) / 2.0
+                    candle_tracker.record_tick(mid_price)
 
-                    print(f"[BURST DISPATCH] Firing {direction} wave ({active_burst_count} orders @ {assigned_lot} lots) on {active_symbol}")
-                    success_count = await fire_stacked_directional_burst(
-                        connection, active_symbol, direction, assigned_lot, active_burst_count, login, key
-                    )
+                    symbol_positions = [p for p in positions if p.get("symbol") == active_symbol]
+                    net_floating_profit = equity - balance
 
-                    if success_count == 0:
-                        consecutive_errors += 1
-                        if consecutive_errors >= 3:
-                            await asyncio.sleep(5.0)
-                            consecutive_errors = 0
-                    else:
-                        consecutive_errors = 0
+                    # Update live telemetry for frontend dashboards
+                    live_account_telemetry[str(login)] = {
+                        "connected_to_broker": True,
+                        "balance": balance,
+                        "equity": equity,
+                        "free_margin": free_margin,
+                        "margin_level": margin_level,
+                        "floating_pnl": round(net_floating_profit, 2),
+                        "open_positions_count": len(symbol_positions),
+                        "active_symbol": active_symbol,
+                        "symbol_price": {"ask": current_ask, "bid": current_bid},
+                        "last_updated": datetime.datetime.utcnow().isoformat()
+                    }
 
-                    await asyncio.sleep(0.05)
-                    continue
+                    # --- Risk & Strategy Execution ---
+                    max_allowed_drawdown = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
+                    if symbol_positions and net_floating_profit < -max_allowed_drawdown:
+                        await purge_entire_basket_instantly(connection, symbol_positions)
+                        await asyncio.sleep(2.0)
+                        continue
 
-            except Exception as loop_err:
-                print(f"[CYCLE ERROR] {loop_err}")
-                await asyncio.sleep(1.0)
+                    dynamic_profit_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
+                    if symbol_positions and net_floating_profit >= dynamic_profit_target:
+                        await purge_entire_basket_instantly(connection, symbol_positions)
+                        await asyncio.sleep(0.02)
+                        continue
 
-            await asyncio.sleep(POLL_LATENCY_DELAY)
+                    if len(symbol_positions) == 0:
+                        current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
+                        if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
+                            await asyncio.sleep(POLL_LATENCY_DELAY)
+                            continue
 
-    except Exception as e:
-        print(f"[CYCLE ERROR] {str(e)}")
-        traceback.print_exc()
-    finally:
-        active_trading_nodes.pop(str(login), None)
-        trading_threads.pop(str(login), None)
-        if str(login) in live_account_telemetry:
-            live_account_telemetry[str(login)]["connected_to_broker"] = False
-        print(f"[ENGINE STOPPED] Worker terminated for: {login}")
+                        direction = candle_tracker.determine_bias()
+                        assigned_lot = calculate_dynamic_lot_size(equity if equity > 0 else balance, free_margin)
+                        active_burst_count = BURST_ORDER_COUNT if free_margin >= 25.0 else 2
+
+                        await fire_stacked_directional_burst(
+                            connection, active_symbol, direction, assigned_lot, active_burst_count, login, key
+                        )
+                        await asyncio.sleep(0.05)
+                        continue
+
+                except Exception as inner_err:
+                    print(f"[INNER CYCLE ERROR] {inner_err}")
+                    # Break inner loop to trigger safe reconnection if terminal drops
+                    break
+
+                await asyncio.sleep(POLL_LATENCY_DELAY)
+
+        except Exception as outer_err:
+            print(f"[CONNECTION DROP / ERROR] {outer_err}. Reconnecting in 5 seconds...")
+            live_account_telemetry[str(login)] = {"connected_to_broker": False}
+            await asyncio.sleep(5.0)  # Wait before attempting a clean auto-reconnect
+
+    # Cleanup when explicitly stopped
+    active_trading_nodes.pop(str(login), None)
+    trading_threads.pop(str(login), None)
+    live_account_telemetry.pop(str(login), None)
+    print(f"[ENGINE STOPPED] Worker terminated for: {login}")
 
 def launch_async_worker_thread(login, password, server, symbol, key, token=None):
     loop = asyncio.new_event_loop()
