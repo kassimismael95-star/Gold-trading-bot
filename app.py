@@ -32,10 +32,6 @@ def add_cors_headers(response):
 # ============================================================
 @app.errorhandler(Exception)
 def handle_exception(e):
-    """
-    Forces Flask to always reply with valid JSON whenever an error or a 404/500 occurs,
-    preventing HTML response mismatches on Bolt and mobile web interfaces.
-    """
     if isinstance(e, HTTPException):
         return jsonify({
             "status": "error",
@@ -44,7 +40,6 @@ def handle_exception(e):
             "code": e.code
         }), e.code
 
-    # Log full traceback for debugging on Render / Cloud logs
     traceback.print_exc()
     return jsonify({
         "status": "error",
@@ -156,6 +151,40 @@ def calculate_dynamic_lot_size(equity: float, free_margin: float) -> float:
         return 2.00
 
 # ============================================================
+# METAAPI ACCOUNT PROVISIONING & CONNECTION RESOLVER
+# ============================================================
+async def get_or_create_metaapi_account(api, login, password, server):
+    """Finds an existing MetaApi account or creates a new one for the broker credentials."""
+    try:
+        if hasattr(api.metatrader_account_api, 'get_accounts_with_classic_pagination'):
+            res = await api.metatrader_account_api.get_accounts_with_classic_pagination()
+            accounts = res.get('items', []) if isinstance(res, dict) else res
+        elif hasattr(api.metatrader_account_api, 'get_accounts'):
+            accounts = await api.metatrader_account_api.get_accounts()
+        else:
+            accounts = []
+
+        for acc in accounts:
+            if str(getattr(acc, 'login', '')) == str(login) and getattr(acc, 'server', '').lower() == str(server).lower():
+                print(f"[ACCOUNT LOCATED] Found provisioned node for {login} on {server}")
+                return acc
+    except Exception as e:
+        print(f"[ACCOUNT SEARCH NOTICE] {e}")
+
+    # Create the account if it doesn't exist yet
+    print(f"[ACCOUNT CREATION] Provisioning fresh cloud node: Exness {login}")
+    account = await api.metatrader_account_api.create_account({
+        'name': f'Exness {login}',
+        'type': 'cloud',
+        'login': str(login),
+        'password': password,
+        'server': server,
+        'platform': 'mt5',
+        'magic': 9924102
+    })
+    return account
+
+# ============================================================
 # EXNESS SYMBOL RESOLVER
 # ============================================================
 async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
@@ -205,38 +234,8 @@ async def purge_entire_basket_instantly(connection, positions):
         results = await asyncio.gather(*close_tasks, return_exceptions=True)
         print(f"[LIQUIDATOR] Liquidated {len(results)} positions in parallel.")
 
-async def get_or_create_metaapi_account(api, login, password, server):
-    login_str = str(login).strip()
-    try:
-        if hasattr(api.metatrader_account_api, 'get_accounts_with_classic_pagination'):
-            res = await api.metatrader_account_api.get_accounts_with_classic_pagination()
-            accounts = res.get('items', []) if isinstance(res, dict) else res
-        elif hasattr(api.metatrader_account_api, 'get_accounts'):
-            accounts = await api.metatrader_account_api.get_accounts()
-        else:
-            accounts = []
-
-        for acc in accounts:
-            if str(getattr(acc, 'login', '')) == login_str and getattr(acc, 'server', '').lower() == server.lower():
-                if getattr(acc, 'state', '') != 'DEPLOYED':
-                    try: await acc.deploy()
-                    except Exception: pass
-                return acc
-    except Exception as e:
-        print(f"[ACCOUNT SEARCH NOTICE] {e}")
-
-    return await api.metatrader_account_api.create_account({
-        "name": f"Node_{login_str}",
-        "type": "cloud",
-        "login": login_str,
-        "password": password,
-        "server": server,
-        "platform": "mt5",
-        "magic": 9924102,
-    })
-
 # ============================================================
-# HIGH-FREQUENCY TRADING ENGINE
+# HIGH-FREQUENCY TRADING & STREAMING ENGINE
 # ============================================================
 class InstantCandleTracker:
     def __init__(self, max_ticks=30):
@@ -265,6 +264,7 @@ class InstantCandleTracker:
         return "BUY"
 
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
+    """Main trading and telemetry engine using MetaApi streaming connection."""
     print(f"[ENGINE INITIALIZED] Connecting account {login} on {server}...")
     account = None
     candle_tracker = InstantCandleTracker()
@@ -272,27 +272,41 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
     try:
         api = get_metaapi_client(token)
+        
+        # 1. Get or provision the account
         account = await get_or_create_metaapi_account(api, login, password, server)
 
+        # 2. Ensure account is deployed
+        if getattr(account, 'state', '') != 'DEPLOYED':
+            print(f"[DEPLOYING] Deploying cloud API server for {login}...")
+            await account.deploy()
+
+        # 3. Establish a streaming connection to pull live terminal data
         await account.wait_connected()
         connection = account.get_streaming_connection()
         await connection.connect()
-        await connection.wait_synchronized()
-        print(f"[CORE LIVE] Connected & Synchronized: {login}")
 
+        # Wait for terminal state to synchronize with Exness server
+        await connection.wait_synchronized()
+        print(f"[LIVE SYNC SUCCESS] Terminal state synchronized with Exness server for account: {login}")
+
+        # Resolve broker-specific Gold symbol
         active_symbol = await resolve_broker_gold_symbol(connection, symbol)
 
+        # Continuous Zero-Downtime Loop
         while active_trading_nodes.get(str(login), False):
             try:
-                account_info = account.account_information or {}
-                equity = float(account_info.get("equity", 0) or 0)
-                balance = float(account_info.get("balance", 0) or 0)
-                free_margin = float(account_info.get("freeMargin", 0) or 0)
-                margin_level = float(account_info.get("marginLevel", 0) or 0)
-
+                # 4. Access live metrics correctly via terminal_state
                 terminal_state = connection.terminal_state
-                price = terminal_state.price(active_symbol)
+                account_info = terminal_state.account_information or {}
+                positions = terminal_state.positions or []
 
+                balance = float(account_info.get('balance', 0.0) or 0.0)
+                equity = float(account_info.get('equity', 0.0) or 0.0)
+                free_margin = float(account_info.get('freeMargin', 0.0) or 0.0)
+                margin_level = float(account_info.get('marginLevel', 0.0) or 0.0)
+
+                price = terminal_state.price(active_symbol)
                 if not price or not price.get("bid"):
                     await connection.subscribe_to_market_data(active_symbol)
                     await asyncio.sleep(0.1)
@@ -303,11 +317,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 mid_price = (current_ask + current_bid) / 2.0
                 candle_tracker.record_tick(mid_price)
 
-                positions = terminal_state.positions or []
                 symbol_positions = [p for p in positions if p.get("symbol") == active_symbol]
                 net_floating_profit = equity - balance
 
-                # Update live telemetry for GET /api/status queries
+                # Update live telemetry for frontend dashboards
                 live_account_telemetry[str(login)] = {
                     "connected_to_broker": getattr(terminal_state, "connected_to_broker", True),
                     "balance": balance,
@@ -372,7 +385,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             await asyncio.sleep(POLL_LATENCY_DELAY)
 
     except Exception as e:
-        print(f"[CRITICAL ENGINE ERROR] {e}")
+        print(f"[CYCLE ERROR] {str(e)}")
         traceback.print_exc()
     finally:
         active_trading_nodes.pop(str(login), None)
