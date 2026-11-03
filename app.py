@@ -156,9 +156,6 @@ def calculate_dynamic_lot_size(equity: float, free_margin: float) -> float:
     else:
         return 2.00
 
-# ============================================================
-# METAAPI ACCOUNT PROVISIONING & CONNECTION RESOLVER
-# ============================================================
 async def get_or_create_metaapi_account(api, login, password, server):
     try:
         if hasattr(api.metatrader_account_api, 'get_accounts_with_classic_pagination'):
@@ -357,9 +354,9 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
             pass
 
 # ============================================================
-# BULLETPROOF UI TEMPLATE WITH SAFE FALLBACK PARSING
+# PURE STANDALONE HTML (ZERO BOLT DEPENDENCIES, ZERO LOOPS)
 # ============================================================
-EXACT_MATCH_HTML = """
+PURE_NATIVE_HTML = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -386,7 +383,6 @@ EXACT_MATCH_HTML = """
     .card-value { font-size: 14px; font-weight: 800; color: #fff; margin-top: 8px; word-break: break-all; }
     
     .full-card { background: #161b22; border: 1px solid #21262d; border-radius: 16px; padding: 14px; }
-
     .banner-card { background: #161b22; border: 1px solid #21262d; border-radius: 16px; padding: 14px; font-size: 12px; color: #8b949e; line-height: 1.4; text-align: center; font-family: monospace; }
 
     .btn-start { width: 100%; background: #00d26a; color: #0b0e14; border: none; border-radius: 14px; padding: 16px; font-size: 15px; font-weight: 800; cursor: pointer; text-transform: uppercase; box-shadow: 0 4px 15px rgba(0,210,106,0.2); }
@@ -498,7 +494,7 @@ EXACT_MATCH_HTML = """
         try {
           data = JSON.parse(text);
         } catch (err) {
-          return; // Skip cycle safely if response is not valid JSON yet
+          return; // Safely skip tick if server is mid-boot or packet is partial
         }
         
         document.getElementById('lblConnection').innerText = data?.connected_to_broker ? 'CONNECTED' : 'OFFLINE';
@@ -620,7 +616,7 @@ def extract_request_data(req):
 
 @app.route("/", methods=["GET"])
 def root_dashboard():
-    return render_template_string(EXACT_MATCH_HTML)
+    return render_template_string(PURE_NATIVE_HTML)
 
 @app.route("/api/account", methods=["GET", "OPTIONS"])
 @app.route("/get_credentials", methods=["GET", "OPTIONS"])
