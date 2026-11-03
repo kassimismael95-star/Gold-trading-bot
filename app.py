@@ -7,7 +7,7 @@ import threading
 import datetime
 import traceback
 from collections import deque
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from metaapi_cloud_sdk import MetaApi
@@ -28,7 +28,7 @@ def add_cors_headers(response):
     return response
 
 # ============================================================
-# GLOBAL EXCEPTION HANDLER (PURE JSON RESPONSES ONLY)
+# GLOBAL EXCEPTION HANDLER (PURE JSON ONLY)
 # ============================================================
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -76,7 +76,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_credentials (
+        CREATE TABLE IF NOT EXISTS credentials (
             license_key TEXT PRIMARY KEY,
             mt5_login TEXT NOT NULL,
             mt5_password TEXT NOT NULL,
@@ -94,7 +94,7 @@ def db_save_credentials(license_key, login, password, server, symbol):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO user_credentials (license_key, mt5_login, mt5_password, mt5_server, mt5_symbol, updated_at)
+        INSERT INTO credentials (license_key, mt5_login, mt5_password, mt5_server, mt5_symbol, updated_at)
         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(license_key) DO UPDATE SET
             mt5_login=excluded.mt5_login,
@@ -109,7 +109,7 @@ def db_save_credentials(license_key, login, password, server, symbol):
 def db_get_credentials(license_key):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT mt5_login, mt5_password, mt5_server, mt5_symbol FROM user_credentials WHERE license_key = ?", (license_key.upper(),))
+    cursor.execute("SELECT mt5_login, mt5_password, mt5_server, mt5_symbol FROM credentials WHERE license_key = ?", (license_key.upper(),))
     row = cursor.fetchone()
     conn.close()
     if row:
@@ -171,7 +171,6 @@ async def get_or_create_metaapi_account(api, login, password, server):
     except Exception as e:
         print(f"[ACCOUNT SEARCH NOTICE] {e}")
 
-    # Create the account if it doesn't exist yet
     print(f"[ACCOUNT CREATION] Provisioning fresh cloud node: Exness {login}")
     account = await api.metatrader_account_api.create_account({
         'name': f'Exness {login}',
@@ -264,7 +263,6 @@ class InstantCandleTracker:
         return "BUY"
 
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
-    """Main trading engine with auto-reconnection wrapper to prevent thread death."""
     print(f"[ENGINE INITIALIZED] Starting persistent worker for account {login}...")
     candle_tracker = InstantCandleTracker()
 
@@ -274,20 +272,16 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         try:
             api = get_metaapi_client(token)
             
-            # 1. Get or provision the account
             account = await get_or_create_metaapi_account(api, login, password, server)
 
-            # 2. Ensure account is deployed
             if getattr(account, 'state', '') != 'DEPLOYED':
                 print(f"[DEPLOYING] Deploying cloud API server for {login}...")
                 await account.deploy()
 
-            # 3. Establish a streaming connection with auto-reconnect
             await account.wait_connected()
             connection = account.get_streaming_connection()
             await connection.connect()
 
-            # Wait for terminal state to synchronize with Exness server
             await connection.wait_synchronized()
             print(f"[LIVE SYNC SUCCESS] Connected & synchronized for account: {login}")
 
@@ -319,9 +313,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                     symbol_positions = [p for p in positions if p.get("symbol") == active_symbol]
                     net_floating_profit = equity - balance
 
-                    # Update live telemetry for frontend dashboards
+                    # Update live telemetry
                     live_account_telemetry[str(login)] = {
                         "connected_to_broker": True,
+                        "running": True,
                         "balance": balance,
                         "equity": equity,
                         "free_margin": free_margin,
@@ -333,19 +328,21 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         "last_updated": datetime.datetime.utcnow().isoformat()
                     }
 
-                    # --- Risk & Strategy Execution ---
+                    # Risk safeguard: 25% max basket drawdown cutoff
                     max_allowed_drawdown = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
                     if symbol_positions and net_floating_profit < -max_allowed_drawdown:
                         await purge_entire_basket_instantly(connection, symbol_positions)
                         await asyncio.sleep(2.0)
                         continue
 
+                    # Take-profit purge trigger
                     dynamic_profit_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
                     if symbol_positions and net_floating_profit >= dynamic_profit_target:
                         await purge_entire_basket_instantly(connection, symbol_positions)
                         await asyncio.sleep(0.02)
                         continue
 
+                    # Instant zero-downtime reload
                     if len(symbol_positions) == 0:
                         current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
                         if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
@@ -364,15 +361,14 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
                 except Exception as inner_err:
                     print(f"[INNER CYCLE ERROR] {inner_err}")
-                    # Break inner loop to trigger safe reconnection if terminal drops
                     break
 
                 await asyncio.sleep(POLL_LATENCY_DELAY)
 
         except Exception as outer_err:
             print(f"[CONNECTION DROP / ERROR] {outer_err}. Reconnecting in 5 seconds...")
-            live_account_telemetry[str(login)] = {"connected_to_broker": False}
-            await asyncio.sleep(5.0)  # Wait before attempting a clean auto-reconnect
+            live_account_telemetry[str(login)] = {"connected_to_broker": False, "running": False}
+            await asyncio.sleep(5.0)
 
     # Cleanup when explicitly stopped
     active_trading_nodes.pop(str(login), None)
@@ -390,6 +386,240 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
     finally:
         try: loop.close()
         except Exception: pass
+
+# ============================================================
+# EMBEDDED REACT + TAILWIND FRONTEND TEMPLATE
+# ============================================================
+REACT_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Gold Scalper AI - Matrix Control</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    body { background-color: #0b0e14; color: #f3f4f6; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-center p-4">
+  <div id="root" class="w-full flex justify-center"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      const [licenseKey, setLicenseKey] = useState("BOSSMODE99");
+      const [mt5Data, setMt5Data] = useState({ login: "", password: "", server: "", symbol: "XAUUSD" });
+      const [status, setStatus] = useState({ connected_to_broker: false, running: false, balance: 0.0, equity: 0.0 });
+      const [msg, setMsg] = useState("");
+
+      useEffect(() => {
+        const savedKey = localStorage.getItem("active_license_key") || "BOSSMODE99";
+        setLicenseKey(savedKey);
+        fetchAccountDetails(savedKey);
+        fetchStatus();
+
+        const interval = setInterval(fetchStatus, 2000);
+        return () => clearInterval(interval);
+      }, []);
+
+      const fetchAccountDetails = async (key) => {
+        try {
+          const res = await fetch(`/api/account?license_key=${key}`);
+          const data = await res.json();
+          if (data && data.login) {
+            setMt5Data(prev => ({
+              ...prev,
+              login: data.login,
+              server: data.server,
+              symbol: data.symbol || "XAUUSD"
+            }));
+          }
+        } catch (err) {
+          console.error("Failed to load saved credentials", err);
+        }
+      };
+
+      const fetchStatus = async () => {
+        try {
+          const res = await fetch(`/status`);
+          const data = await res.json();
+          setStatus(data);
+        } catch (err) {
+          console.error("Status fetch error", err);
+        }
+      };
+
+      const handleStart = async () => {
+        if (licenseKey !== "BOSSMODE98" && licenseKey !== "BOSSMODE99") {
+          setMsg("❌ Invalid License Key! Use BOSSMODE98 or BOSSMODE99.");
+          return;
+        }
+        setMsg("⚡ Validating & Launching Continuous Scalper Wave...");
+        try {
+          const res = await fetch(`/api/control`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              command: "START",
+              license_key: licenseKey,
+              mt5_login: mt5Data.login,
+              mt5_password: mt5Data.password,
+              mt5_server: mt5Data.server,
+              mt5_symbol: mt5Data.symbol
+            })
+          });
+          const data = await res.json();
+          setMsg(data.message || "Bot active & scalping live!");
+          fetchStatus();
+        } catch (err) {
+          setMsg("❌ Failed to reach backend.");
+        }
+      };
+
+      const handleStop = async () => {
+        setMsg("🛑 Liquidating basket & stopping bot...");
+        try {
+          await fetch(`/api/control`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              command: "STOP",
+              license_key: licenseKey,
+              mt5_login: mt5Data.login
+            })
+          });
+          setMsg("🛑 Scalper terminated.");
+          fetchStatus();
+        } catch (err) {
+          setMsg("❌ Failed to stop.");
+        }
+      };
+
+      return (
+        <div className="w-full max-w-md bg-[#161b22]/90 backdrop-blur-xl border border-white/10 rounded-3xl p-6 shadow-2xl">
+          <div className="flex items-center justify-between border-b border-gray-800 pb-4 mb-5">
+            <div className="flex items-center space-x-3">
+              <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-emerald-500 to-green-300 flex items-center justify-center text-black font-extrabold text-xl shadow-lg">
+                ⚡
+              </div>
+              <div>
+                <h1 className="text-lg font-bold text-white tracking-tight">Gold Scalper AI</h1>
+                <p className="text-xs text-emerald-400 font-medium flex items-center gap-1">
+                  <span className={`w-2 h-2 rounded-full ${status.running ? 'bg-emerald-400 animate-pulse' : 'bg-gray-500'}`}></span> 
+                  {status.running ? "Active Burst Matrix" : "Standby Mode"}
+                </p>
+              </div>
+            </div>
+            <div className={`text-xs px-2.5 py-1 rounded-full border ${status.connected_to_broker ? 'bg-emerald-950 text-emerald-400 border-emerald-500/40' : 'bg-gray-800 text-gray-400 border-gray-700'}`}>
+              {status.connected_to_broker ? "CONNECTED" : "OFFLINE"}
+            </div>
+          </div>
+
+          {status.running && (
+            <div className="bg-gray-900/60 border border-gray-800 rounded-2xl p-3.5 mb-4 text-xs font-mono">
+              <div className="grid grid-cols-2 gap-2">
+                <div><span className="text-gray-500">Balance:</span> <span className="text-white font-bold">${Number(status.balance || 0).toFixed(2)}</span></div>
+                <div><span className="text-gray-500">Equity:</span> <span className="text-emerald-400 font-bold">${Number(status.equity || 0).toFixed(2)}</span></div>
+              </div>
+            </div>
+          )}
+
+          <div className="mb-4">
+            <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1.5">Master License Key</label>
+            <input 
+              type="text" 
+              value={licenseKey} 
+              onChange={(e) => {
+                const val = e.target.value.toUpperCase();
+                setLicenseKey(val);
+                localStorage.setItem("active_license_key", val);
+                fetchAccountDetails(val);
+              }}
+              placeholder="BOSSMODE98 or BOSSMODE99" 
+              className="w-full bg-gray-900 border border-gray-700 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 uppercase tracking-widest font-mono text-emerald-400" 
+            />
+          </div>
+
+          <div className="space-y-3 mb-5">
+            <div>
+              <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1.5">MT5 Account Login</label>
+              <input 
+                type="text" 
+                value={mt5Data.login} 
+                onChange={(e) => setMt5Data({ ...mt5Data, login: e.target.value })}
+                placeholder="e.g. 21648212" 
+                className="w-full bg-gray-900 border border-gray-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500 font-mono" 
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1.5">MT5 Trading Password</label>
+              <input 
+                type="password" 
+                value={mt5Data.password} 
+                onChange={(e) => setMt5Data({ ...mt5Data, password: e.target.value })}
+                placeholder="••••••••" 
+                className="w-full bg-gray-900 border border-gray-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500 font-mono" 
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1.5">Broker Server</label>
+                <input 
+                  type="text" 
+                  value={mt5Data.server} 
+                  onChange={(e) => setMt5Data({ ...mt5Data, server: e.target.value })}
+                  placeholder="Exness-MT5Trial" 
+                  className="w-full bg-gray-900 border border-gray-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500 font-mono" 
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-semibold text-gray-400 uppercase tracking-wider mb-1.5">Symbol</label>
+                <input 
+                  type="text" 
+                  value={mt5Data.symbol} 
+                  onChange={(e) => setMt5Data({ ...mt5Data, symbol: e.target.value })}
+                  placeholder="XAUUSD" 
+                  className="w-full bg-gray-900 border border-gray-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-emerald-500 font-mono" 
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-black/50 border border-gray-800 rounded-xl p-3 mb-5 text-xs font-mono text-gray-400 min-h-[48px] flex items-center">
+            {msg || "Ready. Click Launch to initiate continuous wave scalping."}
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <button 
+              onClick={handleStart}
+              className="w-full py-3.5 bg-gradient-to-r from-emerald-500 to-green-600 hover:from-emerald-400 hover:to-green-500 text-black font-extrabold rounded-2xl shadow-lg transition active:scale-95"
+            >
+              ⚡ LAUNCH BOT
+            </button>
+
+            <button 
+              onClick={handleStop}
+              className="w-full py-3.5 bg-gradient-to-r from-rose-600 to-red-700 hover:from-rose-500 hover:to-red-600 text-white font-extrabold rounded-2xl shadow-lg transition active:scale-95"
+            >
+              🛑 STOP BOT
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
+"""
 
 # ============================================================
 # API CONTROLLER & MATCHING ROUTES
@@ -410,45 +640,62 @@ def extract_request_data(req):
     return data or {}
 
 @app.route("/", methods=["GET"])
-def health_root():
-    return jsonify({
-        "status": "online",
-        "service": "Gold Scalper AI Engine",
-        "compatible_frontend": "https://gold-mobile-ea-web-a-5m0x.bolt.host"
-    }), 200
+def root_dashboard():
+    """Serves the complete React + Tailwind frontend directly at root."""
+    return render_template_string(REACT_HTML_TEMPLATE)
 
-# Metadata retrieval for auto-populating fields on Bolt UI
 @app.route("/api/account", methods=["GET"])
 @app.route("/get_credentials", methods=["GET"])
 def get_account_metadata():
-    license_key = request.args.get("license_key", "").strip().upper()
-    if license_key in ALLOWED_LICENSES:
-        creds = db_get_credentials(license_key)
-        if creds:
-            return jsonify({
-                "status": "success",
-                "account": {
-                    "mt5_login": creds["mt5_login"],
-                    "mt5_server": creds["mt5_server"],
-                    "mt5_symbol": creds["mt5_symbol"],
-                    "has_stored_password": bool(creds["mt5_password"])
-                }
-            }), 200
-    return jsonify({"status": "not_found"}), 200
+    license_key = request.args.get("license_key", "BOSSMODE99").strip().upper()
+    
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT mt5_login, mt5_server, mt5_symbol FROM credentials WHERE license_key = ?", (license_key,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return jsonify({
+            "login": row[0],
+            "server": row[1],
+            "symbol": row[2]
+        }), 200
+    else:
+        return jsonify({
+            "login": "21648212",
+            "server": "Exness-MT5Trial",
+            "symbol": "XAUUSD"
+        }), 200
 
-# Live telemetry endpoint
 @app.route("/status", methods=["GET", "OPTIONS"])
 @app.route("/api/status", methods=["GET", "OPTIONS"])
 def status_endpoint():
     active_accounts = [login for login, running in active_trading_nodes.items() if running]
+    is_running = len(active_accounts) > 0
+    is_connected = False
+    balance = 0.0
+    equity = 0.0
+
+    if is_running:
+        first_login = active_accounts[0]
+        if first_login in live_account_telemetry:
+            t = live_account_telemetry[first_login]
+            is_connected = t.get("connected_to_broker", False)
+            balance = t.get("balance", 0.0)
+            equity = t.get("equity", 0.0)
+
     return jsonify({
         "status": "online",
+        "running": is_running,
+        "connected_to_broker": is_connected,
+        "balance": balance,
+        "equity": equity,
         "active_nodes_count": len(active_accounts),
         "active_accounts": active_accounts,
         "telemetry": live_account_telemetry
     }), 200
 
-# Universal dispatch controller (START, STOP, SAVE)
 @app.route("/control", methods=["GET", "POST", "OPTIONS"])
 @app.route("/start", methods=["GET", "POST", "OPTIONS"])
 @app.route("/api/control", methods=["GET", "POST", "OPTIONS"])
@@ -473,7 +720,6 @@ def control_dispatcher():
     mt5_server = str(data.get("mt5_server") or data.get("server") or data.get("broker") or "").strip()
     mt5_symbol = str(data.get("mt5_symbol") or data.get("symbol") or "XAUUSDm").strip()
 
-    # Check for saved credentials if inputs were omitted
     saved = db_get_credentials(license_key)
     if saved:
         mt5_login = mt5_login or saved["mt5_login"]
@@ -481,7 +727,6 @@ def control_dispatcher():
         mt5_server = mt5_server or saved["mt5_server"]
         mt5_symbol = mt5_symbol or saved["mt5_symbol"]
 
-    # Handle explicit SAVE command without starting the bot
     if command == "SAVE":
         if not mt5_login or not mt5_server:
             return jsonify({"status": "error", "message": "Login and Server are required to save."}), 200
@@ -495,7 +740,6 @@ def control_dispatcher():
             "message": "Missing credentials. Enter login, password, and server."
         }), 200
 
-    # Persist credentials on start
     db_save_credentials(license_key, mt5_login, mt5_password, mt5_server, mt5_symbol)
     login_str = str(mt5_login).strip()
 
