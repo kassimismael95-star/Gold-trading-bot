@@ -58,6 +58,14 @@ def handle_exception(error):
         "message": str(error), "login": "", "server": "", "symbol": "XAUUSD"
     }), 200
 
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({
+        "status": "online", "success": True, "connected": False,
+        "connected_to_broker": False, "running": False,
+        "login": "", "server": "", "symbol": "XAUUSD", "message": "Route not found."
+    }), 200
+
 def get_user_session_id():
     sid = request.cookies.get("ea_session_id")
     if not sid:
@@ -343,7 +351,6 @@ def verify_license():
         resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
         return resp, 200
 
-    # Force wipe existing stored credentials so frontend is forced to prompt for new ones
     db_clear_credentials(sid)
 
     resp = make_response(jsonify({
