@@ -1,13 +1,4 @@
-import os
-import re
-import sys
-import json
-import sqlite3
-import asyncio
-import threading
-import datetime
-import traceback
-import uuid
+import os, re, sqlite3, asyncio, threading, datetime, traceback, uuid
 from collections import deque
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -16,10 +7,10 @@ from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-# Enable full CORS and allow credentials for robust cookie session handling
 CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
 
 METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
+ALLOWED_LICENSES = {"BOSSMODE98", "BOSSMODE99"}
 DB_PATH = "/tmp/credentials.db"
 
 metaapi_instance = None
@@ -30,9 +21,7 @@ active_trading_nodes = {}
 trading_threads = {}
 active_connections = {}
 live_account_telemetry = {}
-connection_diagnostics = {}
 
-# Strategy settings
 BURST_ORDER_COUNT = 8
 MIN_TARGET_PROFIT_USD = 1.00
 PROFIT_EQUITY_RATIO = 0.05
@@ -42,9 +31,6 @@ POLL_LATENCY_DELAY = 0.20
 RECONNECT_DELAY_SECONDS = 5
 MAX_CONSECUTIVE_TRANSIENT_ERRORS = 2
 
-# ============================================================
-# UNIVERSAL JSON & CORS ENFORCEMENT
-# ============================================================
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin", "*")
@@ -60,43 +46,17 @@ def add_cors_headers(response):
 def handle_exception(error):
     traceback.print_exc()
     return jsonify({
-        "status": "error",
-        "success": False,
-        "connected": False,
-        "connected_to_broker": False,
-        "running": False,
-        "message": str(error),
-        "login": "",
-        "server": "",
-        "symbol": "XAUUSD"
+        "status": "error", "success": False, "connected": False,
+        "connected_to_broker": False, "running": False,
+        "message": str(error), "login": "", "server": "", "symbol": "XAUUSD"
     }), 200
 
-@app.errorhandler(404)
-def handle_404(e):
-    return jsonify({
-        "status": "online",
-        "success": True,
-        "connected": False,
-        "connected_to_broker": False,
-        "running": False,
-        "login": "",
-        "server": "",
-        "symbol": "XAUUSD",
-        "message": "Route not found."
-    }), 200
-
-# ============================================================
-# SESSION HELPER
-# ============================================================
 def get_user_session_id():
     sid = request.cookies.get("ea_session_id")
     if not sid:
         sid = str(uuid.uuid4())
     return sid
 
-# ============================================================
-# SQLITE STORAGE
-# ============================================================
 def init_db():
     try:
         with sqlite3.connect(DB_PATH, timeout=15) as conn:
@@ -148,10 +108,18 @@ def db_get_credentials(session_id, login=""):
         print(f"[DB GET ERROR] {e}")
         return None
 
+def db_clear_credentials(session_id):
+    init_db()
+    try:
+        with sqlite3.connect(DB_PATH, timeout=15) as conn:
+            conn.execute("DELETE FROM credentials WHERE session_id=?", (session_id,))
+            conn.commit()
+    except Exception as e:
+        print(f"[DB CLEAR ERROR] {e}")
+
 def safe_error(error):
     msg = str(error)
     if METAAPI_TOKEN: msg = msg.replace(METAAPI_TOKEN, "[REDACTED_TOKEN]")
-    msg = re.sub(r"(?i)(password|token|authorization)(\s*[:=]\s*)([^,\s;]+)", r"\1\2[REDACTED]", msg)
     return msg[:1500]
 
 def get_metaapi_client():
@@ -207,7 +175,7 @@ def calculate_dynamic_lot_size(equity, free_margin):
     return 2.00
 
 async def fire_burst(connection, symbol, direction, volume, count, login):
-    comment = f"SCALPER"[:25]
+    comment = "SCALPER"[:25]
     tasks = []
     for _ in range(count):
         if direction == "BUY":
@@ -244,9 +212,7 @@ async def high_frequency_trading_engine(login, password, server, symbol):
         connection = None
         try:
             live_account_telemetry[str(login)] = {
-                "connected_to_broker": False,
-                "running": True,
-                "status_text": "CONNECTING"
+                "connected_to_broker": False, "running": True, "status_text": "CONNECTING"
             }
             api = get_metaapi_client()
             account = await get_or_create_account(api, login, password, server)
@@ -285,18 +251,11 @@ async def high_frequency_trading_engine(login, password, server, symbol):
                 pnl = equity - balance
 
                 live_account_telemetry[str(login)] = {
-                    "connected_to_broker": True,
-                    "running": True,
-                    "status_text": "CONNECTED",
-                    "balance": balance,
-                    "equity": equity,
-                    "free_margin": free_margin,
-                    "margin_level": margin_level,
-                    "floating_pnl": round(pnl, 2),
-                    "open_positions_count": len(basket),
-                    "active_symbol": active_symbol,
-                    "symbol_price": {"ask": ask, "bid": bid},
-                    "last_error": None
+                    "connected_to_broker": True, "running": True, "status_text": "CONNECTED",
+                    "balance": balance, "equity": equity, "free_margin": free_margin,
+                    "margin_level": margin_level, "floating_pnl": round(pnl, 2),
+                    "open_positions_count": len(basket), "active_symbol": active_symbol,
+                    "symbol_price": {"ask": ask, "bid": bid}, "last_error": None
                 }
 
                 if basket and pnl < -(balance * MAX_ACCOUNT_DRAWDOWN_RATIO):
@@ -332,9 +291,7 @@ async def high_frequency_trading_engine(login, password, server, symbol):
             if failures >= MAX_CONSECUTIVE_TRANSIENT_ERRORS:
                 active_trading_nodes[login] = False
                 live_account_telemetry[str(login)] = {
-                    "connected_to_broker": False,
-                    "running": False,
-                    "status_text": "FAILED",
+                    "connected_to_broker": False, "running": False, "status_text": "FAILED",
                     "last_error": f"Failed after {failures} attempts: {err_msg}"
                 }
                 break
@@ -359,49 +316,35 @@ def launch_worker(login, password, server, symbol):
         try: loop.close()
         except Exception: pass
 
-# ============================================================
-# API ENDPOINTS WITH COOKIE ATTACHMENT
-# ============================================================
-
 @app.route("/", methods=["GET"])
 def health_root():
     sid = get_user_session_id()
-    resp = make_response(jsonify({
-        "status": "online",
-        "service": "Gold Scalper API",
-        "message": "Render backend is live and ready."
-    }))
+    resp = make_response(jsonify({"status": "online", "service": "Gold Scalper API", "message": "Live"}))
     resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
     return resp, 200
 
-@app.route("/api/connect", methods=["GET", "POST", "OPTIONS"])
-def connect_endpoint():
-    if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
-
+# License verification endpoint: validates key and resets credentials prompt
+@app.route("/api/license", methods=["POST", "OPTIONS"])
+@app.route("/verify_license", methods=["POST", "OPTIONS"])
+def verify_license():
+    if request.method == "OPTIONS": return jsonify({"status": "ok"}), 200
     sid = get_user_session_id()
-    login = request.args.get("login") or request.args.get("mt5_login") or ""
-    if request.is_json:
-        body = request.get_json(silent=True) or {}
-        login = login or body.get("login") or body.get("mt5_login") or ""
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    key = str(data.get("license_key", "")).strip().upper()
 
-    if not login:
-        saved = db_get_credentials(sid)
-        if saved:
-            login = saved["mt5_login"]
+    if key not in ALLOWED_LICENSES:
+        resp = make_response(jsonify({"status": "error", "success": False, "message": "Invalid license key."}))
+        resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+        return resp, 200
 
-    login_str = str(login).strip()
-    is_connected = False
-    if login_str and login_str in live_account_telemetry:
-        is_connected = live_account_telemetry[login_str].get("connected_to_broker", False)
+    # Clear prior stored credentials for this session so it asks for new ones
+    db_clear_credentials(sid)
 
     resp = make_response(jsonify({
-        "success": True,
-        "status": "success",
-        "connected": is_connected,
-        "connected_to_broker": is_connected,
-        "login": login_str,
-        "message": "Connected" if is_connected else "Ready to connect"
+        "status": "success", "success": True, "valid": True,
+        "message": "License verified. Please enter MT5 credentials.",
+        "connected": False, "connected_to_broker": False,
+        "login": "", "server": "", "symbol": "XAUUSD"
     }))
     resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
     return resp, 200
@@ -409,38 +352,20 @@ def connect_endpoint():
 @app.route("/api/account", methods=["GET", "OPTIONS"])
 @app.route("/get_credentials", methods=["GET", "OPTIONS"])
 def account_metadata():
-    if request.method == "OPTIONS": 
-        return jsonify({"status": "ok"}), 200
-    
+    if request.method == "OPTIONS": return jsonify({"status": "ok"}), 200
     sid = get_user_session_id()
-    login = request.args.get("login") or request.args.get("mt5_login") or ""
     
-    saved = db_get_credentials(sid, login)
+    saved = db_get_credentials(sid)
     login_val = saved["mt5_login"] if saved else ""
     server_val = saved["mt5_server"] if saved else ""
     symbol_val = saved["mt5_symbol"] if saved else "XAUUSD"
 
-    is_connected = False
-    if login_val and login_val in live_account_telemetry:
-        is_connected = live_account_telemetry[login_val].get("connected_to_broker", False)
+    is_connected = login_val in live_account_telemetry and live_account_telemetry[login_val].get("connected_to_broker", False)
 
     resp = make_response(jsonify({
-        "success": True,
-        "status": "success",
-        "connected": is_connected,
-        "connected_to_broker": is_connected,
-        "login": login_val,
-        "server": server_val,
-        "symbol": symbol_val,
-        "mt5_login": login_val,
-        "mt5_server": server_val,
-        "mt5_symbol": symbol_val,
-        "account": {
-            "login": login_val,
-            "server": server_val,
-            "symbol": symbol_val,
-            "connected": is_connected
-        }
+        "success": True, "status": "success", "connected": is_connected,
+        "connected_to_broker": is_connected, "login": login_val, "server": server_val, "symbol": symbol_val,
+        "account": {"login": login_val, "server": server_val, "symbol": symbol_val, "connected": is_connected}
     }))
     resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
     return resp, 200
@@ -448,22 +373,13 @@ def account_metadata():
 @app.route("/status", methods=["GET", "OPTIONS"])
 @app.route("/api/status", methods=["GET", "OPTIONS"])
 def status_endpoint():
-    if request.method == "OPTIONS": 
-        return jsonify({"status": "ok"}), 200
-    
+    if request.method == "OPTIONS": return jsonify({"status": "ok"}), 200
     sid = get_user_session_id()
-    req_login = request.args.get("login") or request.args.get("mt5_login") or ""
-    
-    if not req_login:
-        saved = db_get_credentials(sid)
-        if saved:
-            req_login = saved["mt5_login"]
+    saved = db_get_credentials(sid)
+    target_login = saved["mt5_login"] if saved else ""
 
-    target_login = str(req_login).strip()
     is_running = target_login in active_trading_nodes and active_trading_nodes[target_login]
-    is_connected = False
-    balance, equity = 0.0, 0.0
-    last_error = None
+    is_connected, balance, equity, last_error = False, 0.0, 0.0, None
 
     if target_login and target_login in live_account_telemetry:
         t = live_account_telemetry[target_login]
@@ -473,79 +389,22 @@ def status_endpoint():
         last_error = t.get("last_error")
 
     resp = make_response(jsonify({
-        "success": True,
-        "status": "online",
-        "running": is_running,
-        "connected": is_connected,
-        "connected_to_broker": is_connected,
-        "login": target_login,
-        "balance": balance,
-        "equity": equity,
-        "last_error": last_error,
-        "telemetry": live_account_telemetry
+        "success": True, "status": "online", "running": is_running,
+        "connected": is_connected, "connected_to_broker": is_connected,
+        "login": target_login, "balance": balance, "equity": equity,
+        "last_error": last_error, "telemetry": live_account_telemetry
     }))
     resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
     return resp, 200
 
+# Save credentials and start worker ONLY on explicit START command
 @app.route("/control", methods=["POST", "OPTIONS"])
 @app.route("/api/control", methods=["POST", "OPTIONS"])
 def control_dispatcher():
-    if request.method == "OPTIONS": 
-        return jsonify({"status": "ok"}), 200
-    
+    if request.method == "OPTIONS": return jsonify({"status": "ok"}), 200
     sid = get_user_session_id()
     data = request.get_json(silent=True) or request.form.to_dict() or {}
     command = str(data.get("command", "START")).strip().upper()
-    login = str(data.get("mt5_login", "")).strip()
 
     if command == "STOP":
-        if login:
-            active_trading_nodes[login] = False
-        else:
-            saved = db_get_credentials(sid)
-            if saved:
-                active_trading_nodes[saved["mt5_login"]] = False
-        resp = make_response(jsonify({"status": "success", "success": True, "message": "Engine stopped."}))
-        resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
-        return resp, 200
-
-    password = str(data.get("mt5_password", "")).strip()
-    server = str(data.get("mt5_server", "")).strip()
-    symbol = str(data.get("mt5_symbol", "XAUUSD")).strip()
-
-    saved = db_get_credentials(sid, login)
-    if saved:
-        login = login or saved["mt5_login"]
-        password = password or saved["mt5_password"]
-        server = server or saved["mt5_server"]
-        symbol = symbol or saved["mt5_symbol"]
-
-    if not login or not password or not server:
-        resp = make_response(jsonify({"status": "error", "success": False, "message": "Missing credentials. Enter login, password, and server."}))
-        resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
-        return resp, 200
-
-    db_save_credentials(sid, login, password, server, symbol)
-    active_trading_nodes[login] = True
-
-    with state_lock:
-        old = trading_threads.get(login)
-        if not old or not old.is_alive():
-            worker = threading.Thread(target=launch_worker, args=(login, password, server, symbol),
-                                      daemon=True, name=f"Worker-{login}")
-            trading_threads[login] = worker
-            worker.start()
-
-    resp = make_response(jsonify({
-        "status": "success",
-        "success": True,
-        "connected": True,
-        "message": f"Deployment started for account {login}."
-    }))
-    resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
-    return resp, 200
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Multi-Tenant Isolated Server active on port {port}")
-    serve(app, host="0.0.0.0", port=port, threads=8)
+        saved = db
