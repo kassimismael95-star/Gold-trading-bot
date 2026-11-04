@@ -24,7 +24,7 @@ CORS(
     resources={r"/*": {"origins": "*"}}
 )
 
-app.secret_key = os.environ.get("JWT_SECRET", "")
+app.secret_key = os.environ.get("JWT_SECRET", "default-fallback-secret-key")
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
