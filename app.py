@@ -343,13 +343,15 @@ def verify_license():
         resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
         return resp, 200
 
+    # Force wipe existing stored credentials so frontend is forced to prompt for new ones
     db_clear_credentials(sid)
 
     resp = make_response(jsonify({
         "status": "success", "success": True, "valid": True,
         "message": "License verified. Please enter MT5 credentials.",
         "connected": False, "connected_to_broker": False,
-        "login": "", "server": "", "symbol": "XAUUSD"
+        "login": "", "server": "", "symbol": "XAUUSD",
+        "account": {"login": "", "server": "", "symbol": "XAUUSD", "connected": False}
     }))
     resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
     return resp, 200
