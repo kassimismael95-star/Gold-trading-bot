@@ -1,4 +1,11 @@
-import os, re, sqlite3, asyncio, threading, datetime, traceback, uuid
+import os
+import re
+import sqlite3
+import asyncio
+import threading
+import datetime
+import traceback
+import uuid
 from collections import deque
 from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
@@ -323,7 +330,6 @@ def health_root():
     resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
     return resp, 200
 
-# License verification endpoint: validates key and resets credentials prompt
 @app.route("/api/license", methods=["POST", "OPTIONS"])
 @app.route("/verify_license", methods=["POST", "OPTIONS"])
 def verify_license():
@@ -337,7 +343,6 @@ def verify_license():
         resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
         return resp, 200
 
-    # Clear prior stored credentials for this session so it asks for new ones
     db_clear_credentials(sid)
 
     resp = make_response(jsonify({
@@ -397,7 +402,6 @@ def status_endpoint():
     resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
     return resp, 200
 
-# Save credentials and start worker ONLY on explicit START command
 @app.route("/control", methods=["POST", "OPTIONS"])
 @app.route("/api/control", methods=["POST", "OPTIONS"])
 def control_dispatcher():
@@ -407,4 +411,44 @@ def control_dispatcher():
     command = str(data.get("command", "START")).strip().upper()
 
     if command == "STOP":
-        saved = db
+        saved = db_get_credentials(sid)
+        if saved: active_trading_nodes[saved["mt5_login"]] = False
+        resp = make_response(jsonify({"status": "success", "success": True, "message": "Engine stopped."}))
+        resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+        return resp, 200
+
+    login = str(data.get("mt5_login", "")).strip()
+    password = str(data.get("mt5_password", "")).strip()
+    server = str(data.get("mt5_server", "")).strip()
+    symbol = str(data.get("mt5_symbol", "XAUUSD")).strip()
+
+    if not login or not password or not server:
+        resp = make_response(jsonify({
+            "status": "error", "success": False,
+            "message": "Please fill in MT5 Login, Password, and Server."
+        }))
+        resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+        return resp, 200
+
+    db_save_credentials(sid, login, password, server, symbol)
+    active_trading_nodes[login] = True
+
+    with state_lock:
+        old = trading_threads.get(login)
+        if not old or not old.is_alive():
+            worker = threading.Thread(target=launch_worker, args=(login, password, server, symbol),
+                                      daemon=True, name=f"Worker-{login}")
+            trading_threads[login] = worker
+            worker.start()
+
+    resp = make_response(jsonify({
+        "status": "success", "success": True, "connected": True,
+        "message": f"Deployment started for account {login}."
+    }))
+    resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+    return resp, 200
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    print(f"[STARTUP] Server active on port {port}")
+    serve(app, host="0.0.0.0", port=port, threads=8)
