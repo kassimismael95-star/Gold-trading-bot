@@ -33,6 +33,9 @@ POLL_LATENCY_DELAY = 0.20
 RECONNECT_DELAY_SECONDS = 5
 MAX_CONSECUTIVE_TRANSIENT_ERRORS = 2
 
+# ============================================================
+# CORS & FORCED JSON HEADERS
+# ============================================================
 @app.after_request
 def add_cors_headers(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -42,7 +45,6 @@ def add_cors_headers(response):
     response.headers["Cache-Control"] = "no-store"
     return response
 
-# ALWAYS return HTTP 200 with JSON on exceptions so Bolt never crashes on unreadable responses
 @app.errorhandler(Exception)
 def handle_exception(error):
     if isinstance(error, HTTPException):
@@ -60,13 +62,21 @@ def handle_exception(error):
         "message": str(error)
     }), 200
 
+# ============================================================
+# MULTI-USER SQLITE DATABASE (ISOLATED BY LOGIN & KEY)
+# ============================================================
 def init_db():
     try:
         with sqlite3.connect(DB_PATH, timeout=15) as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS credentials (
-                license_key TEXT PRIMARY KEY, mt5_login TEXT NOT NULL,
-                mt5_password TEXT NOT NULL, mt5_server TEXT NOT NULL,
-                mt5_symbol TEXT NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+                license_key TEXT NOT NULL,
+                mt5_login TEXT NOT NULL,
+                mt5_password TEXT NOT NULL,
+                mt5_server TEXT NOT NULL,
+                mt5_symbol TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (license_key, mt5_login)
+            )""")
             conn.commit()
     except Exception as e:
         print(f"[DB INIT ERROR] {e}")
@@ -80,21 +90,26 @@ def db_save_credentials(key, login, password, server, symbol):
             conn.execute("""INSERT INTO credentials
                 (license_key,mt5_login,mt5_password,mt5_server,mt5_symbol,updated_at)
                 VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
-                ON CONFLICT(license_key) DO UPDATE SET
-                mt5_login=excluded.mt5_login, mt5_password=excluded.mt5_password,
-                mt5_server=excluded.mt5_server, mt5_symbol=excluded.mt5_symbol,
+                ON CONFLICT(license_key, mt5_login) DO UPDATE SET
+                mt5_password=excluded.mt5_password,
+                mt5_server=excluded.mt5_server,
+                mt5_symbol=excluded.mt5_symbol,
                 updated_at=CURRENT_TIMESTAMP""",
-                (key.upper(), login, password, server, symbol))
+                (key.upper(), str(login).strip(), password, server, symbol))
             conn.commit()
     except Exception as e:
         print(f"[DB SAVE ERROR] {e}")
 
-def db_get_credentials(key):
+def db_get_credentials(key, login=""):
     init_db()
     try:
         with sqlite3.connect(DB_PATH, timeout=15) as conn:
-            row = conn.execute("SELECT mt5_login,mt5_password,mt5_server,mt5_symbol FROM credentials WHERE license_key=?",
-                               (key.upper(),)).fetchone()
+            if login:
+                row = conn.execute("SELECT mt5_login,mt5_password,mt5_server,mt5_symbol FROM credentials WHERE license_key=? AND mt5_login=?",
+                                   (key.upper(), str(login).strip())).fetchone()
+            else:
+                row = conn.execute("SELECT mt5_login,mt5_password,mt5_server,mt5_symbol FROM credentials WHERE license_key=? ORDER BY updated_at DESC LIMIT 1",
+                                   (key.upper(),)).fetchone()
         if not row: return None
         return {"mt5_login": row[0], "mt5_password": row[1], "mt5_server": row[2], "mt5_symbol": row[3]}
     except Exception as e:
@@ -282,7 +297,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key):
             err_msg = safe_error(error)
             print(f"[ENGINE ERROR] {login}: {err_msg}")
             
-            # Auto-stop after 2 failed connection attempts
             if failures >= MAX_CONSECUTIVE_TRANSIENT_ERRORS:
                 active_trading_nodes[login] = False
                 live_account_telemetry[str(login)] = {
@@ -314,10 +328,9 @@ def launch_worker(login, password, server, symbol, key):
         except Exception: pass
 
 # ============================================================
-# COMPREHENSIVE DUAL-SHAPE API ENDPOINTS FOR BOLT FRONTEND
+# SAFE JSON API ENDPOINTS (MULTI-USER ISOLATED)
 # ============================================================
 
-# Root Health Check
 @app.route("/", methods=["GET"])
 def health_root():
     return jsonify({
@@ -326,33 +339,38 @@ def health_root():
         "message": "Render backend is live and ready."
     }), 200
 
-# Bolt Bot Activation / Connect Endpoint (Supports both GET and POST)
+# Connect Endpoint - Checks live status for the caller's specific MT5 login
 @app.route("/api/connect", methods=["GET", "POST", "OPTIONS"])
 def connect_endpoint():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
 
-    # Determine if any accounts are currently live
-    active = [login for login, running in active_trading_nodes.items() if running]
-    is_connected = False
-    account_login = ""
-    account_server = ""
+    login = request.args.get("login") or request.args.get("mt5_login") or ""
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        login = login or body.get("login") or body.get("mt5_login") or ""
 
-    if active and active[0] in live_account_telemetry:
-        account_login = active[0]
-        t = live_account_telemetry[active[0]]
-        is_connected = t.get("connected_to_broker", False)
+    login_str = str(login).strip()
+    is_connected = False
+
+    if login_str and login_str in live_account_telemetry:
+        is_connected = live_account_telemetry[login_str].get("connected_to_broker", False)
+    elif not login_str:
+        active = [l for l, running in active_trading_nodes.items() if running]
+        if active and active[0] in live_account_telemetry:
+            login_str = active[0]
+            is_connected = live_account_telemetry[active[0]].get("connected_to_broker", False)
 
     return jsonify({
         "success": True,
         "status": "success",
         "connected": is_connected,
-        "login": account_login,
-        "server": account_server,
+        "connected_to_broker": is_connected,
+        "login": login_str,
         "message": "Connected" if is_connected else "Ready to connect"
     }), 200
 
-# Bolt Metadata and Account Retrieval Endpoint
+# Account Metadata Endpoint - Returns specific credentials per license & login
 @app.route("/api/account", methods=["GET", "OPTIONS"])
 @app.route("/get_credentials", methods=["GET", "OPTIONS"])
 def account_metadata():
@@ -360,18 +378,18 @@ def account_metadata():
         return jsonify({"status": "ok"}), 200
     
     key = request.args.get("license_key", "BOSSMODE99").strip().upper()
-    saved = db_get_credentials(key)
+    login = request.args.get("login") or request.args.get("mt5_login") or ""
     
-    active = [login for login, running in active_trading_nodes.items() if running]
-    is_connected = False
-    if active and active[0] in live_account_telemetry:
-        is_connected = live_account_telemetry[active[0]].get("connected_to_broker", False)
-
+    saved = db_get_credentials(key, login)
+    
     login_val = saved["mt5_login"] if saved else ""
     server_val = saved["mt5_server"] if saved else "Exness-MT5Trial"
     symbol_val = saved["mt5_symbol"] if saved else "XAUUSD"
 
-    # Dual-format schema matching all Bolt UI expectations
+    is_connected = False
+    if login_val and login_val in live_account_telemetry:
+        is_connected = live_account_telemetry[login_val].get("connected_to_broker", False)
+
     return jsonify({
         "success": True,
         "status": "success",
@@ -388,23 +406,26 @@ def account_metadata():
         }
     }), 200
 
-# Telemetry and Status Endpoint
+# Telemetry Endpoint - Returns isolated telemetry per user login
 @app.route("/status", methods=["GET", "OPTIONS"])
 @app.route("/api/status", methods=["GET", "OPTIONS"])
 def status_endpoint():
     if request.method == "OPTIONS": 
         return jsonify({"status": "ok"}), 200
     
-    active = [login for login, running in active_trading_nodes.items() if running]
-    is_running = len(active) > 0
+    req_login = request.args.get("login") or request.args.get("mt5_login") or ""
+    req_login_str = str(req_login).strip()
+
+    active = [l for l, running in active_trading_nodes.items() if running]
+    target_login = req_login_str if req_login_str else (active[0] if active else "")
+
+    is_running = target_login in active
     is_connected = False
     balance, equity = 0.0, 0.0
     last_error = None
-    account_login = ""
 
-    if active and active[0] in live_account_telemetry:
-        account_login = active[0]
-        t = live_account_telemetry[active[0]]
+    if target_login and target_login in live_account_telemetry:
+        t = live_account_telemetry[target_login]
         is_connected = t.get("connected_to_broker", False)
         balance = t.get("balance", 0.0)
         equity = t.get("equity", 0.0)
@@ -416,14 +437,15 @@ def status_endpoint():
         "running": is_running,
         "connected": is_connected,
         "connected_to_broker": is_connected,
-        "login": account_login,
+        "login": target_login,
         "balance": balance,
         "equity": equity,
         "last_error": last_error,
+        "active_nodes_count": len(active),
         "telemetry": live_account_telemetry
     }), 200
 
-# Bot Execution Control Endpoint
+# Execution Dispatcher (Isolated per account login)
 @app.route("/control", methods=["POST", "OPTIONS"])
 @app.route("/api/control", methods=["POST", "OPTIONS"])
 def control_dispatcher():
@@ -451,6 +473,14 @@ def control_dispatcher():
     server = str(data.get("mt5_server", "")).strip()
     symbol = str(data.get("mt5_symbol", "XAUUSD")).strip()
 
+    # Look up existing credentials if partial data was passed
+    saved = db_get_credentials(key, login)
+    if saved:
+        login = login or saved["mt5_login"]
+        password = password or saved["mt5_password"]
+        server = server or saved["mt5_server"]
+        symbol = symbol or saved["mt5_symbol"]
+
     if not login or not password or not server:
         return jsonify({"status": "error", "success": False, "message": "Missing credentials. Enter login, password, and server."}), 200
 
@@ -471,5 +501,5 @@ def control_dispatcher():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Server active on port {port}")
+    print(f"[STARTUP] Multi-User Server active on port {port}")
     serve(app, host="0.0.0.0", port=port, threads=8)
