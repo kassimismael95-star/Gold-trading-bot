@@ -360,6 +360,31 @@ def health():
                     "metaapi_token_configured":bool(METAAPI_TOKEN),
                     "utc_time":datetime.datetime.now(datetime.timezone.utc).isoformat()})
 
+@app.route('/api/connect', methods=['POST', 'OPTIONS'])
+def connect_mt5():
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "ok"}), 200
+    try:
+        data = request.get_json(silent=True) or {}
+        login = data.get('login') or data.get('mt5_login')
+        server = data.get('server') or data.get('mt5_server')
+        
+        if not login or not server:
+            return jsonify({
+                "success": False,
+                "error": "Missing login or server credentials."
+            }), 200
+
+        return jsonify({
+            "success": True, 
+            "message": "Connection parameters validated successfully."
+        }), 200
+    except Exception as e:
+        return jsonify({
+            "success": False, 
+            "error": str(e)
+        }), 200
+
 @app.route("/api/account",methods=["GET","OPTIONS"])
 @app.route("/get_credentials",methods=["GET","OPTIONS"])
 def account_metadata():
