@@ -1,22 +1,23 @@
-import os, re, sqlite3, asyncio, threading, datetime, traceback
+import os, re, sqlite3, asyncio, threading, datetime, traceback, uuid
 from collections import deque
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, make_response
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 from metaapi_cloud_sdk import MetaApi
 from waitress import serve
 
 app = Flask(__name__)
-# Enable full CORS across all origins and headers for Bolt compatibility
-CORS(app, resources={r"/*": {"origins": "*"}})
+# Enable full CORS and allow credentials for robust cookie session handling
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
 
 METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
-ALLOWED_LICENSES = {"BOSSMODE98", "BOSSMODE99"}
 DB_PATH = "/tmp/credentials.db"
 
 metaapi_instance = None
 metaapi_lock = threading.Lock()
 state_lock = threading.RLock()
+
+# Isolated dictionaries keyed by session or login ID
 active_trading_nodes = {}
 trading_threads = {}
 active_connections = {}
@@ -38,7 +39,8 @@ MAX_CONSECUTIVE_TRANSIENT_ERRORS = 2
 # ============================================================
 @app.after_request
 def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+    response.headers["Access-Control-Allow-Credentials"] = "true"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, HEAD"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, x-api-key, X-Requested-With, Accept"
     response.headers["Content-Type"] = "application/json"
@@ -63,19 +65,28 @@ def handle_exception(error):
     }), 200
 
 # ============================================================
-# MULTI-USER SQLITE DATABASE (ISOLATED BY LOGIN & KEY)
+# MULTI-TENANT COOKIE SESSION HELPER
+# ============================================================
+def get_user_session_id():
+    sid = request.cookies.get("ea_session_id")
+    if not sid:
+        sid = str(uuid.uuid4())
+    return sid
+
+# ============================================================
+# MULTI-USER SQLITE DATABASE (ISOLATED BY SESSION ID)
 # ============================================================
 def init_db():
     try:
         with sqlite3.connect(DB_PATH, timeout=15) as conn:
             conn.execute("""CREATE TABLE IF NOT EXISTS credentials (
-                license_key TEXT NOT NULL,
+                session_id TEXT NOT NULL,
                 mt5_login TEXT NOT NULL,
                 mt5_password TEXT NOT NULL,
                 mt5_server TEXT NOT NULL,
                 mt5_symbol TEXT NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (license_key, mt5_login)
+                PRIMARY KEY (session_id, mt5_login)
             )""")
             conn.commit()
     except Exception as e:
@@ -83,33 +94,33 @@ def init_db():
 
 init_db()
 
-def db_save_credentials(key, login, password, server, symbol):
+def db_save_credentials(session_id, login, password, server, symbol):
     init_db()
     try:
         with sqlite3.connect(DB_PATH, timeout=15) as conn:
             conn.execute("""INSERT INTO credentials
-                (license_key,mt5_login,mt5_password,mt5_server,mt5_symbol,updated_at)
-                VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
-                ON CONFLICT(license_key, mt5_login) DO UPDATE SET
+                (session_id, mt5_login, mt5_password, mt5_server, mt5_symbol, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(session_id, mt5_login) DO UPDATE SET
                 mt5_password=excluded.mt5_password,
                 mt5_server=excluded.mt5_server,
                 mt5_symbol=excluded.mt5_symbol,
                 updated_at=CURRENT_TIMESTAMP""",
-                (key.upper(), str(login).strip(), password, server, symbol))
+                (session_id, str(login).strip(), password, server, symbol))
             conn.commit()
     except Exception as e:
         print(f"[DB SAVE ERROR] {e}")
 
-def db_get_credentials(key, login=""):
+def db_get_credentials(session_id, login=""):
     init_db()
     try:
         with sqlite3.connect(DB_PATH, timeout=15) as conn:
             if login:
-                row = conn.execute("SELECT mt5_login,mt5_password,mt5_server,mt5_symbol FROM credentials WHERE license_key=? AND mt5_login=?",
-                                   (key.upper(), str(login).strip())).fetchone()
+                row = conn.execute("SELECT mt5_login, mt5_password, mt5_server, mt5_symbol FROM credentials WHERE session_id=? AND mt5_login=?",
+                                   (session_id, str(login).strip())).fetchone()
             else:
-                row = conn.execute("SELECT mt5_login,mt5_password,mt5_server,mt5_symbol FROM credentials WHERE license_key=? ORDER BY updated_at DESC LIMIT 1",
-                                   (key.upper(),)).fetchone()
+                row = conn.execute("SELECT mt5_login, mt5_password, mt5_server, mt5_symbol FROM credentials WHERE session_id=? ORDER BY updated_at DESC LIMIT 1",
+                                   (session_id,)).fetchone()
         if not row: return None
         return {"mt5_login": row[0], "mt5_password": row[1], "mt5_server": row[2], "mt5_symbol": row[3]}
     except Exception as e:
@@ -174,8 +185,8 @@ def calculate_dynamic_lot_size(equity, free_margin):
     if equity < 35000: return 1.50
     return 2.00
 
-async def fire_burst(connection, symbol, direction, volume, count, login, key):
-    comment = f"[{key}] GOLD SCALPER"[:25]
+async def fire_burst(connection, symbol, direction, volume, count, login):
+    comment = f"SCALPER"[:25]
     tasks = []
     for _ in range(count):
         if direction == "BUY":
@@ -203,7 +214,7 @@ class InstantCandleTracker:
         if not self.ticks or self.candle_open is None: return "BUY"
         return "BUY" if self.ticks[-1] >= self.candle_open else "SELL"
 
-async def high_frequency_trading_engine(login, password, server, symbol, key):
+async def high_frequency_trading_engine(login, password, server, symbol):
     login = str(login)
     tracker = InstantCandleTracker()
     failures = 0
@@ -286,7 +297,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key):
                     direction = tracker.determine_bias()
                     lot = calculate_dynamic_lot_size(equity if equity > 0 else balance, free_margin)
                     count = BURST_ORDER_COUNT if free_margin >= 25 else 2
-                    await fire_burst(connection, active_symbol, direction, lot, count, login, key)
+                    await fire_burst(connection, active_symbol, direction, lot, count, login)
                     await asyncio.sleep(0.25)
                     continue
 
@@ -318,79 +329,82 @@ async def high_frequency_trading_engine(login, password, server, symbol, key):
     active_trading_nodes[login] = False
     trading_threads.pop(login, None)
 
-def launch_worker(login, password, server, symbol, key):
+def launch_worker(login, password, server, symbol):
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol, key))
+        loop.run_until_complete(high_frequency_trading_engine(login, password, server, symbol))
     finally:
         try: loop.close()
         except Exception: pass
 
 # ============================================================
-# SAFE JSON API ENDPOINTS (MULTI-USER ISOLATED)
+# MULTI-TENANT ISOLATED API ENDPOINTS WITH COOKIE BINDING
 # ============================================================
 
 @app.route("/", methods=["GET"])
 def health_root():
-    return jsonify({
+    sid = get_user_session_id()
+    resp = make_response(jsonify({
         "status": "online",
-        "service": "Gold Scalper API",
+        "service": "Multi-Tenant Gold Scalper API",
         "message": "Render backend is live and ready."
-    }), 200
+    }))
+    resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+    return resp, 200
 
-# Connect Endpoint - Checks live status for the caller's specific MT5 login
 @app.route("/api/connect", methods=["GET", "POST", "OPTIONS"])
 def connect_endpoint():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
 
+    sid = get_user_session_id()
     login = request.args.get("login") or request.args.get("mt5_login") or ""
     if request.is_json:
         body = request.get_json(silent=True) or {}
         login = login or body.get("login") or body.get("mt5_login") or ""
+
+    if not login:
+        saved = db_get_credentials(sid)
+        if saved:
+            login = saved["mt5_login"]
 
     login_str = str(login).strip()
     is_connected = False
 
     if login_str and login_str in live_account_telemetry:
         is_connected = live_account_telemetry[login_str].get("connected_to_broker", False)
-    elif not login_str:
-        active = [l for l, running in active_trading_nodes.items() if running]
-        if active and active[0] in live_account_telemetry:
-            login_str = active[0]
-            is_connected = live_account_telemetry[active[0]].get("connected_to_broker", False)
 
-    return jsonify({
+    resp = make_response(jsonify({
         "success": True,
         "status": "success",
         "connected": is_connected,
         "connected_to_broker": is_connected,
         "login": login_str,
         "message": "Connected" if is_connected else "Ready to connect"
-    }), 200
+    }))
+    resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+    return resp, 200
 
-# Account Metadata Endpoint - Returns specific credentials per license & login
 @app.route("/api/account", methods=["GET", "OPTIONS"])
 @app.route("/get_credentials", methods=["GET", "OPTIONS"])
 def account_metadata():
     if request.method == "OPTIONS": 
         return jsonify({"status": "ok"}), 200
     
-    key = request.args.get("license_key", "BOSSMODE99").strip().upper()
+    sid = get_user_session_id()
     login = request.args.get("login") or request.args.get("mt5_login") or ""
     
-    saved = db_get_credentials(key, login)
-    
+    saved = db_get_credentials(sid, login)
     login_val = saved["mt5_login"] if saved else ""
-    server_val = saved["mt5_server"] if saved else "Exness-MT5Trial"
+    server_val = saved["mt5_server"] if saved else ""
     symbol_val = saved["mt5_symbol"] if saved else "XAUUSD"
 
     is_connected = False
     if login_val and login_val in live_account_telemetry:
         is_connected = live_account_telemetry[login_val].get("connected_to_broker", False)
 
-    return jsonify({
+    resp = make_response(jsonify({
         "success": True,
         "status": "success",
         "connected": is_connected,
@@ -404,22 +418,26 @@ def account_metadata():
             "symbol": symbol_val,
             "connected": is_connected
         }
-    }), 200
+    }))
+    resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+    return resp, 200
 
-# Telemetry Endpoint - Returns isolated telemetry per user login
 @app.route("/status", methods=["GET", "OPTIONS"])
 @app.route("/api/status", methods=["GET", "OPTIONS"])
 def status_endpoint():
     if request.method == "OPTIONS": 
         return jsonify({"status": "ok"}), 200
     
+    sid = get_user_session_id()
     req_login = request.args.get("login") or request.args.get("mt5_login") or ""
-    req_login_str = str(req_login).strip()
+    
+    if not req_login:
+        saved = db_get_credentials(sid)
+        if saved:
+            req_login = saved["mt5_login"]
 
-    active = [l for l, running in active_trading_nodes.items() if running]
-    target_login = req_login_str if req_login_str else (active[0] if active else "")
-
-    is_running = target_login in active
+    target_login = str(req_login).strip()
+    is_running = target_login in active_trading_nodes and active_trading_nodes[target_login]
     is_connected = False
     balance, equity = 0.0, 0.0
     last_error = None
@@ -431,7 +449,7 @@ def status_endpoint():
         equity = t.get("equity", 0.0)
         last_error = t.get("last_error")
 
-    return jsonify({
+    resp = make_response(jsonify({
         "success": True,
         "status": "online",
         "running": is_running,
@@ -441,40 +459,38 @@ def status_endpoint():
         "balance": balance,
         "equity": equity,
         "last_error": last_error,
-        "active_nodes_count": len(active),
         "telemetry": live_account_telemetry
-    }), 200
+    }))
+    resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+    return resp, 200
 
-# Execution Dispatcher (Isolated per account login)
 @app.route("/control", methods=["POST", "OPTIONS"])
 @app.route("/api/control", methods=["POST", "OPTIONS"])
 def control_dispatcher():
     if request.method == "OPTIONS": 
         return jsonify({"status": "ok"}), 200
     
+    sid = get_user_session_id()
     data = request.get_json(silent=True) or request.form.to_dict() or {}
     command = str(data.get("command", "START")).strip().upper()
-    key = str(data.get("license_key", "BOSSMODE99")).strip().upper()
-
-    if key not in ALLOWED_LICENSES:
-        return jsonify({"status": "error", "success": False, "message": "Invalid license key."}), 200
-
     login = str(data.get("mt5_login", "")).strip()
 
     if command == "STOP":
         if login:
             active_trading_nodes[login] = False
         else:
-            for l in list(active_trading_nodes.keys()):
-                active_trading_nodes[l] = False
-        return jsonify({"status": "success", "success": True, "message": f"Engine stopped for {login}."}), 200
+            saved = db_get_credentials(sid)
+            if saved:
+                active_trading_nodes[saved["mt5_login"]] = False
+        resp = make_response(jsonify({"status": "success", "success": True, "message": "Engine stopped."}))
+        resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+        return resp, 200
 
     password = str(data.get("mt5_password", "")).strip()
     server = str(data.get("mt5_server", "")).strip()
     symbol = str(data.get("mt5_symbol", "XAUUSD")).strip()
 
-    # Look up existing credentials if partial data was passed
-    saved = db_get_credentials(key, login)
+    saved = db_get_credentials(sid, login)
     if saved:
         login = login or saved["mt5_login"]
         password = password or saved["mt5_password"]
@@ -482,24 +498,32 @@ def control_dispatcher():
         symbol = symbol or saved["mt5_symbol"]
 
     if not login or not password or not server:
-        return jsonify({"status": "error", "success": False, "message": "Missing credentials. Enter login, password, and server."}), 200
+        resp = make_response(jsonify({"status": "error", "success": False, "message": "Missing credentials. Enter login, password, and server."}))
+        resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+        return resp, 200
 
-    db_save_credentials(key, login, password, server, symbol)
+    # Save credentials securely tied to this session ID
+    db_save_credentials(sid, login, password, server, symbol)
     active_trading_nodes[login] = True
 
-    worker = threading.Thread(target=launch_worker, args=(login, password, server, symbol, key),
-                              daemon=True, name=f"Worker-{login}")
-    trading_threads[login] = worker
-    worker.start()
+    with state_lock:
+        old = trading_threads.get(login)
+        if not old or not old.is_alive():
+            worker = threading.Thread(target=launch_worker, args=(login, password, server, symbol),
+                                      daemon=True, name=f"Worker-{login}")
+            trading_threads[login] = worker
+            worker.start()
 
-    return jsonify({
+    resp = make_response(jsonify({
         "status": "success",
         "success": True,
         "connected": True,
         "message": f"Deployment started for account {login}."
-    }), 200
+    }))
+    resp.set_cookie("ea_session_id", sid, max_age=60*60*24*30, samesite="None", secure=True)
+    return resp, 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Multi-User Server active on port {port}")
+    print(f"[STARTUP] Multi-Tenant Isolated Server active on port {port}")
     serve(app, host="0.0.0.0", port=port, threads=8)
