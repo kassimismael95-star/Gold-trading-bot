@@ -1,4 +1,4 @@
-flask
-flask-cors
-metaapi-cloud-sdk
-waitress
+Flask==3.0.3
+Flask-Cors==4.0.1
+metaapi-cloud-sdk==20.26.0
+waitress==3.0.0
