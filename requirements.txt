@@ -1,6 +1,4 @@
 Flask
 Flask-Cors
-waitress
-requests
-cryptography
 metaapi-cloud-sdk
+waitress
