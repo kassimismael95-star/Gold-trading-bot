@@ -1,5 +1,6 @@
 Flask
 Flask-Cors
-MetaTrader5
 waitress
 requests
+cryptography
+metaapi-cloud-sdk
