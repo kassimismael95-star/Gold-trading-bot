@@ -116,41 +116,26 @@ def get_metaapi_client(override_token: str = None):
     return metaapi_instance
 
 def calculate_dynamic_lot_size(equity: float, balance: float, free_margin: float) -> tuple:
-    """
-    Exact replication of the lot & burst scaling curve seen in the video:
-    From $0.92 sub-dollar accounts up to $212,000+ compounding.
-    Returns (lot_size, burst_count).
-    """
     effective_capital = max(equity, balance)
     
-    # Ultra-Low Accounts ($0.92 - $10) -> Micro Scalp Stacks
     if effective_capital < 10.0 or free_margin < 2.0:
         return 0.01, 3 if free_margin < 5.0 else 5
-    # Small Growth Tier ($10 - $25)
     elif effective_capital < 25.0:
         return 0.01, 6
-    # Intermediate Tier ($25 - $70)
     elif effective_capital < 70.0:
         return 0.02, 6
-    # Expansion Tier ($70 - $200)
     elif effective_capital < 200.0:
         return 0.02, 8
-    # Centurion Tier ($200 - $800)
     elif effective_capital < 800.0:
         return 0.10, 8
-    # Pro Tier ($800 - $2,000)
     elif effective_capital < 2000.0:
         return 0.20, 8
-    # High Roller ($2,000 - $5,000)
     elif effective_capital < 5000.0:
         return 0.30, 8
-    # Institutional Tier ($5,000 - $15,000)
     elif effective_capital < 15000.0:
         return 0.90, 8
-    # Whale Tier ($15,000 - $50,000)
     elif effective_capital < 50000.0:
         return 2.00, 8
-    # Apex Tier ($50,000+)
     else:
         return 3.00, 8
 
@@ -168,7 +153,7 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
             await asyncio.sleep(0.12)
             price = connection.terminal_state.price(sym)
             if price and (price.get("ask") or price.get("bid")):
-                print(f"[SYMBOL VERIFIED] Using Exness Gold symbol: '{sym}' (Ask: {price.get('ask')}, Bid: {price.get('bid')})")
+                print(f"[SYMBOL VERIFIED] Using Exness Gold symbol: '{sym}'")
                 return sym
         except Exception:
             continue
@@ -195,15 +180,12 @@ async def fire_stacked_directional_burst(connection, symbol: str, direction: str
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     successful = sum(1 for r in results if not isinstance(r, Exception))
-    print(f"[BURST COMPLETE] {successful}/{count} {direction} orders deployed on {symbol} @ {volume} lots.")
     return successful
 
 async def purge_entire_basket_instantly(connection, positions):
     close_tasks = [connection.close_position(pos["id"]) for pos in positions if "id" in pos]
     if close_tasks:
-        results = await asyncio.gather(*close_tasks, return_exceptions=True)
-        successful = sum(1 for r in results if not isinstance(r, Exception))
-        print(f"[LIQUIDATOR] Liquidated {successful}/{len(positions)} positions in parallel.")
+        await asyncio.gather(*close_tasks, return_exceptions=True)
 
 async def get_or_create_metaapi_account(api, login, password, server):
     login_str = str(login).strip()
@@ -236,7 +218,7 @@ async def get_or_create_metaapi_account(api, login, password, server):
     })
 
 # ============================================================
-# HIGH-FREQUENCY TRADING ENGINE (HYBRID VIDEO LOGIC)
+# HIGH-FREQUENCY TRADING ENGINE
 # ============================================================
 class InstantCandleTracker:
     def __init__(self, max_ticks=40):
@@ -260,12 +242,9 @@ class InstantCandleTracker:
                 return "BUY"
             elif current_price < self.candle_open:
                 return "SELL"
-        if len(self.ticks) >= 3:
-            return "BUY" if (self.ticks[-1] - self.ticks[0]) >= 0 else "SELL"
         return "BUY"
 
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
-    print(f"[ENGINE INITIALIZED] Connecting account {login} on {server}...")
     account = None
     candle_tracker = InstantCandleTracker()
     consecutive_errors = 0
@@ -279,7 +258,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         connection = account.get_streaming_connection()
         await connection.connect()
         await connection.wait_synchronized()
-        print(f"[CORE LIVE] Connected & Synchronized: {login}")
 
         active_symbol = await resolve_broker_gold_symbol(connection, symbol)
 
@@ -308,7 +286,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 symbol_positions = [p for p in positions if p.get("symbol") == active_symbol]
                 net_floating_profit = equity - balance
 
-                # Update live telemetry for Bolt UI
                 live_account_telemetry[str(login)] = {
                     "connected_to_broker": getattr(terminal_state, "connected_to_broker", True),
                     "balance": balance,
@@ -322,49 +299,34 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                     "last_updated": datetime.datetime.utcnow().isoformat()
                 }
 
-                # ----------------------------------------------------
-                # 1. RISK SAFEGUARD: Drawdown Cutoff
-                # ----------------------------------------------------
                 max_allowed_drawdown = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
                 if symbol_positions and net_floating_profit < -max_allowed_drawdown:
-                    print(f"[CIRCUIT BREAKER] Floating Drawdown -${abs(net_floating_profit):.2f} hit cutoff. Purging.")
                     await purge_entire_basket_instantly(connection, symbol_positions)
                     peak_basket_profit = 0.0
                     await asyncio.sleep(1.0)
                     continue
 
-                # ----------------------------------------------------
-                # 2. BASKET TAKE-PROFIT PURGE (EXACT VIDEO BEHAVIOR)
-                # ----------------------------------------------------
                 if symbol_positions:
                     if net_floating_profit > peak_basket_profit:
                         peak_basket_profit = net_floating_profit
 
-                    # Dynamic target scale based on balance size
                     dynamic_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
                     if balance < 10.0:
-                        dynamic_target = max(0.50, balance * 0.15) # Fast exit on micro accounts
+                        dynamic_target = max(0.50, balance * 0.15)
 
-                    # Hit target -> Flush basket completely
                     if net_floating_profit >= dynamic_target:
-                        print(f"[TARGET REACHED] Basket +${net_floating_profit:.2f} >= Target ${dynamic_target:.2f}. Flushing.")
                         await purge_entire_basket_instantly(connection, symbol_positions)
                         peak_basket_profit = 0.0
                         consecutive_errors = 0
                         await asyncio.sleep(0.02)
                         continue
 
-                    # Trailing Lock: If profit hit $1.50+ then pulls back 30%, secure profit
                     if peak_basket_profit >= 1.50 and net_floating_profit <= (peak_basket_profit * TRAILING_FLUSH_RATIO):
-                        print(f"[TRAILING FLUSH] Trailing locked profit at +${net_floating_profit:.2f} (Peak: ${peak_basket_profit:.2f}).")
                         await purge_entire_basket_instantly(connection, symbol_positions)
                         peak_basket_profit = 0.0
                         await asyncio.sleep(0.02)
                         continue
 
-                # ----------------------------------------------------
-                # 3. ZERO-DOWNTIME INSTANT RELOAD BURST
-                # ----------------------------------------------------
                 if len(symbol_positions) == 0:
                     peak_basket_profit = 0.0
                     current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
@@ -375,7 +337,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                     direction = candle_tracker.determine_bias()
                     assigned_lot, burst_count = calculate_dynamic_lot_size(equity, balance, free_margin)
 
-                    print(f"[BURST DISPATCH] Firing {direction} wave ({burst_count} orders @ {assigned_lot} lots) on {active_symbol}")
                     success_count = await fire_stacked_directional_burst(
                         connection, active_symbol, direction, assigned_lot, burst_count, key
                     )
@@ -405,7 +366,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         trading_threads.pop(str(login), None)
         if str(login) in live_account_telemetry:
             live_account_telemetry[str(login)]["connected_to_broker"] = False
-        print(f"[ENGINE STOPPED] Worker terminated for: {login}")
 
 def launch_async_worker_thread(login, password, server, symbol, key, token=None):
     loop = asyncio.new_event_loop()
@@ -419,7 +379,7 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
         except Exception: pass
 
 # ============================================================
-# API CONTROLLER & MATCHING ROUTES
+# API ENDPOINTS
 # ============================================================
 def extract_request_data(req):
     data = {}
@@ -438,11 +398,7 @@ def extract_request_data(req):
 
 @app.route("/", methods=["GET"])
 def health_root():
-    return jsonify({
-        "status": "online",
-        "service": "Gold Scalper AI Hybrid Engine",
-        "mode": "High-Frequency Burst Compounding (Video Logic)"
-    }), 200
+    return jsonify({"status": "online", "service": "Gold Scalper AI Hybrid Engine"}), 200
 
 @app.route("/api/account", methods=["GET"])
 @app.route("/get_credentials", methods=["GET"])
@@ -487,11 +443,7 @@ def control_dispatcher():
         license_key = str(data.get("license_key") or data.get("key") or "BOSSMODE99").strip().upper()
 
         if license_key not in ALLOWED_LICENSES:
-            return jsonify({
-                "status": "error",
-                "success": False,
-                "message": "Invalid License Key. Allowed keys: BOSSMODE98, BOSSMODE99."
-            }), 200
+            return jsonify({"status": "error", "success": False, "message": "Invalid License Key."}), 200
 
         mt5_login = str(data.get("mt5_login") or data.get("login") or data.get("account") or "").strip()
         mt5_password = str(data.get("mt5_password") or data.get("password") or data.get("pass") or "").strip()
@@ -507,27 +459,23 @@ def control_dispatcher():
 
         if command == "SAVE":
             if not mt5_login or not mt5_server:
-                return jsonify({"status": "error", "message": "Login and Server are required to save."}), 200
+                return jsonify({"status": "error", "message": "Login and Server required."}), 200
             db_save_credentials(license_key, mt5_login, mt5_password, mt5_server, mt5_symbol)
-            return jsonify({"status": "success", "message": "Credentials saved securely on server database."}), 200
+            return jsonify({"status": "success", "message": "Saved successfully."}), 200
 
         if not mt5_login or not mt5_password or not mt5_server:
-            return jsonify({
-                "status": "error",
-                "success": False,
-                "message": "Missing credentials. Enter login, password, and server."
-            }), 200
+            return jsonify({"status": "error", "success": False, "message": "Missing credentials."}), 200
 
         db_save_credentials(license_key, mt5_login, mt5_password, mt5_server, mt5_symbol)
         login_str = str(mt5_login).strip()
 
         if command == "STOP":
             active_trading_nodes[login_str] = False
-            return jsonify({"status": "success", "success": True, "message": "STOP command accepted."}), 200
+            return jsonify({"status": "success", "success": True, "message": "Bot stopped."}), 200
 
         if command in ["START", "RUN"]:
             if active_trading_nodes.get(login_str, False):
-                return jsonify({"status": "success", "success": True, "message": "Bot is already running."}), 200
+                return jsonify({"status": "success", "success": True, "message": "Bot already running."}), 200
 
             active_trading_nodes[login_str] = True
 
@@ -547,7 +495,7 @@ def control_dispatcher():
             return jsonify({
                 "status": "success",
                 "success": True,
-                "message": f"License [{license_key}] Verified. Hybrid scalper active with Exness Gold resolution.",
+                "message": "Bot started successfully.",
                 "login": login_str,
                 "symbol": mt5_symbol
             }), 200
@@ -564,5 +512,4 @@ def control_dispatcher():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Running Gold Scalper AI Server on 0.0.0.0:{port}...")
     serve(app, host="0.0.0.0", port=port, threads=8)
