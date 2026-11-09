@@ -6,11 +6,14 @@ import asyncio
 import threading
 import datetime
 import traceback
+import functools
 from collections import deque
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from metaapi_cloud_sdk import MetaApi
 from waitress import serve
+
+print = functools.partial(print, flush=True)
 
 app = Flask(__name__)
 
@@ -62,6 +65,10 @@ MAX_RECOVERY_STAGES = 3
 MAX_CONNECTION_ATTEMPTS = 10
 CONNECTION_RETRY_DELAY = 5
 SYNC_TIMEOUT_SECONDS = 30
+DEPLOY_TIMEOUT_SECONDS = 60
+DEPLOY_WAIT_TIMEOUT_SECONDS = 120
+BROKER_CONNECT_TIMEOUT_SECONDS = 120
+STREAM_CONNECT_TIMEOUT_SECONDS = 60
 RECONNECT_DELAY = 5
 MAX_CONSECUTIVE_CRITICAL_ERRORS = 10
 
@@ -138,7 +145,18 @@ def get_metaapi_client(override_token=None):
     token = (override_token or METAAPI_TOKEN).strip()
 
     if not token:
-        raise ValueError("METAAPI_TOKEN is missing. Add it in Render environment variables.")
+        error_message = (
+            "METAAPI_TOKEN is missing or empty. "
+            "Add METAAPI_TOKEN in Render Environment Variables, then redeploy."
+        )
+
+        print(f"[TOKEN ERROR] {error_message}")
+        raise ValueError(error_message)
+
+    print(
+        f"[TOKEN CHECK] MetaApi token detected: "
+        f"{token[:6]}...{token[-4:]}"
+    )
 
     with metaapi_lock:
         if metaapi_instance is None or override_token:
@@ -376,55 +394,116 @@ async def get_or_create_metaapi_account(api, login, password, server):
     })
 
 # ============================================================
-# RESILIENT CONNECTION MANAGER
+# TIMEOUT-PROTECTED CONNECTION MANAGER
 # ============================================================
 async def connect_metaapi_account(account, login):
     last_error = None
 
     for attempt in range(1, MAX_CONNECTION_ATTEMPTS + 1):
         try:
-            print(f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] Connecting MT5 account {login}...")
+            account_id = getattr(account, "id", "unknown")
+            account_state = getattr(account, "state", "unknown")
 
-            if getattr(account, "state", "") != "DEPLOYED":
+            print(
+                f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] "
+                f"Connecting MT5 account {login} | MetaApi ID: {account_id} | "
+                f"State: {account_state}"
+            )
+
+            if account_state != "DEPLOYED":
+                print(
+                    f"[DEPLOYING ACCOUNT] MetaApi account {account_id} "
+                    f"is {account_state}."
+                )
+
                 try:
-                    await account.deploy()
+                    await asyncio.wait_for(
+                        account.deploy(),
+                        timeout=DEPLOY_TIMEOUT_SECONDS
+                    )
                 except Exception as deploy_error:
                     print(f"[DEPLOY WARNING] {deploy_error}")
 
-            await account.wait_connected()
+                try:
+                    await asyncio.wait_for(
+                        account.wait_deployed(),
+                        timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+                    )
+
+                    print(
+                        f"[ACCOUNT DEPLOYED] MetaApi account {account_id} deployed."
+                    )
+
+                except Exception as deploy_wait_error:
+                    print(f"[DEPLOY WAIT FAILED] {deploy_wait_error}")
+                    raise deploy_wait_error
+
+            print(
+                f"[WAITING FOR BROKER] Waiting for MT5 account "
+                f"{login} to connect..."
+            )
+
+            await asyncio.wait_for(
+                account.wait_connected(),
+                timeout=BROKER_CONNECT_TIMEOUT_SECONDS
+            )
+
+            print(
+                f"[BROKER CONNECTED] MT5 account {login} connected "
+                f"through MetaApi."
+            )
 
             connection = account.get_streaming_connection()
-            await connection.connect()
 
-            try:
-                await asyncio.wait_for(
-                    connection.wait_synchronized(),
-                    timeout=SYNC_TIMEOUT_SECONDS
-                )
+            print(
+                f"[OPENING STREAM] Opening MetaApi streaming connection "
+                f"for {login}..."
+            )
 
-                print(f"[CORE LIVE & SYNCHRONIZED] Connected account: {login}")
-                return connection
+            await asyncio.wait_for(
+                connection.connect(),
+                timeout=STREAM_CONNECT_TIMEOUT_SECONDS
+            )
 
-            except Exception as sync_error:
-                print(f"[SYNC NOTICE] Synchronization warning on attempt {attempt}: {sync_error}")
+            print(
+                f"[STREAM OPEN] MetaApi streaming connection opened "
+                f"for {login}."
+            )
 
-                if attempt == MAX_CONNECTION_ATTEMPTS:
-                    print("[SYNC WARNING] Continuing with unsynchronized connection.")
-                    return connection
+            print(
+                f"[WAITING FOR SYNC] Waiting for MetaApi synchronization..."
+            )
 
-                await asyncio.sleep(CONNECTION_RETRY_DELAY)
-                continue
+            await asyncio.wait_for(
+                connection.wait_synchronized(),
+                timeout=SYNC_TIMEOUT_SECONDS
+            )
+
+            print(
+                f"[CORE LIVE & SYNCHRONIZED] Connected account: {login} | "
+                f"MetaApi ID: {account_id}"
+            )
+
+            return connection
 
         except Exception as error:
             last_error = error
-            print(f"[CONNECTION FAILED] Attempt {attempt}/{MAX_CONNECTION_ATTEMPTS}: {error}")
+
+            print(
+                f"[CONNECTION FAILED] Attempt {attempt}/{MAX_CONNECTION_ATTEMPTS}: {error}"
+            )
 
             if attempt < MAX_CONNECTION_ATTEMPTS:
+                print(
+                    f"[RETRYING] Waiting {CONNECTION_RETRY_DELAY} seconds "
+                    f"before retry..."
+                )
+
                 await asyncio.sleep(CONNECTION_RETRY_DELAY)
 
     raise Exception(
         f"Failed to connect MetaApi account {login} after "
-        f"{MAX_CONNECTION_ATTEMPTS} attempts: {last_error}"
+        f"{MAX_CONNECTION_ATTEMPTS} attempts. Last error: {last_error}"
     )
 
 # ============================================================
@@ -476,7 +555,10 @@ class InstantCandleTracker:
 # RESILIENT TRADING ENGINE
 # ============================================================
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
-    print(f"[HYBRID ENGINE INITIALIZED] Connecting account {login} on {server}...")
+    print(
+        f"[HYBRID ENGINE INITIALIZED] Connecting account {login} "
+        f"on {server}..."
+    )
 
     account = None
     connection = None
@@ -496,9 +578,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         margin_level=0,
         floating_pnl=0,
         positions_count=0,
-        price_data=None
+        price_data=None,
+        error=None
     ):
-        live_account_telemetry[str(login)] = {
+        telemetry = {
             "connected_to_broker": connected,
             "balance": balance,
             "equity": equity,
@@ -511,6 +594,11 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             "symbol_price": price_data or {},
             "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
+
+        if error:
+            telemetry["error"] = error
+
+        live_account_telemetry[str(login)] = telemetry
 
     update_telemetry(
         connected=False,
@@ -541,7 +629,8 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
                     update_telemetry(
                         connected=False,
-                        active_symbol=symbol
+                        active_symbol=symbol,
+                        error=str(symbol_error)
                     )
 
                     return
@@ -615,7 +704,11 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         )
 
                         if not broker_connected:
-                            print("[BROKER DISCONNECTED] Attempting automatic reconnection...")
+                            print(
+                                "[BROKER DISCONNECTED] Attempting automatic "
+                                "reconnection..."
+                            )
+
                             break
 
                         max_drawdown_limit = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
@@ -786,11 +879,15 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
                         update_telemetry(
                             connected=False,
-                            active_symbol=symbol
+                            active_symbol=symbol,
+                            error=str(trading_loop_error)
                         )
 
                         if critical_errors >= MAX_CONSECUTIVE_CRITICAL_ERRORS:
-                            print("[CRITICAL ERRORS] Restarting MetaApi connection...")
+                            print(
+                                "[CRITICAL ERRORS] Restarting MetaApi connection..."
+                            )
+
                             break
 
                         await asyncio.sleep(1.0)
@@ -805,11 +902,15 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
                 update_telemetry(
                     connected=False,
-                    active_symbol=symbol
+                    active_symbol=symbol,
+                    error=str(connection_cycle_error)
                 )
 
                 if critical_errors >= MAX_CONSECUTIVE_CRITICAL_ERRORS:
-                    print("[CRITICAL ERRORS] Waiting before another connection attempt...")
+                    print(
+                        "[CRITICAL ERRORS] Waiting before another connection attempt..."
+                    )
+
                     await asyncio.sleep(10.0)
                     critical_errors = 0
                 else:
@@ -817,13 +918,16 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
     except Exception as fatal_error:
         print(
-            f"[CRITICAL ENGINE ERROR] Failed to connect account {login}: {str(fatal_error)}"
+            f"[CRITICAL ENGINE ERROR] Failed to connect account {login}: "
+            f"{str(fatal_error)}"
         )
+
         traceback.print_exc()
 
         update_telemetry(
             connected=False,
-            active_symbol=symbol
+            active_symbol=symbol,
+            error=str(fatal_error)
         )
 
     finally:
@@ -843,6 +947,11 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
     asyncio.set_event_loop(loop)
 
     try:
+        print(
+            f"[WORKER STARTED] login={login} server={server} "
+            f"symbol={symbol} license={key}"
+        )
+
         loop.run_until_complete(
             high_frequency_trading_engine(
                 login,
@@ -854,9 +963,29 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
             )
         )
 
+        print(f"[WORKER FINISHED NORMALLY] login={login}")
+
     except Exception as error:
-        print(f"[THREAD ERROR] {error}")
+        error_message = str(error)
+
+        print(f"[WORKER CRASHED] login={login}")
+        print(f"[WORKER ERROR] {error_message}")
         traceback.print_exc()
+
+        live_account_telemetry[str(login)] = {
+            "connected_to_broker": False,
+            "balance": 0,
+            "equity": 0,
+            "free_margin": 0,
+            "margin_level": 0,
+            "floating_pnl": 0,
+            "open_positions_count": 0,
+            "active_symbol": symbol,
+            "active_stage": 1,
+            "symbol_price": {},
+            "error": error_message,
+            "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
 
     finally:
         try:
@@ -958,6 +1087,11 @@ def control_dispatcher():
     try:
         data = extract_request_data(request)
 
+        print(
+            f"[START REQUEST RECEIVED] method={request.method} "
+            f"path={request.path} data_keys={list(data.keys())}"
+        )
+
         command = str(
             data.get("command") or
             data.get("action") or
@@ -1051,6 +1185,8 @@ def control_dispatcher():
 
         if command == "STOP":
             active_trading_nodes[login_str] = False
+
+            print(f"[STOP REQUEST RECEIVED] Stopping worker for {login_str}.")
 
             return jsonify({
                 "status": "success",
