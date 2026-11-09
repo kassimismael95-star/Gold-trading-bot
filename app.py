@@ -171,9 +171,11 @@ def calculate_dynamic_lot_size(equity, balance, free_margin):
         return 3.00, 8
 
 # ============================================================
-# SYMBOL RESOLVER
+# SAFE GOLD SYMBOL RESOLVER
 # ============================================================
 async def resolve_broker_gold_symbol(connection, requested_symbol):
+    requested_symbol = str(requested_symbol or "").strip()
+
     candidates = [
         requested_symbol,
         "XAUUSDm",
@@ -194,6 +196,8 @@ async def resolve_broker_gold_symbol(connection, requested_symbol):
             seen.add(symbol)
             filtered_candidates.append(symbol)
 
+    errors = []
+
     for symbol in filtered_candidates:
         try:
             await connection.subscribe_to_market_data(symbol)
@@ -202,15 +206,27 @@ async def resolve_broker_gold_symbol(connection, requested_symbol):
             price = connection.terminal_state.price(symbol)
 
             if price and (price.get("ask") or price.get("bid")):
-                print(f"[SYMBOL VERIFIED] Using Gold symbol: {symbol}")
+                print(
+                    f"[SYMBOL VERIFIED] Using Gold symbol: '{symbol}' "
+                    f"(Ask: {price.get('ask')}, Bid: {price.get('bid')})"
+                )
                 return symbol
 
-        except Exception as error:
-            print(f"[SYMBOL CHECK FAILED] {symbol}: {error}")
-            continue
+            errors.append(f"{symbol}: no price returned")
 
-    await connection.subscribe_to_market_data(requested_symbol)
-    return requested_symbol
+        except Exception as error:
+            errors.append(f"{symbol}: {error}")
+            print(f"[SYMBOL CHECK FAILED] {symbol}: {error}")
+
+    error_message = (
+        "No valid Gold symbol found on this broker. "
+        "Enter the exact symbol from MT5 Market Watch. "
+        f"Tried: {', '.join(filtered_candidates)}. "
+        f"Errors: {' | '.join(errors)}"
+    )
+
+    print(f"[SYMBOL RESOLUTION FAILED] {error_message}")
+    raise ValueError(error_message)
 
 # ============================================================
 # ORDER EXECUTION
@@ -424,10 +440,19 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
     last_burst_entry_price = 0.0
     active_burst_direction = "BUY"
     peak_basket_profit = 0.0
-    consecutive_errors = 0
     critical_errors = 0
 
-    def update_telemetry(connected, active_symbol, balance=0, equity=0, free_margin=0, margin_level=0, floating_pnl=0, positions_count=0, price_data=None):
+    def update_telemetry(
+        connected,
+        active_symbol,
+        balance=0,
+        equity=0,
+        free_margin=0,
+        margin_level=0,
+        floating_pnl=0,
+        positions_count=0,
+        price_data=None
+    ):
         live_account_telemetry[str(login)] = {
             "connected_to_broker": connected,
             "balance": balance,
@@ -451,6 +476,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         while active_trading_nodes.get(str(login), False):
             try:
                 api = get_metaapi_client(token)
+
                 account = await get_or_create_metaapi_account(
                     api,
                     login,
@@ -459,13 +485,28 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 )
 
                 connection = await connect_metaapi_account(account, login)
-                active_symbol = await resolve_broker_gold_symbol(connection, symbol)
+
+                try:
+                    active_symbol = await resolve_broker_gold_symbol(
+                        connection,
+                        symbol
+                    )
+                except Exception as symbol_error:
+                    print(f"[CRITICAL SYMBOL ERROR] {symbol_error}")
+
+                    update_telemetry(
+                        connected=False,
+                        active_symbol=symbol
+                    )
+
+                    return
 
                 critical_errors = 0
 
                 while active_trading_nodes.get(str(login), False):
                     try:
                         account_info = {}
+
                         try:
                             account_info = account.account_information or {}
                         except Exception as account_info_error:
