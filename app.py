@@ -18,7 +18,7 @@ print = functools.partial(print, flush=True)
 app = Flask(__name__)
 
 # ============================================================
-# CORS HEADERS
+# CORS CONFIGURATION
 # ============================================================
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -37,8 +37,6 @@ METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
 ALLOWED_LICENSES = ["BOSSMODE98", "BOSSMODE99"]
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.db")
 
-FIXED_METAAPI_ACCOUNT_ID = "28ecb0a9-55bf-4bd4-9d8c-cbc62b8c45ef"
-
 metaapi_instance = None
 metaapi_lock = threading.Lock()
 
@@ -46,11 +44,41 @@ active_trading_nodes = {}
 trading_threads = {}
 live_account_telemetry = {}
 
-MAX_ALLOWED_SPREAD_PIPS = 35.0
-POLL_LATENCY_DELAY = 0.05
+# ============================================================
+# FIXED METAAPI ACCOUNT BINDING
+# ============================================================
+FIXED_METAAPI_ACCOUNT_ID = "28ecb0a9-55bf-4bd4-9d8c-cbc62b8c45ef"
 
 # ============================================================
-# SQLITE PERSISTENCE
+# HYBRID STYLE 1 + STYLE 4 SCALPING PARAMETERS
+# ============================================================
+BURST_ORDER_COUNT = 8
+MIN_TARGET_PROFIT_USD = 0.80
+PROFIT_EQUITY_RATIO = 0.04
+TRAILING_FLUSH_RATIO = 0.70
+MAX_ALLOWED_SPREAD_PIPS = 25.0
+MAX_ACCOUNT_DRAWDOWN_RATIO = 0.35
+POLL_LATENCY_DELAY = 0.015
+
+GRID_RECOVERY_DISTANCE_PIPS = 18.0
+MARTINGALE_LOT_MULTIPLIER = 1.5
+MAX_RECOVERY_STAGES = 3
+
+# ============================================================
+# CONNECTION STABILITY SETTINGS
+# ============================================================
+MAX_CONNECTION_ATTEMPTS = 15
+CONNECTION_RETRY_DELAY = 5
+SYNC_TIMEOUT_SECONDS = 30
+DEPLOY_TIMEOUT_SECONDS = 60
+DEPLOY_WAIT_TIMEOUT_SECONDS = 180
+BROKER_CONNECT_TIMEOUT_SECONDS = 180
+STREAM_CONNECT_TIMEOUT_SECONDS = 60
+RECONNECT_DELAY = 5
+MAX_CONSECUTIVE_CRITICAL_ERRORS = 10
+
+# ============================================================
+# DATABASE
 # ============================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -102,6 +130,7 @@ def db_get_credentials(license_key):
     )
     row = cursor.fetchone()
     conn.close()
+
     if row:
         return {
             "mt5_login": row[0],
@@ -109,6 +138,7 @@ def db_get_credentials(license_key):
             "mt5_server": row[2],
             "mt5_symbol": row[3]
         }
+
     return None
 
 # ============================================================
@@ -116,126 +146,162 @@ def db_get_credentials(license_key):
 # ============================================================
 def get_metaapi_client(override_token=None):
     global metaapi_instance
+
     token = (override_token or METAAPI_TOKEN).strip()
+
     if not token:
-        raise ValueError("METAAPI_TOKEN is missing in Render environment variables.")
+        error_message = (
+            "METAAPI_TOKEN is missing or empty. "
+            "Add METAAPI_TOKEN in Render Environment Variables, then redeploy."
+        )
+
+        print(f"[TOKEN ERROR] {error_message}")
+        raise ValueError(error_message)
+
+    print(
+        f"[TOKEN CHECK] MetaApi token detected: "
+        f"{token[:6]}...{token[-4:]}"
+    )
+
     with metaapi_lock:
         if metaapi_instance is None or override_token:
             metaapi_instance = MetaApi(token)
+
     return metaapi_instance
 
-# ============================================================
-# VIDEO LOT & BURST MATRIX
-# ============================================================
-def calculate_video_dynamic_burst(equity: float, balance: float, confidence_score: int) -> tuple:
-    capital = max(equity, balance)
-    abs_conf = abs(confidence_score)
+def calculate_dynamic_lot_size(equity, balance, free_margin):
+    effective_capital = max(equity, balance)
 
-    if capital < 4.0:
-        count = 2 if abs_conf >= 7 else 1
-        return 0.01, count, 0.35
-    elif capital < 10.0:
-        count = 2 if abs_conf >= 6 else 1
-        lot = 0.02 if abs_conf >= 8 else 0.01
-        return lot, count, 0.60
-    elif capital < 25.0:
-        if abs_conf >= 8:
-            return 0.02, 4, 1.20
-        elif abs_conf >= 5:
-            return 0.01, 3, 0.80
-        else:
-            return 0.01, 2, 0.60
-    elif capital < 70.0:
-        count = 5 if abs_conf >= 7 else 3
-        return 0.02, count, 2.50
-    elif capital < 200.0:
-        count = 6 if abs_conf >= 7 else 4
-        lot = 0.03 if abs_conf >= 8 else 0.02
-        return lot, count, 5.00
-    elif capital < 800.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.10, count, 15.00
-    elif capital < 2000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.20, count, 35.00
-    elif capital < 5000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.30, count, 80.00
-    elif capital < 15000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.90, count, 200.00
-    elif capital < 50000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 2.00, count, 500.00
+    if effective_capital < 10.0 or free_margin < 2.0:
+        return 0.01, 3 if free_margin < 5.0 else 5
+    elif effective_capital < 25.0:
+        return 0.01, 6
+    elif effective_capital < 70.0:
+        return 0.02, 6
+    elif effective_capital < 200.0:
+        return 0.02, 8
+    elif effective_capital < 800.0:
+        return 0.10, 8
+    elif effective_capital < 2000.0:
+        return 0.20, 8
+    elif effective_capital < 5000.0:
+        return 0.30, 8
+    elif effective_capital < 15000.0:
+        return 0.90, 8
+    elif effective_capital < 50000.0:
+        return 2.00, 8
     else:
-        count = 8 if abs_conf >= 6 else 5
-        return 3.00, count, 1200.00
+        return 3.00, 8
 
 # ============================================================
-# MICRO-MOMENTUM TRACKER
+# SAFE ACCOUNT DATA READERS
 # ============================================================
-class MicroMomentumTracker:
-    def __init__(self, capacity=20):
-        self.ticks = deque(maxlen=capacity)
-        self.candle_open = None
-        self.last_minute = None
+def safe_get_account_info(terminal_state):
+    try:
+        info = terminal_state.account_information or {}
+        return info if isinstance(info, dict) else {}
+    except Exception as error:
+        print(f"[ACCOUNT INFO WARNING] {error}")
+        return {}
 
-    def record_tick(self, price: float):
-        current_minute = datetime.datetime.now(datetime.timezone.utc).minute
-        if self.last_minute != current_minute or self.candle_open is None:
-            self.candle_open = price
-            self.last_minute = current_minute
-        self.ticks.append(price)
+def safe_get_positions(terminal_state):
+    try:
+        positions = terminal_state.positions or []
+        return positions if isinstance(positions, list) else []
+    except Exception as error:
+        print(f"[POSITIONS WARNING] {error}")
+        return []
 
-    def evaluate(self) -> tuple:
-        if len(self.ticks) < 3:
-            return "BUY", 6
+def safe_get_price(terminal_state, symbol):
+    try:
+        price = terminal_state.price(symbol)
+        return price if isinstance(price, dict) else {}
+    except Exception as error:
+        print(f"[PRICE WARNING] {error}")
+        return {}
 
-        score = 0
-        latest = self.ticks[-1]
+def safe_get_connection_state(connection):
+    try:
+        terminal_state = connection.terminal_state
 
-        short_delta = latest - self.ticks[-3]
-        if short_delta > 0.05:
-            score += 4
-        elif short_delta < -0.05:
-            score -= 4
-        elif short_delta > 0:
-            score += 2
-        elif short_delta < 0:
-            score -= 2
+        connected = getattr(terminal_state, "connected", None)
 
-        full_delta = latest - self.ticks[0]
-        if full_delta > 0.15:
-            score += 3
-        elif full_delta < -0.15:
-            score -= 3
-        elif full_delta > 0:
-            score += 1
-        elif full_delta < 0:
-            score -= 1
+        if connected is None:
+            connected = getattr(terminal_state, "connected_to_broker", None)
 
-        if self.candle_open is not None:
-            candle_delta = latest - self.candle_open
-            if candle_delta > 0.10:
-                score += 3
-            elif candle_delta < -0.10:
-                score -= 3
-            elif candle_delta > 0:
-                score += 1
-            elif candle_delta < 0:
-                score -= 1
+        if connected is None:
+            connected = True
 
-        score = max(-10, min(10, score))
-        direction = "BUY" if score >= 0 else "SELL"
-        return direction, score
+        return bool(connected)
+
+    except Exception as error:
+        print(f"[CONNECTION STATE WARNING] {error}")
+        return False
 
 # ============================================================
-# BATCH EXECUTION & FLUSH
+# SAFE GOLD SYMBOL RESOLVER
 # ============================================================
-async def fire_stacked_batch(connection, symbol: str, direction: str, volume: float, count: int, key: str):
+async def resolve_broker_gold_symbol(connection, requested_symbol):
+    requested_symbol = str(requested_symbol or "").strip()
+
+    candidates = [
+        requested_symbol,
+        "XAUUSDm",
+        "XAUUSD",
+        "XAUUSDc",
+        "XAUUSDr",
+        "GOLD",
+        "XAUUSD247",
+        "XAUUSD.a",
+        "XAUUSD.ecn"
+    ]
+
+    seen = set()
+    filtered_candidates = []
+
+    for symbol in candidates:
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            filtered_candidates.append(symbol)
+
+    errors = []
+
+    for symbol in filtered_candidates:
+        try:
+            await connection.subscribe_to_market_data(symbol)
+            await asyncio.sleep(0.20)
+
+            price = safe_get_price(connection.terminal_state, symbol)
+
+            if price and (price.get("ask") or price.get("bid")):
+                print(
+                    f"[SYMBOL VERIFIED] Using Gold symbol: '{symbol}' "
+                    f"(Ask: {price.get('ask')}, Bid: {price.get('bid')})"
+                )
+                return symbol
+
+            errors.append(f"{symbol}: no price returned")
+
+        except Exception as error:
+            errors.append(f"{symbol}: {error}")
+            print(f"[SYMBOL CHECK FAILED] {symbol}: {error}")
+
+    error_message = (
+        "No valid Gold symbol found on this broker. "
+        "Enter the exact symbol from MT5 Market Watch. "
+        f"Tried: {', '.join(filtered_candidates)}. "
+        f"Errors: {' | '.join(errors)}"
+    )
+
+    print(f"[SYMBOL RESOLUTION FAILED] {error_message}")
+    raise ValueError(error_message)
+
+# ============================================================
+# ORDER EXECUTION
+# ============================================================
+async def fire_stacked_directional_burst(connection, symbol, direction, volume, count, key):
     tasks = []
-    comment = f"SCALPER [{key}]"
-    print(f"[DISPATCH] Firing {count} concurrent {direction} orders on {symbol} @ {volume} lots...")
+    bot_signature = f"GOLD MOBILE EA [{key}]"
 
     for _ in range(count):
         if direction == "BUY":
@@ -244,7 +310,7 @@ async def fire_stacked_batch(connection, symbol: str, direction: str, volume: fl
                 volume=volume,
                 stop_loss=None,
                 take_profit=None,
-                options={"comment": comment}
+                options={"comment": bot_signature}
             ))
         else:
             tasks.append(connection.create_market_sell_order(
@@ -252,99 +318,153 @@ async def fire_stacked_batch(connection, symbol: str, direction: str, volume: fl
                 volume=volume,
                 stop_loss=None,
                 take_profit=None,
-                options={"comment": comment}
+                options={"comment": bot_signature}
             ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    success = sum(1 for r in results if not isinstance(r, Exception))
-    print(f"[DISPATCH COMPLETE] {success}/{count} {direction} orders filled.")
-    return success
+    successful = sum(1 for result in results if not isinstance(result, Exception))
 
-async def purge_entire_basket(connection, positions):
-    tasks = [connection.close_position(p["id"]) for p in positions if "id" in p]
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        success = sum(1 for r in results if not isinstance(r, Exception))
-        print(f"[BASKET FLUSH] Liquidated {success}/{len(tasks)} open positions.")
+    print(f"[BURST COMPLETE] {successful}/{count} {direction} orders on {symbol} at {volume} lots.")
+    return successful
 
-# ============================================================
-# SYMBOL RESOLVER
-# ============================================================
-async def resolve_gold_symbol(connection, requested_symbol: str) -> str:
-    requested_symbol = str(requested_symbol or "").strip()
-    candidates = [requested_symbol, "XAUUSDm", "XAUUSD", "XAUUSDc", "XAUUSDr", "GOLD"]
-    seen = set()
-    for s in candidates:
-        if s and s not in seen:
-            seen.add(s)
-            try:
-                await connection.subscribe_to_market_data(s)
-                await asyncio.sleep(0.20)
-                p = connection.terminal_state.price(s)
-                if p and (p.get("ask") or p.get("bid")):
-                    print(f"[SYMBOL VERIFIED] Active symbol: '{s}'")
-                    return s
-            except Exception:
-                continue
-    return requested_symbol
+async def purge_entire_basket_instantly(connection, positions):
+    close_tasks = []
+
+    for position in positions:
+        if "id" in position:
+            close_tasks.append(connection.close_position(position["id"]))
+
+    if close_tasks:
+        results = await asyncio.gather(*close_tasks, return_exceptions=True)
+        successful = sum(1 for result in results if not isinstance(result, Exception))
+        print(f"[LIQUIDATOR] Closed {successful}/{len(close_tasks)} positions.")
 
 # ============================================================
-# RESILIENT ACCOUNT & DEPLOYMENT HANDLER
+# METAAPI ACCOUNT SELECTOR WITH FIXED BINDING
 # ============================================================
-async def ensure_account_deployed(account):
-    """Safely checks deployment state without raising fatal timeouts"""
-    state = getattr(account, "state", "")
-    if state == "DEPLOYED":
-        return True
-
-    print(f"[DEPLOY] Current account state is '{state}'. Initiating deployment...")
-    try:
-        if state != "DEPLOYING":
-            await account.deploy()
-    except Exception as e:
-        print(f"[DEPLOY CALL NOTICE] {e}")
-
-    # Wait gracefully with polling instead of rigid blocking
-    for _ in range(40):
-        try:
-            curr_state = getattr(account, "state", "")
-            if curr_state == "DEPLOYED":
-                print("[DEPLOY SUCCESS] Account is DEPLOYED.")
-                return True
-            await asyncio.sleep(2)
-        except Exception:
-            await asyncio.sleep(2)
-
-    return getattr(account, "state", "") == "DEPLOYED"
-
-async def get_or_create_account(api, login: str, password: str, server: str):
+async def get_or_create_metaapi_account(api, login, password, server):
     login_str = str(login).strip()
     server_str = str(server).strip()
 
-    # 1. Try fixed account ID
-    try:
-        account = await api.metatrader_account_api.get_account(FIXED_METAAPI_ACCOUNT_ID)
-        if getattr(account, "login", "") == login_str:
-            await ensure_account_deployed(account)
-            print(f"[ACCOUNT BOUND] Using fixed MetaApi account: {FIXED_METAAPI_ACCOUNT_ID}")
-            return account
-    except Exception as e:
-        print(f"[BINDING NOTICE] Fixed ID bypass ({e}). Checking account inventory...")
+    print(
+        f"[ACCOUNT BIND] Trying fixed MetaApi account: "
+        f"{FIXED_METAAPI_ACCOUNT_ID}"
+    )
 
-    # 2. Search existing accounts
     try:
-        accounts = await api.metatrader_account_api.get_accounts()
-        for acc in accounts:
-            if str(getattr(acc, "login", "")).strip() == login_str:
-                await ensure_account_deployed(acc)
-                print(f"[ACCOUNT BOUND] Reusing existing MetaApi account: {getattr(acc, 'id', '')}")
-                return acc
-    except Exception:
-        pass
+        account = await api.metatrader_account_api.get_account(
+            FIXED_METAAPI_ACCOUNT_ID
+        )
 
-    # 3. Create fresh account
-    print(f"[ACCOUNT CREATE] Provisioning fresh MetaApi account for {login_str}...")
-    new_acc = await api.metatrader_account_api.create_account({
+        account_login = str(getattr(account, "login", "")).strip()
+        account_server = str(getattr(account, "server", "")).strip()
+        account_state = getattr(account, "state", "")
+
+        print(
+            f"[ACCOUNT VALIDATION] Fixed account login={account_login}, "
+            f"server={account_server}, state={account_state}"
+        )
+
+        if account_login != login_str:
+            raise ValueError(
+                f"Fixed MetaApi account login mismatch. "
+                f"Expected: {login_str}, found: {account_login}"
+            )
+
+        if account_server.lower() != server_str.lower():
+            print(
+                f"[SERVER MISMATCH WARNING] MetaApi account server is "
+                f"'{account_server}', but Mini App sent '{server_str}'. "
+                f"Using the MetaApi account server."
+            )
+
+        if account_state != "DEPLOYED":
+            print(
+                f"[DEPLOYING ACCOUNT] Deploying MetaApi account "
+                f"{FIXED_METAAPI_ACCOUNT_ID}..."
+            )
+
+            await asyncio.wait_for(
+                account.deploy(),
+                timeout=DEPLOY_TIMEOUT_SECONDS
+            )
+
+            await asyncio.wait_for(
+                account.wait_deployed(),
+                timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+            )
+
+        print(
+            f"[ACCOUNT BOUND] Using fixed MetaApi account: "
+            f"{FIXED_METAAPI_ACCOUNT_ID}"
+        )
+
+        return account
+
+    except Exception as fixed_bind_error:
+        print(
+            f"[DIRECT BIND ERROR] {fixed_bind_error}. "
+            f"Searching existing MetaApi accounts..."
+        )
+
+    try:
+        if hasattr(
+            api.metatrader_account_api,
+            "get_accounts_with_classic_pagination"
+        ):
+            response = await api.metatrader_account_api.get_accounts_with_classic_pagination()
+            accounts = response.get("items", []) if isinstance(response, dict) else response
+        elif hasattr(api.metatrader_account_api, "get_accounts"):
+            accounts = await api.metatrader_account_api.get_accounts()
+        else:
+            accounts = []
+
+        matching_accounts = []
+
+        for account in accounts:
+            account_login = str(getattr(account, "login", "")).strip()
+
+            if account_login == login_str:
+                matching_accounts.append(account)
+
+        print(
+            f"[ACCOUNT SEARCH] Found {len(matching_accounts)} MetaApi "
+            f"account(s) for login {login_str}."
+        )
+
+        for account in matching_accounts:
+            if getattr(account, "state", "") == "DEPLOYED":
+                print(
+                    f"[ACCOUNT BOUND] Reusing deployed MetaApi account: "
+                    f"{getattr(account, 'id', '')}"
+                )
+                return account
+
+        for account in matching_accounts:
+            if getattr(account, "state", "") != "DEPLOYED":
+                print(
+                    f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: "
+                    f"{getattr(account, 'id', '')}"
+                )
+
+                await asyncio.wait_for(
+                    account.deploy(),
+                    timeout=DEPLOY_TIMEOUT_SECONDS
+                )
+
+                await asyncio.wait_for(
+                    account.wait_deployed(),
+                    timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+                )
+
+                return account
+
+    except Exception as search_error:
+        print(f"[ACCOUNT SEARCH ERROR] {search_error}")
+
+    print("[ACCOUNT CREATE] Creating new MetaApi account.")
+
+    return await api.metatrader_account_api.create_account({
         "name": f"Node_{login_str}",
         "type": "cloud",
         "login": login_str,
@@ -353,251 +473,890 @@ async def get_or_create_account(api, login: str, password: str, server: str):
         "platform": "mt5",
         "magic": 9924102
     })
-    await ensure_account_deployed(new_acc)
-    return new_acc
-
-async def connect_streaming(account, login: str):
-    await ensure_account_deployed(account)
-
-    try:
-        await asyncio.wait_for(account.wait_connected(), timeout=120)
-    except Exception as e:
-        print(f"[WAIT CONNECTED NOTICE] {e}")
-
-    connection = account.get_streaming_connection()
-    await connection.connect()
-
-    try:
-        await asyncio.wait_for(connection.wait_synchronized(), timeout=25)
-    except Exception:
-        print("[SYNC NOTICE] Proceeding with unsynchronized stream.")
-
-    print(f"[CORE LIVE & READY] Connected to MT5 account: {login}")
-    return connection
 
 # ============================================================
-# VIDEO-STYLE TRADING ENGINE
+# TIMEOUT-PROTECTED CONNECTION MANAGER
 # ============================================================
-async def video_style_trading_engine(login, password, server, symbol, key, token=None):
-    print(f"[ENGINE INITIALIZED] Starting Scalper for {login}...")
-    tracker = MicroMomentumTracker()
+async def connect_metaapi_account(account, login):
+    last_error = None
 
-    def push_telemetry(connected, sym, bal=0, eq=0, f_margin=0, m_level=0, pnl=0, open_count=0, price_obj=None, conf=0):
-        live_account_telemetry[str(login)] = {
+    for attempt in range(1, MAX_CONNECTION_ATTEMPTS + 1):
+        try:
+            account_id = getattr(account, "id", "unknown")
+            account_state = getattr(account, "state", "unknown")
+
+            print(
+                f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] "
+                f"Connecting MT5 account {login} | MetaApi ID: {account_id} | "
+                f"State: {account_state}"
+            )
+
+            if account_state != "DEPLOYED":
+                print(
+                    f"[DEPLOYING ACCOUNT] MetaApi account {account_id} "
+                    f"is {account_state}."
+                )
+
+                try:
+                    await asyncio.wait_for(
+                        account.deploy(),
+                        timeout=DEPLOY_TIMEOUT_SECONDS
+                    )
+                except Exception as deploy_error:
+                    print(f"[DEPLOY WARNING] {deploy_error}")
+
+                try:
+                    await asyncio.wait_for(
+                        account.wait_deployed(),
+                        timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+                    )
+
+                    print(
+                        f"[ACCOUNT DEPLOYED] MetaApi account {account_id} deployed."
+                    )
+
+                except Exception as deploy_wait_error:
+                    print(f"[DEPLOY WAIT FAILED] {deploy_wait_error}")
+                    raise deploy_wait_error
+
+            print(
+                f"[WAITING FOR BROKER] Waiting for MT5 account "
+                f"{login} to connect..."
+            )
+
+            await asyncio.wait_for(
+                account.wait_connected(),
+                timeout=BROKER_CONNECT_TIMEOUT_SECONDS
+            )
+
+            print(
+                f"[BROKER CONNECTED] MT5 account {login} connected "
+                f"through MetaApi."
+            )
+
+            connection = account.get_streaming_connection()
+
+            print(
+                f"[OPENING STREAM] Opening MetaApi streaming connection "
+                f"for {login}..."
+            )
+
+            await asyncio.wait_for(
+                connection.connect(),
+                timeout=STREAM_CONNECT_TIMEOUT_SECONDS
+            )
+
+            print(
+                f"[STREAM OPEN] MetaApi streaming connection opened "
+                f"for {login}."
+            )
+
+            print(
+                f"[WAITING FOR SYNC] Waiting for MetaApi synchronization..."
+            )
+
+            await asyncio.wait_for(
+                connection.wait_synchronized(),
+                timeout=SYNC_TIMEOUT_SECONDS
+            )
+
+            print(
+                f"[CORE LIVE & SYNCHRONIZED] Connected account: {login} | "
+                f"MetaApi ID: {account_id}"
+            )
+
+            return connection
+
+        except Exception as error:
+            last_error = error
+
+            print(
+                f"[CONNECTION FAILED] Attempt {attempt}/{MAX_CONNECTION_ATTEMPTS}: {error}"
+            )
+
+            if attempt < MAX_CONNECTION_ATTEMPTS:
+                print(
+                    f"[RETRYING] Waiting {CONNECTION_RETRY_DELAY} seconds "
+                    f"before retry..."
+                )
+
+                await asyncio.sleep(CONNECTION_RETRY_DELAY)
+
+    raise Exception(
+        f"Failed to connect MetaApi account {login} after "
+        f"{MAX_CONNECTION_ATTEMPTS} attempts. Last error: {last_error}"
+    )
+
+# ============================================================
+# MOMENTUM TRACKER
+# ============================================================
+class InstantCandleTracker:
+    def __init__(self, max_ticks=30):
+        self.ticks = deque(maxlen=max_ticks)
+        self.candle_open = None
+        self.last_minute = None
+
+    def record_tick(self, price):
+        current_minute = datetime.datetime.now(datetime.timezone.utc).minute
+
+        if self.last_minute != current_minute or self.candle_open is None:
+            self.candle_open = price
+            self.last_minute = current_minute
+
+        self.ticks.append(price)
+
+    def determine_bias(self):
+        if len(self.ticks) < 4:
+            return "BUY"
+
+        recent_delta = self.ticks[-1] - self.ticks[-4]
+        overall_delta = self.ticks[-1] - self.ticks[0]
+        candle_delta = (self.ticks[-1] - self.candle_open) if self.candle_open else 0.0
+
+        score = 0
+
+        if recent_delta > 0:
+            score += 2
+        elif recent_delta < 0:
+            score -= 2
+
+        if overall_delta > 0:
+            score += 1
+        elif overall_delta < 0:
+            score -= 1
+
+        if candle_delta > 0:
+            score += 1
+        elif candle_delta < 0:
+            score -= 1
+
+        return "BUY" if score >= 0 else "SELL"
+
+# ============================================================
+# RESILIENT TRADING ENGINE
+# ============================================================
+async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
+    print(
+        f"[HYBRID ENGINE INITIALIZED] Connecting account {login} "
+        f"on {server}..."
+    )
+
+    account = None
+    connection = None
+    candle_tracker = InstantCandleTracker()
+    current_stage = 1
+    last_burst_entry_price = 0.0
+    active_burst_direction = "BUY"
+    peak_basket_profit = 0.0
+    critical_errors = 0
+
+    def update_telemetry(
+        connected,
+        active_symbol,
+        balance=0,
+        equity=0,
+        free_margin=0,
+        margin_level=0,
+        floating_pnl=0,
+        positions_count=0,
+        price_data=None,
+        error=None
+    ):
+        telemetry = {
             "connected_to_broker": connected,
-            "balance": bal,
-            "equity": eq,
-            "free_margin": f_margin,
-            "margin_level": m_level,
-            "floating_pnl": round(pnl, 2),
-            "open_positions_count": open_count,
-            "active_symbol": sym,
-            "confidence_score": conf,
-            "symbol_price": price_obj or {},
+            "balance": balance,
+            "equity": equity,
+            "free_margin": free_margin,
+            "margin_level": margin_level,
+            "floating_pnl": round(floating_pnl, 2),
+            "open_positions_count": positions_count,
+            "active_symbol": active_symbol,
+            "active_stage": current_stage,
+            "symbol_price": price_data or {},
             "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
 
-    push_telemetry(False, symbol)
+        if error:
+            telemetry["error"] = error
+
+        live_account_telemetry[str(login)] = telemetry
+
+    update_telemetry(
+        connected=False,
+        active_symbol=symbol
+    )
 
     try:
-        api = get_metaapi_client(token)
-        account = await get_or_create_account(api, login, password, server)
-        connection = await connect_streaming(account, login)
-        active_symbol = await resolve_gold_symbol(connection, symbol)
-
-        terminal = connection.terminal_state
-        print(f"[CORE LIVE] Engine trading live on {active_symbol}!")
-
         while active_trading_nodes.get(str(login), False):
             try:
-                acc_info = terminal.account_information or {}
-                equity = float(acc_info.get("equity", 0) or 0)
-                balance = float(acc_info.get("balance", 0) or 0)
-                free_margin = float(acc_info.get("freeMargin", 0) or 0)
-                margin_level = float(acc_info.get("marginLevel", 0) or 0)
+                api = get_metaapi_client(token)
 
-                broker_connected = getattr(terminal, "connected", True)
-                price_data = terminal.price(active_symbol)
-
-                if not price_data or not price_data.get("bid"):
-                    await connection.subscribe_to_market_data(active_symbol)
-                    push_telemetry(broker_connected, active_symbol, balance, equity, free_margin, margin_level)
-                    await asyncio.sleep(0.1)
-                    continue
-
-                ask = float(price_data.get("ask", 0) or 0)
-                bid = float(price_data.get("bid", 0) or 0)
-                mid_price = (ask + bid) / 2.0
-                tracker.record_tick(mid_price)
-
-                all_positions = terminal.positions or []
-                my_positions = [p for p in all_positions if p.get("symbol") == active_symbol]
-                net_pnl = equity - balance
-
-                direction, confidence = tracker.evaluate()
-
-                push_telemetry(
-                    connected=broker_connected,
-                    sym=active_symbol,
-                    bal=balance,
-                    eq=equity,
-                    f_margin=free_margin,
-                    m_level=margin_level,
-                    pnl=net_pnl,
-                    open_count=len(my_positions),
-                    price_obj={"ask": ask, "bid": bid},
-                    conf=confidence
+                account = await get_or_create_metaapi_account(
+                    api,
+                    login,
+                    password,
+                    server
                 )
 
-                lot_size, burst_count, profit_target = calculate_video_dynamic_burst(
-                    equity, balance, confidence
+                connection = await connect_metaapi_account(account, login)
+
+                try:
+                    active_symbol = await resolve_broker_gold_symbol(
+                        connection,
+                        symbol
+                    )
+                except Exception as symbol_error:
+                    print(f"[CRITICAL SYMBOL ERROR] {symbol_error}")
+
+                    update_telemetry(
+                        connected=False,
+                        active_symbol=symbol,
+                        error=str(symbol_error)
+                    )
+
+                    return
+
+                critical_errors = 0
+
+                while active_trading_nodes.get(str(login), False):
+                    try:
+                        terminal_state = connection.terminal_state
+
+                        account_info = safe_get_account_info(terminal_state)
+
+                        equity = float(account_info.get("equity", 0) or 0)
+                        balance = float(account_info.get("balance", 0) or 0)
+                        free_margin = float(account_info.get("freeMargin", 0) or 0)
+                        margin_level = float(account_info.get("marginLevel", 0) or 0)
+
+                        broker_connected = safe_get_connection_state(connection)
+
+                        price = safe_get_price(terminal_state, active_symbol)
+
+                        if not price or not price.get("bid"):
+                            try:
+                                await connection.subscribe_to_market_data(active_symbol)
+                            except Exception as subscribe_error:
+                                print(f"[SUBSCRIBE WARNING] {subscribe_error}")
+
+                            update_telemetry(
+                                connected=broker_connected,
+                                active_symbol=active_symbol,
+                                balance=balance,
+                                equity=equity,
+                                free_margin=free_margin,
+                                margin_level=margin_level,
+                                floating_pnl=equity - balance,
+                                positions_count=0
+                            )
+
+                            await asyncio.sleep(0.5)
+                            continue
+
+                        current_ask = float(price.get("ask", 0) or 0)
+                        current_bid = float(price.get("bid", 0) or 0)
+                        mid_price = (current_ask + current_bid) / 2.0 if current_ask and current_bid else 0.0
+
+                        if mid_price > 0:
+                            candle_tracker.record_tick(mid_price)
+
+                        positions = safe_get_positions(terminal_state)
+
+                        symbol_positions = [
+                            position for position in positions
+                            if position.get("symbol") == active_symbol
+                        ]
+
+                        net_floating_profit = equity - balance
+
+                        update_telemetry(
+                            connected=broker_connected,
+                            active_symbol=active_symbol,
+                            balance=balance,
+                            equity=equity,
+                            free_margin=free_margin,
+                            margin_level=margin_level,
+                            floating_pnl=net_floating_profit,
+                            positions_count=len(symbol_positions),
+                            price_data={
+                                "ask": current_ask,
+                                "bid": current_bid
+                            }
+                        )
+
+                        if not broker_connected:
+                            print(
+                                "[BROKER DISCONNECTED] Attempting automatic "
+                                "reconnection..."
+                            )
+
+                            break
+
+                        max_drawdown_limit = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
+
+                        if symbol_positions and net_floating_profit < -max_drawdown_limit:
+                            print(
+                                f"[CIRCUIT BREAKER] Drawdown limit reached: "
+                                f"-{abs(net_floating_profit):.2f} USD"
+                            )
+
+                            await purge_entire_basket_instantly(
+                                connection,
+                                symbol_positions
+                            )
+
+                            current_stage = 1
+                            peak_basket_profit = 0.0
+                            last_burst_entry_price = 0.0
+
+                            await asyncio.sleep(2.0)
+                            continue
+
+                        if symbol_positions:
+                            if net_floating_profit > peak_basket_profit:
+                                peak_basket_profit = net_floating_profit
+
+                            dynamic_target = max(
+                                MIN_TARGET_PROFIT_USD,
+                                balance * PROFIT_EQUITY_RATIO
+                            )
+
+                            if balance < 10.0:
+                                dynamic_target = max(
+                                    0.50,
+                                    balance * 0.12
+                                )
+
+                            if net_floating_profit >= dynamic_target:
+                                print(
+                                    f"[TARGET HIT] Profit {net_floating_profit:.2f} USD "
+                                    f"reached target {dynamic_target:.2f} USD."
+                                )
+
+                                await purge_entire_basket_instantly(
+                                    connection,
+                                    symbol_positions
+                                )
+
+                                current_stage = 1
+                                peak_basket_profit = 0.0
+                                last_burst_entry_price = 0.0
+
+                                await asyncio.sleep(0.05)
+                                continue
+
+                            if peak_basket_profit >= 1.50 and net_floating_profit <= (
+                                peak_basket_profit * TRAILING_FLUSH_RATIO
+                            ):
+                                print(
+                                    f"[TRAILING FLUSH] Securing profit: "
+                                    f"{net_floating_profit:.2f} USD"
+                                )
+
+                                await purge_entire_basket_instantly(
+                                    connection,
+                                    symbol_positions
+                                )
+
+                                current_stage = 1
+                                peak_basket_profit = 0.0
+                                last_burst_entry_price = 0.0
+
+                                await asyncio.sleep(0.05)
+                                continue
+
+                            if current_stage < MAX_RECOVERY_STAGES and last_burst_entry_price > 0.0:
+                                if active_burst_direction == "BUY":
+                                    pip_divergence = (
+                                        last_burst_entry_price - current_bid
+                                    ) / 0.1
+                                else:
+                                    pip_divergence = (
+                                        current_ask - last_burst_entry_price
+                                    ) / 0.1
+
+                                if pip_divergence >= GRID_RECOVERY_DISTANCE_PIPS:
+                                    current_stage += 1
+
+                                    base_lot, burst_count = calculate_dynamic_lot_size(
+                                        equity,
+                                        balance,
+                                        free_margin
+                                    )
+
+                                    scaled_lot = round(
+                                        base_lot * (
+                                            MARTINGALE_LOT_MULTIPLIER ** (current_stage - 1)
+                                        ),
+                                        2
+                                    )
+
+                                    print(
+                                        f"[RECOVERY INJECTION] Stage {current_stage}: "
+                                        f"{burst_count} orders at {scaled_lot} lots."
+                                    )
+
+                                    await fire_stacked_directional_burst(
+                                        connection,
+                                        active_symbol,
+                                        active_burst_direction,
+                                        scaled_lot,
+                                        burst_count,
+                                        key
+                                    )
+
+                                    last_burst_entry_price = mid_price
+                                    await asyncio.sleep(0.5)
+                                    continue
+
+                        if len(symbol_positions) == 0:
+                            current_stage = 1
+                            peak_basket_profit = 0.0
+
+                            current_spread_pips = round(
+                                (current_ask - current_bid) / 0.1,
+                                2
+                            )
+
+                            if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
+                                await asyncio.sleep(POLL_LATENCY_DELAY)
+                                continue
+
+                            active_burst_direction = candle_tracker.determine_bias()
+
+                            base_lot, burst_count = calculate_dynamic_lot_size(
+                                equity,
+                                balance,
+                                free_margin
+                            )
+
+                            print(
+                                f"[BURST DISPATCH] Stage 1: {burst_count} orders "
+                                f"at {base_lot} lots, direction {active_burst_direction}."
+                            )
+
+                            await fire_stacked_directional_burst(
+                                connection,
+                                active_symbol,
+                                active_burst_direction,
+                                base_lot,
+                                burst_count,
+                                key
+                            )
+
+                            last_burst_entry_price = mid_price
+                            await asyncio.sleep(0.05)
+                            continue
+
+                        await asyncio.sleep(POLL_LATENCY_DELAY)
+
+                    except Exception as trading_loop_error:
+                        critical_errors += 1
+
+                        print(
+                            f"[TRADING CYCLE ERROR RECOVERED {critical_errors}] "
+                            f"{trading_loop_error}"
+                        )
+
+                        update_telemetry(
+                            connected=False,
+                            active_symbol=symbol,
+                            error=str(trading_loop_error)
+                        )
+
+                        if critical_errors >= MAX_CONSECUTIVE_CRITICAL_ERRORS:
+                            print(
+                                "[CRITICAL ERRORS] Restarting MetaApi connection..."
+                            )
+
+                            break
+
+                        await asyncio.sleep(1.0)
+
+            except Exception as connection_cycle_error:
+                critical_errors += 1
+
+                print(
+                    f"[CONNECTION CYCLE ERROR RECOVERED {critical_errors}] "
+                    f"{connection_cycle_error}"
                 )
 
-                # 1. Instant Basket Profit Trapping (Video Behavior)
-                if len(my_positions) > 0:
-                    if net_pnl >= profit_target:
-                        print(f"[PROFIT TRAPPED] Reached +{net_pnl:.2f} USD (Target: {profit_target:.2f}). Liquidating basket instantly!")
-                        await purge_entire_basket(connection, my_positions)
-                        await asyncio.sleep(0.08)
-                        continue
+                update_telemetry(
+                    connected=False,
+                    active_symbol=symbol,
+                    error=str(connection_cycle_error)
+                )
 
-                    # Safety Hard Drawdown Cutoff
-                    if balance > 10.0 and net_pnl < -(balance * 0.35):
-                        print(f"[CIRCUIT BREAKER] Hard cutoff reached (-{abs(net_pnl):.2f} USD).")
-                        await purge_entire_basket(connection, my_positions)
-                        await asyncio.sleep(0.5)
-                        continue
+                if critical_errors >= MAX_CONSECUTIVE_CRITICAL_ERRORS:
+                    print(
+                        "[CRITICAL ERRORS] Waiting before another connection attempt..."
+                    )
 
-                # 2. Immediate New Batch Dispatch (Zero Idle Time)
-                if len(my_positions) == 0:
-                    spread_pips = round((ask - bid) / 0.1, 2)
-                    if spread_pips <= MAX_ALLOWED_SPREAD_PIPS:
-                        print(f"[IMMEDIATE TRIGGER] Confidence: {confidence} | Dispatching {burst_count}x {direction} @ {lot_size} lots...")
-                        await fire_stacked_batch(connection, active_symbol, direction, lot_size, burst_count, key)
-                        await asyncio.sleep(0.08)
-                        continue
+                    await asyncio.sleep(10.0)
+                    critical_errors = 0
+                else:
+                    await asyncio.sleep(RECONNECT_DELAY)
 
-            except Exception as cycle_err:
-                print(f"[CYCLE EXCEPTION] {cycle_err}")
-                await asyncio.sleep(0.5)
+    except Exception as fatal_error:
+        print(
+            f"[CRITICAL ENGINE ERROR] Failed to connect account {login}: "
+            f"{str(fatal_error)}"
+        )
 
-            await asyncio.sleep(POLL_LATENCY_DELAY)
-
-    except Exception as fatal:
-        print(f"[FATAL ENGINE ERROR] {fatal}")
         traceback.print_exc()
-        push_telemetry(False, symbol)
+
+        update_telemetry(
+            connected=False,
+            active_symbol=symbol,
+            error=str(fatal_error)
+        )
+
     finally:
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
+
         if str(login) in live_account_telemetry:
             live_account_telemetry[str(login)]["connected_to_broker"] = False
-        print(f"[ENGINE STOPPED] Worker terminated for {login}")
+            live_account_telemetry[str(login)]["last_updated"] = (
+                datetime.datetime.now(datetime.timezone.utc).isoformat()
+            )
 
-def run_worker_thread(login, password, server, symbol, key, token=None):
+        print(f"[ENGINE STOPPED] Worker terminated for: {login}")
+
+def launch_async_worker_thread(login, password, server, symbol, key, token=None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
     try:
-        loop.run_until_complete(video_style_trading_engine(login, password, server, symbol, key, token))
+        print(
+            f"[WORKER STARTED] login={login} server={server} "
+            f"symbol={symbol} license={key}"
+        )
+
+        loop.run_until_complete(
+            high_frequency_trading_engine(
+                login,
+                password,
+                server,
+                symbol,
+                key,
+                token
+            )
+        )
+
+        print(f"[WORKER FINISHED NORMALLY] login={login}")
+
+    except Exception as error:
+        error_message = str(error)
+
+        print(f"[WORKER CRASHED] login={login}")
+        print(f"[WORKER ERROR] {error_message}")
+        traceback.print_exc()
+
+        live_account_telemetry[str(login)] = {
+            "connected_to_broker": False,
+            "balance": 0,
+            "equity": 0,
+            "free_margin": 0,
+            "margin_level": 0,
+            "floating_pnl": 0,
+            "open_positions_count": 0,
+            "active_symbol": symbol,
+            "active_stage": 1,
+            "symbol_price": {},
+            "error": error_message,
+            "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
+
     finally:
-        loop.close()
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 # ============================================================
-# API CONTROLLER & ROUTES
+# API ROUTES
 # ============================================================
-def extract_body(req):
+def extract_request_data(req):
+    data = {}
+
     try:
-        return req.get_json(force=True, silent=True) or req.args.to_dict() or {}
+        data = req.get_json(force=True, silent=True) or {}
     except Exception:
-        return req.args.to_dict() or {}
+        data = {}
+
+    if not data and req.form:
+        try:
+            data = req.form.to_dict()
+        except Exception:
+            pass
+
+    if not data and req.data:
+        try:
+            data = json.loads(req.data.decode("utf-8"))
+        except Exception:
+            pass
+
+    if not data and req.args:
+        try:
+            data = req.args.to_dict()
+        except Exception:
+            pass
+
+    return data or {}
 
 @app.route("/", methods=["GET"])
 def health_root():
     return jsonify({
         "status": "online",
-        "engine": "Video-Style Momentum Burst Scalper",
-        "mode": "Zero-Idle Instant Basket Trapping"
+        "service": "Gold Scalper AI Hybrid Engine",
+        "mode": "Parallel Burst + Martingale Grid Recovery"
     }), 200
+
+@app.route("/health", methods=["GET"])
+@app.route("/ping", methods=["GET"])
+def health_ping():
+    return jsonify({
+        "status": "healthy",
+        "service": "Gold Scalper Engine",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }), 200
+
+@app.route("/api/account", methods=["GET"])
+@app.route("/get_credentials", methods=["GET"])
+def get_account_metadata():
+    license_key = request.args.get("license_key", "").strip().upper()
+
+    if license_key in ALLOWED_LICENSES:
+        credentials = db_get_credentials(license_key)
+
+        if credentials:
+            return jsonify({
+                "status": "success",
+                "account": {
+                    "mt5_login": credentials["mt5_login"],
+                    "mt5_server": credentials["mt5_server"],
+                    "mt5_symbol": credentials["mt5_symbol"],
+                    "has_stored_password": bool(credentials["mt5_password"])
+                }
+            }), 200
+
+    return jsonify({"status": "not_found"}), 200
 
 @app.route("/status", methods=["GET", "OPTIONS"])
 @app.route("/api/status", methods=["GET", "OPTIONS"])
-def get_status():
-    active = [k for k, v in active_trading_nodes.items() if v]
+def status_endpoint():
+    active_accounts = [
+        login for login, running in active_trading_nodes.items() if running
+    ]
+
     return jsonify({
         "status": "online",
-        "active_nodes_count": len(active),
-        "active_accounts": active,
+        "active_nodes_count": len(active_accounts),
+        "active_accounts": active_accounts,
         "telemetry": live_account_telemetry
     }), 200
 
 @app.route("/api/connection-status", methods=["GET", "OPTIONS"])
-def connection_status():
+def connection_status_endpoint():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
     login = request.args.get("mt5_login", "").strip()
-    return jsonify(live_account_telemetry.get(login, {"connected_to_broker": False})), 200
+    telemetry = live_account_telemetry.get(login, {})
+
+    return jsonify({
+        "status": "online",
+        "mt5_login": login,
+        "connected_to_broker": telemetry.get("connected_to_broker", False),
+        "balance": telemetry.get("balance", 0),
+        "equity": telemetry.get("equity", 0),
+        "free_margin": telemetry.get("free_margin", 0),
+        "floating_pnl": telemetry.get("floating_pnl", 0),
+        "open_positions_count": telemetry.get("open_positions_count", 0),
+        "active_symbol": telemetry.get("active_symbol", ""),
+        "symbol_price": telemetry.get("symbol_price", {}),
+        "last_updated": telemetry.get("last_updated", None)
+    }), 200
 
 @app.route("/control", methods=["GET", "POST", "OPTIONS"])
 @app.route("/start", methods=["GET", "POST", "OPTIONS"])
 @app.route("/api/control", methods=["GET", "POST", "OPTIONS"])
 @app.route("/api/start", methods=["GET", "POST", "OPTIONS"])
-def handle_control():
+def control_dispatcher():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
 
-    data = extract_body(request)
-    command = str(data.get("command") or data.get("action") or "START").strip().upper()
-    license_key = str(data.get("license_key") or data.get("key") or "BOSSMODE99").strip().upper()
+    try:
+        data = extract_request_data(request)
 
-    if license_key not in ALLOWED_LICENSES:
-        return jsonify({"status": "error", "message": "Invalid License Key."}), 200
-
-    login = str(data.get("mt5_login") or data.get("login") or "").strip()
-    password = str(data.get("mt5_password") or data.get("password") or "").strip()
-    server = str(data.get("mt5_server") or data.get("server") or "").strip()
-    symbol = str(data.get("mt5_symbol") or data.get("symbol") or "XAUUSDm").strip()
-
-    saved = db_get_credentials(license_key)
-    if saved:
-        login = login or saved["mt5_login"]
-        password = password or saved["mt5_password"]
-        server = server or saved["mt5_server"]
-        symbol = symbol or saved["mt5_symbol"]
-
-    if command == "STOP":
-        active_trading_nodes[str(login)] = False
-        print(f"[STOP DISPATCHED] Terminating scalper for {login}...")
-        return jsonify({"status": "success", "message": "Bot stopping."}), 200
-
-    if command in ["START", "RUN"]:
-        if not login or not password or not server:
-            return jsonify({"status": "error", "message": "Missing MT5 credentials."}), 200
-
-        db_save_credentials(license_key, login, password, server, symbol)
-
-        if active_trading_nodes.get(str(login), False):
-            return jsonify({"status": "success", "message": "Bot is already actively trading."}), 200
-
-        active_trading_nodes[str(login)] = True
-        token_override = str(data.get("metaapi_token") or "").strip() or None
-
-        worker = threading.Thread(
-            target=run_worker_thread,
-            args=(login, password, server, symbol, license_key, token_override),
-            daemon=True,
-            name=f"Scalper-{login}"
+        print(
+            f"[START REQUEST RECEIVED] method={request.method} "
+            f"path={request.path} data_keys={list(data.keys())}"
         )
-        trading_threads[str(login)] = worker
-        worker.start()
+
+        command = str(
+            data.get("command") or
+            data.get("action") or
+            "START"
+        ).strip().upper()
+
+        license_key = str(
+            data.get("license_key") or
+            data.get("key") or
+            "BOSSMODE99"
+        ).strip().upper()
+
+        if license_key not in ALLOWED_LICENSES:
+            return jsonify({
+                "status": "error",
+                "success": False,
+                "message": "Invalid License Key. Allowed keys: BOSSMODE98, BOSSMODE99."
+            }), 200
+
+        mt5_login = str(
+            data.get("mt5_login") or
+            data.get("login") or
+            data.get("account") or
+            ""
+        ).strip()
+
+        mt5_password = str(
+            data.get("mt5_password") or
+            data.get("password") or
+            data.get("pass") or
+            ""
+        ).strip()
+
+        mt5_server = str(
+            data.get("mt5_server") or
+            data.get("server") or
+            data.get("broker") or
+            ""
+        ).strip()
+
+        mt5_symbol = str(
+            data.get("mt5_symbol") or
+            data.get("symbol") or
+            "XAUUSDm"
+        ).strip()
+
+        saved_credentials = db_get_credentials(license_key)
+
+        if saved_credentials:
+            mt5_login = mt5_login or saved_credentials["mt5_login"]
+            mt5_password = mt5_password or saved_credentials["mt5_password"]
+            mt5_server = mt5_server or saved_credentials["mt5_server"]
+            mt5_symbol = mt5_symbol or saved_credentials["mt5_symbol"]
+
+        if command == "SAVE":
+            if not mt5_login or not mt5_server:
+                return jsonify({
+                    "status": "error",
+                    "message": "Login and Server are required to save."
+                }), 200
+
+            db_save_credentials(
+                license_key,
+                mt5_login,
+                mt5_password,
+                mt5_server,
+                mt5_symbol
+            )
+
+            return jsonify({
+                "status": "success",
+                "message": "Credentials saved securely on server database."
+            }), 200
+
+        if not mt5_login or not mt5_password or not mt5_server:
+            return jsonify({
+                "status": "error",
+                "success": False,
+                "message": "Missing credentials. Enter login, password, and server."
+            }), 200
+
+        db_save_credentials(
+            license_key,
+            mt5_login,
+            mt5_password,
+            mt5_server,
+            mt5_symbol
+        )
+
+        login_str = str(mt5_login).strip()
+
+        if command == "STOP":
+            active_trading_nodes[login_str] = False
+
+            print(f"[STOP REQUEST RECEIVED] Stopping worker for {login_str}.")
+
+            return jsonify({
+                "status": "success",
+                "success": True,
+                "message": "STOP command accepted. Worker will shut down safely."
+            }), 200
+
+        if command in ["START", "RUN"]:
+            if active_trading_nodes.get(login_str, False):
+                return jsonify({
+                    "status": "success",
+                    "success": True,
+                    "message": "Bot is already running."
+                }), 200
+
+            active_trading_nodes[login_str] = True
+
+            token_override = str(
+                data.get("metaapi_token") or
+                data.get("token") or
+                request.headers.get("Authorization", "")
+            ).replace("Bearer ", "").strip()
+
+            worker = threading.Thread(
+                target=launch_async_worker_thread,
+                args=(
+                    login_str,
+                    mt5_password,
+                    mt5_server,
+                    mt5_symbol,
+                    license_key,
+                    token_override if token_override else None
+                ),
+                daemon=True,
+                name=f"Worker-{login_str}"
+            )
+
+            trading_threads[login_str] = worker
+            worker.start()
+
+            return jsonify({
+                "status": "success",
+                "success": True,
+                "message": f"License [{license_key}] Verified. Hybrid scalper active with Exness Gold resolution.",
+                "login": login_str,
+                "symbol": mt5_symbol
+            }), 200
 
         return jsonify({
             "status": "success",
-            "message": f"License [{license_key}] Verified. Video-style scalper active on {symbol}.",
-            "login": login,
-            "symbol": symbol
+            "message": f"Command '{command}' processed."
         }), 200
 
-    return jsonify({"status": "success", "message": f"Processed {command}"}), 200
+    except Exception as error:
+        print(f"[CONTROLLER FAULT] {error}")
+        traceback.print_exc()
 
+        return jsonify({
+            "status": "error",
+            "success": False,
+            "message": str(error)
+        }), 200
+
+# ============================================================
+# PRODUCTION ENTRYPOINT
+# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Running Video-Style Scalper on 0.0.0.0:{port}...")
+    print(f"[STARTUP] Running Gold Scalper AI Server on 0.0.0.0:{port}...")
     serve(app, host="0.0.0.0", port=port, threads=8)
