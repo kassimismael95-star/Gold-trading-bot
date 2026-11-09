@@ -15,7 +15,7 @@ from waitress import serve
 app = Flask(__name__)
 
 # ============================================================
-# CROSS-ORIGIN RESOURCE SHARING (CORS) CONFIGURATION
+# CORS CONFIGURATION
 # ============================================================
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -44,28 +44,29 @@ live_account_telemetry = {}
 # ============================================================
 # HYBRID STYLE 1 + STYLE 4 SCALPING PARAMETERS
 # ============================================================
-BURST_ORDER_COUNT = 8              # Stacked orders per wave
-MIN_TARGET_PROFIT_USD = 0.80       # Micro take-profit trigger for sub-$10 accounts
-PROFIT_EQUITY_RATIO = 0.04         # 4% basket gain target before flushing all orders
-TRAILING_FLUSH_RATIO = 0.70        # Lock in 70% of peak profit on pullback
-MAX_ALLOWED_SPREAD_PIPS = 25.0     # Wide spread tolerance for Gold volatility
-MAX_ACCOUNT_DRAWDOWN_RATIO = 0.35  # Hard circuit breaker drawdown cutoff
-POLL_LATENCY_DELAY = 0.015         # 15ms high-frequency polling interval
+BURST_ORDER_COUNT = 8
+MIN_TARGET_PROFIT_USD = 0.80
+PROFIT_EQUITY_RATIO = 0.04
+TRAILING_FLUSH_RATIO = 0.70
+MAX_ALLOWED_SPREAD_PIPS = 25.0
+MAX_ACCOUNT_DRAWDOWN_RATIO = 0.35
+POLL_LATENCY_DELAY = 0.015
 
-# Style 4 Grid Martingale Recovery Parameters
-GRID_RECOVERY_DISTANCE_PIPS = 18.0 # Pip divergence before deploying recovery stage
-MARTINGALE_LOT_MULTIPLIER = 1.5    # Lot scaling factor per recovery stage
-MAX_RECOVERY_STAGES = 3            # Anti-blowout hard cap on recovery stages
+GRID_RECOVERY_DISTANCE_PIPS = 18.0
+MARTINGALE_LOT_MULTIPLIER = 1.5
+MAX_RECOVERY_STAGES = 3
 
 # ============================================================
-# CONNECTION RETRY SETTINGS
+# CONNECTION STABILITY SETTINGS
 # ============================================================
-MAX_CONNECTION_ATTEMPTS = 5
+MAX_CONNECTION_ATTEMPTS = 10
 CONNECTION_RETRY_DELAY = 5
 SYNC_TIMEOUT_SECONDS = 20
+RECONNECT_DELAY = 5
+MAX_CONSECUTIVE_CRITICAL_ERRORS = 10
 
 # ============================================================
-# SECURE SERVER-SIDE DATABASE (SQLITE)
+# DATABASE
 # ============================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -89,7 +90,8 @@ def db_save_credentials(license_key, login, password, server, symbol):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO user_credentials (license_key, mt5_login, mt5_password, mt5_server, mt5_symbol, updated_at)
+        INSERT INTO user_credentials
+        (license_key, mt5_login, mt5_password, mt5_server, mt5_symbol, updated_at)
         VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(license_key) DO UPDATE SET
             mt5_login=excluded.mt5_login,
@@ -97,16 +99,26 @@ def db_save_credentials(license_key, login, password, server, symbol):
             mt5_server=excluded.mt5_server,
             mt5_symbol=excluded.mt5_symbol,
             updated_at=CURRENT_TIMESTAMP
-    """, (license_key.upper(), str(login).strip(), password, server, symbol))
+    """, (
+        license_key.upper(),
+        str(login).strip(),
+        str(password),
+        str(server).strip(),
+        str(symbol).strip()
+    ))
     conn.commit()
     conn.close()
 
 def db_get_credentials(license_key):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT mt5_login, mt5_password, mt5_server, mt5_symbol FROM user_credentials WHERE license_key = ?", (license_key.upper(),))
+    cursor.execute(
+        "SELECT mt5_login, mt5_password, mt5_server, mt5_symbol FROM user_credentials WHERE license_key = ?",
+        (license_key.upper(),)
+    )
     row = cursor.fetchone()
     conn.close()
+
     if row:
         return {
             "mt5_login": row[0],
@@ -114,17 +126,19 @@ def db_get_credentials(license_key):
             "mt5_server": row[2],
             "mt5_symbol": row[3]
         }
+
     return None
 
 # ============================================================
-# CLIENT & ULTRA-PRECISE LOT SCALER
+# METAAPI CLIENT
 # ============================================================
-def get_metaapi_client(override_token: str = None):
+def get_metaapi_client(override_token=None):
     global metaapi_instance
-    token = (override_token or os.environ.get("METAAPI_TOKEN", "")).strip()
+
+    token = (override_token or METAAPI_TOKEN).strip()
 
     if not token:
-        raise ValueError("METAAPI_TOKEN is empty. Set it in Render environment variables.")
+        raise ValueError("METAAPI_TOKEN is missing. Add it in Render environment variables.")
 
     with metaapi_lock:
         if metaapi_instance is None or override_token:
@@ -132,7 +146,7 @@ def get_metaapi_client(override_token: str = None):
 
     return metaapi_instance
 
-def calculate_dynamic_lot_size(equity: float, balance: float, free_margin: float) -> tuple:
+def calculate_dynamic_lot_size(equity, balance, free_margin):
     effective_capital = max(equity, balance)
 
     if effective_capital < 10.0 or free_margin < 2.0:
@@ -157,9 +171,9 @@ def calculate_dynamic_lot_size(equity: float, balance: float, free_margin: float
         return 3.00, 8
 
 # ============================================================
-# EXNESS SYMBOL RESOLVER
+# SYMBOL RESOLVER
 # ============================================================
-async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
+async def resolve_broker_gold_symbol(connection, requested_symbol):
     candidates = [
         requested_symbol,
         "XAUUSDm",
@@ -183,12 +197,12 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
     for symbol in filtered_candidates:
         try:
             await connection.subscribe_to_market_data(symbol)
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.20)
 
             price = connection.terminal_state.price(symbol)
 
             if price and (price.get("ask") or price.get("bid")):
-                print(f"[SYMBOL VERIFIED] Using Gold symbol: '{symbol}'")
+                print(f"[SYMBOL VERIFIED] Using Gold symbol: {symbol}")
                 return symbol
 
         except Exception as error:
@@ -199,9 +213,9 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
     return requested_symbol
 
 # ============================================================
-# PARALLEL EXECUTION & PURGE ENGINES
+# ORDER EXECUTION
 # ============================================================
-async def fire_stacked_directional_burst(connection, symbol: str, direction: str, volume: float, count: int, key: str):
+async def fire_stacked_directional_burst(connection, symbol, direction, volume, count, key):
     tasks = []
     bot_signature = f"GOLD MOBILE EA [{key}]"
 
@@ -226,7 +240,7 @@ async def fire_stacked_directional_burst(connection, symbol: str, direction: str
     results = await asyncio.gather(*tasks, return_exceptions=True)
     successful = sum(1 for result in results if not isinstance(result, Exception))
 
-    print(f"[BURST COMPLETE] {successful}/{count} {direction} orders deployed on {symbol} at {volume} lots.")
+    print(f"[BURST COMPLETE] {successful}/{count} {direction} orders on {symbol} at {volume} lots.")
     return successful
 
 async def purge_entire_basket_instantly(connection, positions):
@@ -242,7 +256,7 @@ async def purge_entire_basket_instantly(connection, positions):
         print(f"[LIQUIDATOR] Closed {successful}/{len(close_tasks)} positions.")
 
 # ============================================================
-# RESILIENT METAAPI ACCOUNT SELECTOR
+# METAAPI ACCOUNT SELECTOR
 # ============================================================
 async def get_or_create_metaapi_account(api, login, password, server):
     login_str = str(login).strip()
@@ -268,13 +282,11 @@ async def get_or_create_metaapi_account(api, login, password, server):
 
         print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching MetaApi account(s).")
 
-        # 1. Reuse an already deployed and healthy account
         for account in matching_accounts:
             if getattr(account, "state", "") == "DEPLOYED":
                 print(f"[ACCOUNT BOUND] Reusing deployed MetaApi node: {getattr(account, 'id', '')}")
                 return account
 
-        # 2. Deploy an existing matching account
         for account in matching_accounts:
             if getattr(account, "state", "") != "DEPLOYED":
                 print(f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: {getattr(account, 'id', '')}")
@@ -290,8 +302,7 @@ async def get_or_create_metaapi_account(api, login, password, server):
     except Exception as error:
         print(f"[ACCOUNT SEARCH NOTICE] {error}")
 
-    # 3. Create a new account only if no matching account exists
-    print("[ACCOUNT CREATE] No matching MetaApi account found. Creating new account.")
+    print("[ACCOUNT CREATE] Creating new MetaApi account.")
 
     return await api.metatrader_account_api.create_account({
         "name": f"Node_{login_str}",
@@ -329,6 +340,7 @@ async def connect_metaapi_account(account, login):
                     connection.wait_synchronized(),
                     timeout=SYNC_TIMEOUT_SECONDS
                 )
+
                 print(f"[CORE LIVE & SYNCHRONIZED] Connected account: {login}")
                 return connection
 
@@ -349,10 +361,13 @@ async def connect_metaapi_account(account, login):
             if attempt < MAX_CONNECTION_ATTEMPTS:
                 await asyncio.sleep(CONNECTION_RETRY_DELAY)
 
-    raise Exception(f"Failed to connect MetaApi account {login} after {MAX_CONNECTION_ATTEMPTS} attempts: {last_error}")
+    raise Exception(
+        f"Failed to connect MetaApi account {login} after "
+        f"{MAX_CONNECTION_ATTEMPTS} attempts: {last_error}"
+    )
 
 # ============================================================
-# HIGH-FREQUENCY MOMENTUM TRACKER
+# MOMENTUM TRACKER
 # ============================================================
 class InstantCandleTracker:
     def __init__(self, max_ticks=30):
@@ -360,7 +375,7 @@ class InstantCandleTracker:
         self.candle_open = None
         self.last_minute = None
 
-    def record_tick(self, price: float):
+    def record_tick(self, price):
         current_minute = datetime.datetime.utcnow().minute
 
         if self.last_minute != current_minute or self.candle_open is None:
@@ -369,7 +384,7 @@ class InstantCandleTracker:
 
         self.ticks.append(price)
 
-    def determine_bias(self) -> str:
+    def determine_bias(self):
         if len(self.ticks) < 4:
             return "BUY"
 
@@ -397,7 +412,7 @@ class InstantCandleTracker:
         return "BUY" if score >= 0 else "SELL"
 
 # ============================================================
-# TRADING ENGINE (HYBRID STYLE 1 + STYLE 4)
+# RESILIENT TRADING ENGINE
 # ============================================================
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
     print(f"[HYBRID ENGINE INITIALIZED] Connecting account {login} on {server}...")
@@ -410,159 +425,264 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
     active_burst_direction = "BUY"
     peak_basket_profit = 0.0
     consecutive_errors = 0
+    critical_errors = 0
 
-    live_account_telemetry[str(login)] = {
-        "connected_to_broker": False,
-        "balance": 0,
-        "equity": 0,
-        "free_margin": 0,
-        "margin_level": 0,
-        "floating_pnl": 0,
-        "open_positions_count": 0,
-        "active_symbol": symbol,
-        "active_stage": 1,
-        "symbol_price": {},
-        "last_updated": datetime.datetime.utcnow().isoformat()
-    }
+    def update_telemetry(connected, active_symbol, balance=0, equity=0, free_margin=0, margin_level=0, floating_pnl=0, positions_count=0, price_data=None):
+        live_account_telemetry[str(login)] = {
+            "connected_to_broker": connected,
+            "balance": balance,
+            "equity": equity,
+            "free_margin": free_margin,
+            "margin_level": margin_level,
+            "floating_pnl": round(floating_pnl, 2),
+            "open_positions_count": positions_count,
+            "active_symbol": active_symbol,
+            "active_stage": current_stage,
+            "symbol_price": price_data or {},
+            "last_updated": datetime.datetime.utcnow().isoformat()
+        }
+
+    update_telemetry(
+        connected=False,
+        active_symbol=symbol
+    )
 
     try:
-        api = get_metaapi_client(token)
-        account = await get_or_create_metaapi_account(api, login, password, server)
-
-        connection = await connect_metaapi_account(account, login)
-
-        active_symbol = await resolve_broker_gold_symbol(connection, symbol)
-
         while active_trading_nodes.get(str(login), False):
             try:
-                account_info = account.account_information or {}
-                equity = float(account_info.get("equity", 0) or 0)
-                balance = float(account_info.get("balance", 0) or 0)
-                free_margin = float(account_info.get("freeMargin", 0) or 0)
-                margin_level = float(account_info.get("marginLevel", 0) or 0)
+                api = get_metaapi_client(token)
+                account = await get_or_create_metaapi_account(
+                    api,
+                    login,
+                    password,
+                    server
+                )
 
-                terminal_state = connection.terminal_state
-                price = terminal_state.price(active_symbol)
+                connection = await connect_metaapi_account(account, login)
+                active_symbol = await resolve_broker_gold_symbol(connection, symbol)
 
-                if not price or not price.get("bid"):
-                    await connection.subscribe_to_market_data(active_symbol)
-                    await asyncio.sleep(0.1)
-                    continue
+                critical_errors = 0
 
-                current_ask = price.get("ask")
-                current_bid = price.get("bid")
-                mid_price = (current_ask + current_bid) / 2.0
+                while active_trading_nodes.get(str(login), False):
+                    try:
+                        account_info = {}
+                        try:
+                            account_info = account.account_information or {}
+                        except Exception as account_info_error:
+                            print(f"[ACCOUNT INFO WARNING] {account_info_error}")
 
-                candle_tracker.record_tick(mid_price)
+                        equity = float(account_info.get("equity", 0) or 0)
+                        balance = float(account_info.get("balance", 0) or 0)
+                        free_margin = float(account_info.get("freeMargin", 0) or 0)
+                        margin_level = float(account_info.get("marginLevel", 0) or 0)
 
-                positions = terminal_state.positions or []
-                symbol_positions = [
-                    position for position in positions
-                    if position.get("symbol") == active_symbol
-                ]
+                        terminal_state = connection.terminal_state
 
-                net_floating_profit = equity - balance
+                        try:
+                            broker_connected = bool(
+                                getattr(terminal_state, "connected_to_broker", False)
+                            )
+                        except Exception:
+                            broker_connected = False
 
-                live_account_telemetry[str(login)] = {
-                    "connected_to_broker": True,
-                    "balance": balance,
-                    "equity": equity,
-                    "free_margin": free_margin,
-                    "margin_level": margin_level,
-                    "floating_pnl": round(net_floating_profit, 2),
-                    "open_positions_count": len(symbol_positions),
-                    "active_symbol": active_symbol,
-                    "active_stage": current_stage,
-                    "symbol_price": {
-                        "ask": current_ask,
-                        "bid": current_bid
-                    },
-                    "last_updated": datetime.datetime.utcnow().isoformat()
-                }
+                        price = None
 
-                # ----------------------------------------------------
-                # 1. HARD SAFETY CIRCUIT BREAKER
-                # ----------------------------------------------------
-                max_drawdown_limit = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
+                        try:
+                            price = terminal_state.price(active_symbol)
+                        except Exception as price_error:
+                            print(f"[PRICE WARNING] {price_error}")
 
-                if symbol_positions and net_floating_profit < -max_drawdown_limit:
-                    print(
-                        f"[CIRCUIT BREAKER] Drawdown limit reached: "
-                        f"-{abs(net_floating_profit):.2f} USD"
-                    )
+                        if not price or not price.get("bid"):
+                            try:
+                                await connection.subscribe_to_market_data(active_symbol)
+                            except Exception as subscribe_error:
+                                print(f"[SUBSCRIBE WARNING] {subscribe_error}")
 
-                    await purge_entire_basket_instantly(connection, symbol_positions)
+                            update_telemetry(
+                                connected=broker_connected,
+                                active_symbol=active_symbol,
+                                balance=balance,
+                                equity=equity,
+                                free_margin=free_margin,
+                                margin_level=margin_level,
+                                floating_pnl=equity - balance,
+                                positions_count=0
+                            )
 
-                    current_stage = 1
-                    peak_basket_profit = 0.0
-                    last_burst_entry_price = 0.0
+                            await asyncio.sleep(0.5)
+                            continue
 
-                    await asyncio.sleep(2.0)
-                    continue
+                        current_ask = float(price.get("ask", 0) or 0)
+                        current_bid = float(price.get("bid", 0) or 0)
+                        mid_price = (current_ask + current_bid) / 2.0 if current_ask and current_bid else 0.0
 
-                # ----------------------------------------------------
-                # 2. COMBINED BASKET TAKE-PROFIT PURGE
-                # ----------------------------------------------------
-                if symbol_positions:
-                    if net_floating_profit > peak_basket_profit:
-                        peak_basket_profit = net_floating_profit
+                        if mid_price > 0:
+                            candle_tracker.record_tick(mid_price)
 
-                    dynamic_target = max(
-                        MIN_TARGET_PROFIT_USD,
-                        balance * PROFIT_EQUITY_RATIO
-                    )
+                        positions = []
 
-                    if balance < 10.0:
-                        dynamic_target = max(0.50, balance * 0.12)
+                        try:
+                            positions = terminal_state.positions or []
+                        except Exception as positions_error:
+                            print(f"[POSITIONS WARNING] {positions_error}")
 
-                    if net_floating_profit >= dynamic_target:
-                        print(
-                            f"[TARGET HIT] Profit {net_floating_profit:.2f} USD "
-                            f"reached target {dynamic_target:.2f} USD."
+                        symbol_positions = [
+                            position for position in positions
+                            if position.get("symbol") == active_symbol
+                        ]
+
+                        net_floating_profit = equity - balance
+
+                        update_telemetry(
+                            connected=broker_connected,
+                            active_symbol=active_symbol,
+                            balance=balance,
+                            equity=equity,
+                            free_margin=free_margin,
+                            margin_level=margin_level,
+                            floating_pnl=net_floating_profit,
+                            positions_count=len(symbol_positions),
+                            price_data={
+                                "ask": current_ask,
+                                "bid": current_bid
+                            }
                         )
 
-                        await purge_entire_basket_instantly(connection, symbol_positions)
+                        if not broker_connected:
+                            print("[BROKER DISCONNECTED] Attempting automatic reconnection...")
+                            break
 
-                        current_stage = 1
-                        peak_basket_profit = 0.0
-                        last_burst_entry_price = 0.0
-                        consecutive_errors = 0
+                        max_drawdown_limit = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
 
-                        await asyncio.sleep(0.05)
-                        continue
+                        if symbol_positions and net_floating_profit < -max_drawdown_limit:
+                            print(
+                                f"[CIRCUIT BREAKER] Drawdown limit reached: "
+                                f"-{abs(net_floating_profit):.2f} USD"
+                            )
 
-                    if peak_basket_profit >= 1.50 and net_floating_profit <= (
-                        peak_basket_profit * TRAILING_FLUSH_RATIO
-                    ):
-                        print(
-                            f"[TRAILING FLUSH] Securing profit: "
-                            f"{net_floating_profit:.2f} USD"
-                        )
+                            await purge_entire_basket_instantly(
+                                connection,
+                                symbol_positions
+                            )
 
-                        await purge_entire_basket_instantly(connection, symbol_positions)
+                            current_stage = 1
+                            peak_basket_profit = 0.0
+                            last_burst_entry_price = 0.0
 
-                        current_stage = 1
-                        peak_basket_profit = 0.0
-                        last_burst_entry_price = 0.0
+                            await asyncio.sleep(2.0)
+                            continue
 
-                        await asyncio.sleep(0.05)
-                        continue
+                        if symbol_positions:
+                            if net_floating_profit > peak_basket_profit:
+                                peak_basket_profit = net_floating_profit
 
-                    # ------------------------------------------------
-                    # 3. MARTINGALE GRID RECOVERY
-                    # ------------------------------------------------
-                    if current_stage < MAX_RECOVERY_STAGES and last_burst_entry_price > 0.0:
-                        if active_burst_direction == "BUY":
-                            pip_divergence = (
-                                last_burst_entry_price - current_bid
-                            ) / 0.1
-                        else:
-                            pip_divergence = (
-                                current_ask - last_burst_entry_price
-                            ) / 0.1
+                            dynamic_target = max(
+                                MIN_TARGET_PROFIT_USD,
+                                balance * PROFIT_EQUITY_RATIO
+                            )
 
-                        if pip_divergence >= GRID_RECOVERY_DISTANCE_PIPS:
-                            current_stage += 1
+                            if balance < 10.0:
+                                dynamic_target = max(
+                                    0.50,
+                                    balance * 0.12
+                                )
+
+                            if net_floating_profit >= dynamic_target:
+                                print(
+                                    f"[TARGET HIT] Profit {net_floating_profit:.2f} USD "
+                                    f"reached target {dynamic_target:.2f} USD."
+                                )
+
+                                await purge_entire_basket_instantly(
+                                    connection,
+                                    symbol_positions
+                                )
+
+                                current_stage = 1
+                                peak_basket_profit = 0.0
+                                last_burst_entry_price = 0.0
+
+                                await asyncio.sleep(0.05)
+                                continue
+
+                            if peak_basket_profit >= 1.50 and net_floating_profit <= (
+                                peak_basket_profit * TRAILING_FLUSH_RATIO
+                            ):
+                                print(
+                                    f"[TRAILING FLUSH] Securing profit: "
+                                    f"{net_floating_profit:.2f} USD"
+                                )
+
+                                await purge_entire_basket_instantly(
+                                    connection,
+                                    symbol_positions
+                                )
+
+                                current_stage = 1
+                                peak_basket_profit = 0.0
+                                last_burst_entry_price = 0.0
+
+                                await asyncio.sleep(0.05)
+                                continue
+
+                            if current_stage < MAX_RECOVERY_STAGES and last_burst_entry_price > 0.0:
+                                if active_burst_direction == "BUY":
+                                    pip_divergence = (
+                                        last_burst_entry_price - current_bid
+                                    ) / 0.1
+                                else:
+                                    pip_divergence = (
+                                        current_ask - last_burst_entry_price
+                                    ) / 0.1
+
+                                if pip_divergence >= GRID_RECOVERY_DISTANCE_PIPS:
+                                    current_stage += 1
+
+                                    base_lot, burst_count = calculate_dynamic_lot_size(
+                                        equity,
+                                        balance,
+                                        free_margin
+                                    )
+
+                                    scaled_lot = round(
+                                        base_lot * (
+                                            MARTINGALE_LOT_MULTIPLIER ** (current_stage - 1)
+                                        ),
+                                        2
+                                    )
+
+                                    print(
+                                        f"[RECOVERY INJECTION] Stage {current_stage}: "
+                                        f"{burst_count} orders at {scaled_lot} lots."
+                                    )
+
+                                    await fire_stacked_directional_burst(
+                                        connection,
+                                        active_symbol,
+                                        active_burst_direction,
+                                        scaled_lot,
+                                        burst_count,
+                                        key
+                                    )
+
+                                    last_burst_entry_price = mid_price
+                                    await asyncio.sleep(0.5)
+                                    continue
+
+                        if len(symbol_positions) == 0:
+                            current_stage = 1
+                            peak_basket_profit = 0.0
+
+                            current_spread_pips = round(
+                                (current_ask - current_bid) / 0.1,
+                                2
+                            )
+
+                            if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
+                                await asyncio.sleep(POLL_LATENCY_DELAY)
+                                continue
+
+                            active_burst_direction = candle_tracker.determine_bias()
 
                             base_lot, burst_count = calculate_dynamic_lot_size(
                                 equity,
@@ -570,107 +690,75 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                                 free_margin
                             )
 
-                            scaled_lot = round(
-                                base_lot * (
-                                    MARTINGALE_LOT_MULTIPLIER ** (current_stage - 1)
-                                ),
-                                2
-                            )
-
                             print(
-                                f"[RECOVERY INJECTION] Stage {current_stage}: "
-                                f"{burst_count} orders at {scaled_lot} lots."
+                                f"[BURST DISPATCH] Stage 1: {burst_count} orders "
+                                f"at {base_lot} lots, direction {active_burst_direction}."
                             )
 
                             await fire_stacked_directional_burst(
                                 connection,
                                 active_symbol,
                                 active_burst_direction,
-                                scaled_lot,
+                                base_lot,
                                 burst_count,
                                 key
                             )
 
                             last_burst_entry_price = mid_price
-                            await asyncio.sleep(0.5)
+                            await asyncio.sleep(0.05)
                             continue
 
-                # ----------------------------------------------------
-                # 4. INITIAL BURST RELOAD
-                # ----------------------------------------------------
-                if len(symbol_positions) == 0:
-                    current_stage = 1
-                    peak_basket_profit = 0.0
-
-                    current_spread_pips = round(
-                        (current_ask - current_bid) / 0.1,
-                        2
-                    )
-
-                    if current_spread_pips > MAX_ALLOWED_SPREAD_PIPS:
                         await asyncio.sleep(POLL_LATENCY_DELAY)
-                        continue
 
-                    active_burst_direction = candle_tracker.determine_bias()
-                    base_lot, burst_count = calculate_dynamic_lot_size(
-                        equity,
-                        balance,
-                        free_margin
-                    )
+                    except Exception as trading_loop_error:
+                        critical_errors += 1
 
-                    print(
-                        f"[BURST DISPATCH] Stage 1: {burst_count} orders "
-                        f"at {base_lot} lots, direction {active_burst_direction}."
-                    )
+                        print(
+                            f"[TRADING CYCLE ERROR RECOVERED {critical_errors}] "
+                            f"{trading_loop_error}"
+                        )
 
-                    success_count = await fire_stacked_directional_burst(
-                        connection,
-                        active_symbol,
-                        active_burst_direction,
-                        base_lot,
-                        burst_count,
-                        key
-                    )
+                        update_telemetry(
+                            connected=False,
+                            active_symbol=symbol
+                        )
 
-                    last_burst_entry_price = mid_price
+                        if critical_errors >= MAX_CONSECUTIVE_CRITICAL_ERRORS:
+                            print("[CRITICAL ERRORS] Restarting MetaApi connection...")
+                            break
 
-                    if success_count == 0:
-                        consecutive_errors += 1
+                        await asyncio.sleep(1.0)
 
-                        if consecutive_errors >= 3:
-                            await asyncio.sleep(3.0)
-                            consecutive_errors = 0
-                    else:
-                        consecutive_errors = 0
+            except Exception as connection_cycle_error:
+                critical_errors += 1
 
-                    await asyncio.sleep(0.05)
-                    continue
+                print(
+                    f"[CONNECTION CYCLE ERROR RECOVERED {critical_errors}] "
+                    f"{connection_cycle_error}"
+                )
 
-            except Exception as loop_error:
-                print(f"[CYCLE ERROR] {loop_error}")
-                await asyncio.sleep(1.0)
+                update_telemetry(
+                    connected=False,
+                    active_symbol=symbol
+                )
 
-            await asyncio.sleep(POLL_LATENCY_DELAY)
+                if critical_errors >= MAX_CONSECUTIVE_CRITICAL_ERRORS:
+                    print("[CRITICAL ERRORS] Waiting before another connection attempt...")
+                    await asyncio.sleep(10.0)
+                    critical_errors = 0
+                else:
+                    await asyncio.sleep(RECONNECT_DELAY)
 
-    except Exception as error:
+    except Exception as fatal_error:
         print(
-            f"[CRITICAL ENGINE ERROR] Failed to connect account {login}: {str(error)}"
+            f"[CRITICAL ENGINE ERROR] Failed to connect account {login}: {str(fatal_error)}"
         )
         traceback.print_exc()
 
-        live_account_telemetry[str(login)] = {
-            "connected_to_broker": False,
-            "balance": 0,
-            "equity": 0,
-            "free_margin": 0,
-            "margin_level": 0,
-            "floating_pnl": 0,
-            "open_positions_count": 0,
-            "active_symbol": symbol,
-            "active_stage": 1,
-            "symbol_price": {},
-            "last_updated": datetime.datetime.utcnow().isoformat()
-        }
+        update_telemetry(
+            connected=False,
+            active_symbol=symbol
+        )
 
     finally:
         active_trading_nodes.pop(str(login), None)
@@ -678,6 +766,9 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
         if str(login) in live_account_telemetry:
             live_account_telemetry[str(login)]["connected_to_broker"] = False
+            live_account_telemetry[str(login)]["last_updated"] = (
+                datetime.datetime.utcnow().isoformat()
+            )
 
         print(f"[ENGINE STOPPED] Worker terminated for: {login}")
 
@@ -699,6 +790,7 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
 
     except Exception as error:
         print(f"[THREAD ERROR] {error}")
+        traceback.print_exc()
 
     finally:
         try:
@@ -707,7 +799,7 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
             pass
 
 # ============================================================
-# API CONTROLLER & MATCHING ROUTES
+# API ROUTES
 # ============================================================
 def extract_request_data(req):
     data = {}
