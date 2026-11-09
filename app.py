@@ -209,14 +209,29 @@ async def get_or_create_metaapi_account(api, login, password, server):
         else:
             accounts = []
 
-        for acc in accounts:
-            if str(getattr(acc, 'login', '')) == login_str and getattr(acc, 'server', '').lower() == server.lower():
-                if getattr(acc, 'state', '') != 'DEPLOYED':
-                    try: await acc.deploy()
-                    except Exception: pass
-                return acc
-    except Exception as e:
-        print(f"[ACCOUNT SEARCH NOTICE] {e}")
+        matching_accounts = [
+            account for account in accounts
+            if str(getattr(account, 'login', '')) == login_str
+            and getattr(account, 'server', '').lower() == server.lower()
+        ]
+
+        # PRIORITIZE ALREADY CONNECTED / DEPLOYED INSTANCE
+        for account in matching_accounts:
+            if getattr(account, 'state', '') == 'DEPLOYED':
+                print(f"[ACCOUNT BOUND] Found active provisioned node ID: {getattr(account, 'id', '')}")
+                return account
+
+        # FALLBACK TO ANY MATCHING ACCOUNT
+        for account in matching_accounts:
+            if getattr(account, 'state', '') != 'DEPLOYED':
+                try:
+                    await account.deploy()
+                except Exception:
+                    pass
+                return account
+
+    except Exception as error:
+        print(f"[ACCOUNT SEARCH NOTICE] {error}")
 
     return await api.metatrader_account_api.create_account({
         "name": f"Node_{login_str}",
