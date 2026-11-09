@@ -454,13 +454,16 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             await asyncio.sleep(POLL_LATENCY_DELAY)
 
     except Exception as e:
-        print(f"[CRITICAL ENGINE ERROR] {e}")
+        print(f"[CRITICAL ENGINE ERROR] Failed to connect account {login}: {str(e)}")
         traceback.print_exc()
+
     finally:
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
+
         if str(login) in live_account_telemetry:
-            live_account_telemetry[str(login)]["connected_to_broker"] = False
+            live_account_telemetry[str(login)]['connected_to_broker'] = False
+
         print(f"[ENGINE STOPPED] Worker terminated for: {login}")
 
 def launch_async_worker_thread(login, password, server, symbol, key, token=None):
