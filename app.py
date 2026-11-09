@@ -61,7 +61,7 @@ MAX_RECOVERY_STAGES = 3
 # ============================================================
 MAX_CONNECTION_ATTEMPTS = 10
 CONNECTION_RETRY_DELAY = 5
-SYNC_TIMEOUT_SECONDS = 20
+SYNC_TIMEOUT_SECONDS = 30
 RECONNECT_DELAY = 5
 MAX_CONSECUTIVE_CRITICAL_ERRORS = 10
 
@@ -171,6 +171,51 @@ def calculate_dynamic_lot_size(equity, balance, free_margin):
         return 3.00, 8
 
 # ============================================================
+# SAFE ACCOUNT DATA READERS
+# ============================================================
+def safe_get_account_info(terminal_state):
+    try:
+        info = terminal_state.account_information or {}
+        return info if isinstance(info, dict) else {}
+    except Exception as error:
+        print(f"[ACCOUNT INFO WARNING] {error}")
+        return {}
+
+def safe_get_positions(terminal_state):
+    try:
+        positions = terminal_state.positions or []
+        return positions if isinstance(positions, list) else []
+    except Exception as error:
+        print(f"[POSITIONS WARNING] {error}")
+        return []
+
+def safe_get_price(terminal_state, symbol):
+    try:
+        price = terminal_state.price(symbol)
+        return price if isinstance(price, dict) else {}
+    except Exception as error:
+        print(f"[PRICE WARNING] {error}")
+        return {}
+
+def safe_get_connection_state(connection):
+    try:
+        terminal_state = connection.terminal_state
+
+        connected = getattr(terminal_state, "connected", None)
+
+        if connected is None:
+            connected = getattr(terminal_state, "connected_to_broker", None)
+
+        if connected is None:
+            connected = True
+
+        return bool(connected)
+
+    except Exception as error:
+        print(f"[CONNECTION STATE WARNING] {error}")
+        return False
+
+# ============================================================
 # SAFE GOLD SYMBOL RESOLVER
 # ============================================================
 async def resolve_broker_gold_symbol(connection, requested_symbol):
@@ -203,7 +248,7 @@ async def resolve_broker_gold_symbol(connection, requested_symbol):
             await connection.subscribe_to_market_data(symbol)
             await asyncio.sleep(0.20)
 
-            price = connection.terminal_state.price(symbol)
+            price = safe_get_price(connection.terminal_state, symbol)
 
             if price and (price.get("ask") or price.get("bid")):
                 print(
@@ -392,7 +437,7 @@ class InstantCandleTracker:
         self.last_minute = None
 
     def record_tick(self, price):
-        current_minute = datetime.datetime.utcnow().minute
+        current_minute = datetime.datetime.now(datetime.timezone.utc).minute
 
         if self.last_minute != current_minute or self.candle_open is None:
             self.candle_open = price
@@ -464,7 +509,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             "active_symbol": active_symbol,
             "active_stage": current_stage,
             "symbol_price": price_data or {},
-            "last_updated": datetime.datetime.utcnow().isoformat()
+            "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
 
     update_telemetry(
@@ -505,33 +550,18 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
                 while active_trading_nodes.get(str(login), False):
                     try:
-                        account_info = {}
+                        terminal_state = connection.terminal_state
 
-                        try:
-                            account_info = account.account_information or {}
-                        except Exception as account_info_error:
-                            print(f"[ACCOUNT INFO WARNING] {account_info_error}")
+                        account_info = safe_get_account_info(terminal_state)
 
                         equity = float(account_info.get("equity", 0) or 0)
                         balance = float(account_info.get("balance", 0) or 0)
                         free_margin = float(account_info.get("freeMargin", 0) or 0)
                         margin_level = float(account_info.get("marginLevel", 0) or 0)
 
-                        terminal_state = connection.terminal_state
+                        broker_connected = safe_get_connection_state(connection)
 
-                        try:
-                            broker_connected = bool(
-                                getattr(terminal_state, "connected_to_broker", False)
-                            )
-                        except Exception:
-                            broker_connected = False
-
-                        price = None
-
-                        try:
-                            price = terminal_state.price(active_symbol)
-                        except Exception as price_error:
-                            print(f"[PRICE WARNING] {price_error}")
+                        price = safe_get_price(terminal_state, active_symbol)
 
                         if not price or not price.get("bid"):
                             try:
@@ -560,12 +590,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         if mid_price > 0:
                             candle_tracker.record_tick(mid_price)
 
-                        positions = []
-
-                        try:
-                            positions = terminal_state.positions or []
-                        except Exception as positions_error:
-                            print(f"[POSITIONS WARNING] {positions_error}")
+                        positions = safe_get_positions(terminal_state)
 
                         symbol_positions = [
                             position for position in positions
@@ -808,7 +833,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         if str(login) in live_account_telemetry:
             live_account_telemetry[str(login)]["connected_to_broker"] = False
             live_account_telemetry[str(login)]["last_updated"] = (
-                datetime.datetime.utcnow().isoformat()
+                datetime.datetime.now(datetime.timezone.utc).isoformat()
             )
 
         print(f"[ENGINE STOPPED] Worker terminated for: {login}")
@@ -884,7 +909,7 @@ def health_ping():
     return jsonify({
         "status": "healthy",
         "service": "Gold Scalper Engine",
-        "timestamp": datetime.datetime.utcnow().isoformat()
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }), 200
 
 @app.route("/api/account", methods=["GET"])
@@ -1030,7 +1055,7 @@ def control_dispatcher():
             return jsonify({
                 "status": "success",
                 "success": True,
-                "message": "STOP command accepted."
+                "message": "STOP command accepted. Worker will shut down safely."
             }), 200
 
         if command in ["START", "RUN"]:
