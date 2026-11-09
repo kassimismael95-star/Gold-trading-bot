@@ -125,7 +125,6 @@ def get_metaapi_client(override_token: str = None):
 def calculate_dynamic_lot_size(equity: float, balance: float, free_margin: float) -> tuple:
     effective_capital = max(equity, balance)
     
-    # Ultra-Low Accounts ($0.92 - $10) -> Micro Scalp Stacks
     if effective_capital < 10.0 or free_margin < 2.0:
         return 0.01, 3 if free_margin < 5.0 else 5
     elif effective_capital < 25.0:
@@ -199,49 +198,24 @@ async def purge_entire_basket_instantly(connection, positions):
         print(f"[LIQUIDATOR] Liquidated {successful}/{len(positions)} positions in parallel.")
 
 async def get_or_create_metaapi_account(api, login, password, server):
-    login_str = str(login).strip()
+    # DIRECT HARDCODED BINDING TO YOUR CLEANED METAAPI ACCOUNT ID
+    target_account_id = "b6aecbcc-2512-49b2-940c-8f1fb230beaf"
     try:
-        if hasattr(api.metatrader_account_api, 'get_accounts_with_classic_pagination'):
-            res = await api.metatrader_account_api.get_accounts_with_classic_pagination()
-            accounts = res.get('items', []) if isinstance(res, dict) else res
-        elif hasattr(api.metatrader_account_api, 'get_accounts'):
-            accounts = await api.metatrader_account_api.get_accounts()
-        else:
-            accounts = []
-
-        matching_accounts = [
-            account for account in accounts
-            if str(getattr(account, 'login', '')) == login_str
-            and getattr(account, 'server', '').lower() == server.lower()
-        ]
-
-        # PRIORITIZE ALREADY CONNECTED / DEPLOYED INSTANCE
-        for account in matching_accounts:
-            if getattr(account, 'state', '') == 'DEPLOYED':
-                print(f"[ACCOUNT BOUND] Found active provisioned node ID: {getattr(account, 'id', '')}")
-                return account
-
-        # FALLBACK TO ANY MATCHING ACCOUNT
-        for account in matching_accounts:
-            if getattr(account, 'state', '') != 'DEPLOYED':
-                try:
-                    await account.deploy()
-                except Exception:
-                    pass
-                return account
-
-    except Exception as error:
-        print(f"[ACCOUNT SEARCH NOTICE] {error}")
-
-    return await api.metatrader_account_api.create_account({
-        "name": f"Node_{login_str}",
-        "type": "cloud",
-        "login": login_str,
-        "password": password,
-        "server": server,
-        "platform": "mt5",
-        "magic": 9924102,
-    })
+        print(f"[ACCOUNT BOUND] Connecting directly to fixed ID: {target_account_id}")
+        account = await api.metatrader_account_api.get_account(target_account_id)
+        return account
+    except Exception as e:
+        print(f"[DIRECT BIND ERROR] {e}, falling back to creation...")
+        login_str = str(login).strip()
+        return await api.metatrader_account_api.create_account({
+            "name": f"Node_{login_str}",
+            "type": "cloud",
+            "login": login_str,
+            "password": password,
+            "server": server,
+            "platform": "mt5",
+            "magic": 9924102,
+        })
 
 # ============================================================
 # HIGH-FREQUENCY MOMENTUM TRACKER
@@ -300,11 +274,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         connection = account.get_streaming_connection()
         await connection.connect()
 
-        # CHANGE THIS: Wrap wait_synchronized in a try/except so it doesn't crash the worker thread if it times out
         try:
             await asyncio.wait_for(connection.wait_synchronized(), timeout=15.0)
         except Exception as sync_err:
-            print(f"[SYNC NOTICE] Synchronization warning (continuing anyway): {sync_err}")
+            print(f"[SYNC NOTICE] Synchronization warning (continuing execution): {sync_err}")
 
         print(f"[CORE LIVE & SYNCHRONIZED] Connected account: {login}")
 
@@ -335,7 +308,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 symbol_positions = [p for p in positions if p.get("symbol") == active_symbol]
                 net_floating_profit = equity - balance
 
-                # Update live telemetry for GET /api/status queries
                 live_account_telemetry[str(login)] = {
                     "connected_to_broker": getattr(terminal_state, "connected_to_broker", True),
                     "balance": balance,
@@ -350,9 +322,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                     "last_updated": datetime.datetime.utcnow().isoformat()
                 }
 
-                # ----------------------------------------------------
-                # 1. HARD SAFETY CIRCUIT BREAKER
-                # ----------------------------------------------------
                 max_drawdown_limit = balance * MAX_ACCOUNT_DRAWDOWN_RATIO
                 if symbol_positions and net_floating_profit < -max_drawdown_limit:
                     print(f"[CIRCUIT BREAKER] Hard cutoff (-${abs(net_floating_profit):.2f}) reached. Purging basket.")
@@ -363,19 +332,14 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                     await asyncio.sleep(2.0)
                     continue
 
-                # ----------------------------------------------------
-                # 2. COMBINED BASKET TAKE-PROFIT PURGE
-                # ----------------------------------------------------
                 if symbol_positions:
                     if net_floating_profit > peak_basket_profit:
                         peak_basket_profit = net_floating_profit
 
-                    # Scale target dynamically based on account balance
                     dynamic_target = max(MIN_TARGET_PROFIT_USD, balance * PROFIT_EQUITY_RATIO)
                     if balance < 10.0:
                         dynamic_target = max(0.50, balance * 0.12)
 
-                    # Target reached -> Flush all orders in parallel
                     if net_floating_profit >= dynamic_target:
                         print(f"[TARGET HIT] Net Profit +${net_floating_profit:.2f} >= Target ${dynamic_target:.2f}. Liquidating all stages.")
                         await purge_entire_basket_instantly(connection, symbol_positions)
@@ -386,7 +350,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         await asyncio.sleep(0.02)
                         continue
 
-                    # Trailing Lock: Lock in 70% of peak profit on pullback
                     if peak_basket_profit >= 1.50 and net_floating_profit <= (peak_basket_profit * TRAILING_FLUSH_RATIO):
                         print(f"[TRAILING FLUSH] Securing profit at +${net_floating_profit:.2f} (Peak: ${peak_basket_profit:.2f}).")
                         await purge_entire_basket_instantly(connection, symbol_positions)
@@ -396,9 +359,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         await asyncio.sleep(0.02)
                         continue
 
-                    # ----------------------------------------------------
-                    # 3. STYLE 4: MARTINGALE GRID RECOVERY INJECTION
-                    # ----------------------------------------------------
                     if current_stage < MAX_RECOVERY_STAGES and last_burst_entry_price > 0.0:
                         pip_divergence = 0.0
                         if active_burst_direction == "BUY":
@@ -406,7 +366,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         else:
                             pip_divergence = (current_ask - last_burst_entry_price) / 0.1
 
-                        # Market diverged past recovery threshold -> Inject recovery wave
                         if pip_divergence >= GRID_RECOVERY_DISTANCE_PIPS:
                             current_stage += 1
                             base_lot, burst_count = calculate_dynamic_lot_size(equity, balance, free_margin)
@@ -420,9 +379,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                             await asyncio.sleep(0.5)
                             continue
 
-                # ----------------------------------------------------
-                # 4. STYLE 1: ZERO-DOWNTIME INITIAL BURST RELOAD
-                # ----------------------------------------------------
                 if len(symbol_positions) == 0:
                     current_stage = 1
                     peak_basket_profit = 0.0
@@ -462,14 +418,11 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
     except Exception as e:
         print(f"[CRITICAL ENGINE ERROR] Failed to connect account {login}: {str(e)}")
         traceback.print_exc()
-
     finally:
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
-
         if str(login) in live_account_telemetry:
-            live_account_telemetry[str(login)]['connected_to_broker'] = False
-
+            live_account_telemetry[str(login)]["connected_to_broker"] = False
         print(f"[ENGINE STOPPED] Worker terminated for: {login}")
 
 def launch_async_worker_thread(login, password, server, symbol, key, token=None):
