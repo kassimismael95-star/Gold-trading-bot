@@ -45,6 +45,11 @@ trading_threads = {}
 live_account_telemetry = {}
 
 # ============================================================
+# FIXED METAAPI ACCOUNT BINDING
+# ============================================================
+FIXED_METAAPI_ACCOUNT_ID = "28ecb0a9-55bf-4bd4-9d8c-cbc62b8c45ef"
+
+# ============================================================
 # HYBRID STYLE 1 + STYLE 4 SCALPING PARAMETERS
 # ============================================================
 BURST_ORDER_COUNT = 8
@@ -335,14 +340,78 @@ async def purge_entire_basket_instantly(connection, positions):
         print(f"[LIQUIDATOR] Closed {successful}/{len(close_tasks)} positions.")
 
 # ============================================================
-# METAAPI ACCOUNT SELECTOR
+# METAAPI ACCOUNT SELECTOR WITH FIXED BINDING
 # ============================================================
 async def get_or_create_metaapi_account(api, login, password, server):
     login_str = str(login).strip()
     server_str = str(server).strip()
 
+    print(
+        f"[ACCOUNT BIND] Trying fixed MetaApi account: "
+        f"{FIXED_METAAPI_ACCOUNT_ID}"
+    )
+
     try:
-        if hasattr(api.metatrader_account_api, "get_accounts_with_classic_pagination"):
+        account = await api.metatrader_account_api.get_account(
+            FIXED_METAAPI_ACCOUNT_ID
+        )
+
+        account_login = str(getattr(account, "login", "")).strip()
+        account_server = str(getattr(account, "server", "")).strip()
+        account_state = getattr(account, "state", "")
+
+        print(
+            f"[ACCOUNT VALIDATION] Fixed account login={account_login}, "
+            f"server={account_server}, state={account_state}"
+        )
+
+        if account_login != login_str:
+            raise ValueError(
+                f"Fixed MetaApi account login mismatch. "
+                f"Expected: {login_str}, found: {account_login}"
+            )
+
+        if account_server.lower() != server_str.lower():
+            print(
+                f"[SERVER MISMATCH WARNING] MetaApi account server is "
+                f"'{account_server}', but Mini App sent '{server_str}'. "
+                f"Using the MetaApi account server."
+            )
+
+        if account_state != "DEPLOYED":
+            print(
+                f"[DEPLOYING ACCOUNT] Deploying MetaApi account "
+                f"{FIXED_METAAPI_ACCOUNT_ID}..."
+            )
+
+            await asyncio.wait_for(
+                account.deploy(),
+                timeout=DEPLOY_TIMEOUT_SECONDS
+            )
+
+            await asyncio.wait_for(
+                account.wait_deployed(),
+                timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+            )
+
+        print(
+            f"[ACCOUNT BOUND] Using fixed MetaApi account: "
+            f"{FIXED_METAAPI_ACCOUNT_ID}"
+        )
+
+        return account
+
+    except Exception as fixed_bind_error:
+        print(
+            f"[DIRECT BIND ERROR] {fixed_bind_error}. "
+            f"Searching existing MetaApi accounts..."
+        )
+
+    try:
+        if hasattr(
+            api.metatrader_account_api,
+            "get_accounts_with_classic_pagination"
+        ):
             response = await api.metatrader_account_api.get_accounts_with_classic_pagination()
             accounts = response.get("items", []) if isinstance(response, dict) else response
         elif hasattr(api.metatrader_account_api, "get_accounts"):
@@ -354,32 +423,44 @@ async def get_or_create_metaapi_account(api, login, password, server):
 
         for account in accounts:
             account_login = str(getattr(account, "login", "")).strip()
-            account_server = str(getattr(account, "server", "")).strip().lower()
 
-            if account_login == login_str and account_server == server_str.lower():
+            if account_login == login_str:
                 matching_accounts.append(account)
 
-        print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching MetaApi account(s).")
+        print(
+            f"[ACCOUNT SEARCH] Found {len(matching_accounts)} MetaApi "
+            f"account(s) for login {login_str}."
+        )
 
         for account in matching_accounts:
             if getattr(account, "state", "") == "DEPLOYED":
-                print(f"[ACCOUNT BOUND] Reusing deployed MetaApi node: {getattr(account, 'id', '')}")
+                print(
+                    f"[ACCOUNT BOUND] Reusing deployed MetaApi account: "
+                    f"{getattr(account, 'id', '')}"
+                )
                 return account
 
         for account in matching_accounts:
             if getattr(account, "state", "") != "DEPLOYED":
-                print(f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: {getattr(account, 'id', '')}")
+                print(
+                    f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: "
+                    f"{getattr(account, 'id', '')}"
+                )
 
-                try:
-                    await account.deploy()
-                    await account.wait_deployed()
-                except Exception as deploy_error:
-                    print(f"[DEPLOY WARNING] {deploy_error}")
+                await asyncio.wait_for(
+                    account.deploy(),
+                    timeout=DEPLOY_TIMEOUT_SECONDS
+                )
+
+                await asyncio.wait_for(
+                    account.wait_deployed(),
+                    timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+                )
 
                 return account
 
-    except Exception as error:
-        print(f"[ACCOUNT SEARCH NOTICE] {error}")
+    except Exception as search_error:
+        print(f"[ACCOUNT SEARCH ERROR] {search_error}")
 
     print("[ACCOUNT CREATE] Creating new MetaApi account.")
 
@@ -1076,6 +1157,28 @@ def status_endpoint():
         "telemetry": live_account_telemetry
     }), 200
 
+@app.route("/api/connection-status", methods=["GET", "OPTIONS"])
+def connection_status_endpoint():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
+    login = request.args.get("mt5_login", "").strip()
+    telemetry = live_account_telemetry.get(login, {})
+
+    return jsonify({
+        "status": "online",
+        "mt5_login": login,
+        "connected_to_broker": telemetry.get("connected_to_broker", False),
+        "balance": telemetry.get("balance", 0),
+        "equity": telemetry.get("equity", 0),
+        "free_margin": telemetry.get("free_margin", 0),
+        "floating_pnl": telemetry.get("floating_pnl", 0),
+        "open_positions_count": telemetry.get("open_positions_count", 0),
+        "active_symbol": telemetry.get("active_symbol", ""),
+        "symbol_price": telemetry.get("symbol_price", {}),
+        "last_updated": telemetry.get("last_updated", None)
+    }), 200
+
 @app.route("/control", methods=["GET", "POST", "OPTIONS"])
 @app.route("/start", methods=["GET", "POST", "OPTIONS"])
 @app.route("/api/control", methods=["GET", "POST", "OPTIONS"])
@@ -1109,151 +1212,4 @@ def control_dispatcher():
                 "status": "error",
                 "success": False,
                 "message": "Invalid License Key. Allowed keys: BOSSMODE98, BOSSMODE99."
-            }), 200
-
-        mt5_login = str(
-            data.get("mt5_login") or
-            data.get("login") or
-            data.get("account") or
-            ""
-        ).strip()
-
-        mt5_password = str(
-            data.get("mt5_password") or
-            data.get("password") or
-            data.get("pass") or
-            ""
-        ).strip()
-
-        mt5_server = str(
-            data.get("mt5_server") or
-            data.get("server") or
-            data.get("broker") or
-            ""
-        ).strip()
-
-        mt5_symbol = str(
-            data.get("mt5_symbol") or
-            data.get("symbol") or
-            "XAUUSDm"
-        ).strip()
-
-        saved_credentials = db_get_credentials(license_key)
-
-        if saved_credentials:
-            mt5_login = mt5_login or saved_credentials["mt5_login"]
-            mt5_password = mt5_password or saved_credentials["mt5_password"]
-            mt5_server = mt5_server or saved_credentials["mt5_server"]
-            mt5_symbol = mt5_symbol or saved_credentials["mt5_symbol"]
-
-        if command == "SAVE":
-            if not mt5_login or not mt5_server:
-                return jsonify({
-                    "status": "error",
-                    "message": "Login and Server are required to save."
-                }), 200
-
-            db_save_credentials(
-                license_key,
-                mt5_login,
-                mt5_password,
-                mt5_server,
-                mt5_symbol
-            )
-
-            return jsonify({
-                "status": "success",
-                "message": "Credentials saved securely on server database."
-            }), 200
-
-        if not mt5_login or not mt5_password or not mt5_server:
-            return jsonify({
-                "status": "error",
-                "success": False,
-                "message": "Missing credentials. Enter login, password, and server."
-            }), 200
-
-        db_save_credentials(
-            license_key,
-            mt5_login,
-            mt5_password,
-            mt5_server,
-            mt5_symbol
-        )
-
-        login_str = str(mt5_login).strip()
-
-        if command == "STOP":
-            active_trading_nodes[login_str] = False
-
-            print(f"[STOP REQUEST RECEIVED] Stopping worker for {login_str}.")
-
-            return jsonify({
-                "status": "success",
-                "success": True,
-                "message": "STOP command accepted. Worker will shut down safely."
-            }), 200
-
-        if command in ["START", "RUN"]:
-            if active_trading_nodes.get(login_str, False):
-                return jsonify({
-                    "status": "success",
-                    "success": True,
-                    "message": "Bot is already running."
-                }), 200
-
-            active_trading_nodes[login_str] = True
-
-            token_override = str(
-                data.get("metaapi_token") or
-                data.get("token") or
-                request.headers.get("Authorization", "")
-            ).replace("Bearer ", "").strip()
-
-            worker = threading.Thread(
-                target=launch_async_worker_thread,
-                args=(
-                    login_str,
-                    mt5_password,
-                    mt5_server,
-                    mt5_symbol,
-                    license_key,
-                    token_override if token_override else None
-                ),
-                daemon=True,
-                name=f"Worker-{login_str}"
-            )
-
-            trading_threads[login_str] = worker
-            worker.start()
-
-            return jsonify({
-                "status": "success",
-                "success": True,
-                "message": f"License [{license_key}] Verified. Hybrid scalper active with Exness Gold resolution.",
-                "login": login_str,
-                "symbol": mt5_symbol
-            }), 200
-
-        return jsonify({
-            "status": "success",
-            "message": f"Command '{command}' processed."
-        }), 200
-
-    except Exception as error:
-        print(f"[CONTROLLER FAULT] {error}")
-        traceback.print_exc()
-
-        return jsonify({
-            "status": "error",
-            "success": False,
-            "message": str(error)
-        }), 200
-
-# ============================================================
-# PRODUCTION ENTRYPOINT
-# ============================================================
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Running Gold Scalper AI Server on 0.0.0.0:{port}...")
-    serve(app, host="0.0.0.0", port=port, threads=8)
+            }),
