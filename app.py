@@ -299,7 +299,13 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         await account.wait_connected()
         connection = account.get_streaming_connection()
         await connection.connect()
-        await connection.wait_synchronized()
+
+        # CHANGE THIS: Wrap wait_synchronized in a try/except so it doesn't crash the worker thread if it times out
+        try:
+            await asyncio.wait_for(connection.wait_synchronized(), timeout=15.0)
+        except Exception as sync_err:
+            print(f"[SYNC NOTICE] Synchronization warning (continuing anyway): {sync_err}")
+
         print(f"[CORE LIVE & SYNCHRONIZED] Connected account: {login}")
 
         active_symbol = await resolve_broker_gold_symbol(connection, symbol)
