@@ -46,9 +46,9 @@ live_account_telemetry = {}
 active_connections = {}  # Tracks open streaming connections to prevent socket locks
 
 # Fast Execution Parameters
-MAX_ALLOWED_SPREAD_PIPS = 35.0
-POLL_LATENCY_DELAY = 0.05
-BURST_SPACING_DELAY = 0.08
+MAX_ALLOWED_SPREAD_PIPS = 35.0     # Wide spread tolerance for Gold volatility
+POLL_LATENCY_DELAY = 0.05          # 50ms rapid polling loop
+BURST_SPACING_DELAY = 0.08         # 80ms spacing between batch executions
 
 # Connection Timeouts
 MAX_CONNECTION_ATTEMPTS = 10
@@ -136,46 +136,71 @@ def get_metaapi_client(override_token: str = None):
 # VIDEO-STYLE CAPITAL SCALER (SAME-LOT BATCH BURSTS)
 # ============================================================
 def calculate_video_dynamic_burst(equity: float, balance: float, confidence_score: int) -> tuple:
+    """
+    Evaluates account capital and returns: (lot_size, burst_count, profit_target_usd)
+    Matches the exact video scaling progression from micro to multi-lot waves.
+    """
     capital = max(equity, balance)
     abs_conf = abs(confidence_score)
 
     if capital < 4.0:
+        # Sub-$4 Ultra-Micro Mode (e.g. 0.92 starting capital in video)
         count = 2 if abs_conf >= 7 else 1
         return 0.01, count, 0.35
+
     elif capital < 10.0:
+        # $4.00 - $9.99
         count = 2 if abs_conf >= 6 else 1
         lot = 0.02 if abs_conf >= 8 else 0.01
         return lot, count, 0.60
+
     elif capital < 25.0:
+        # $10.00 - $24.99: bursts of 0.01 to 0.02
         if abs_conf >= 8:
             return 0.02, 4, 1.20
         elif abs_conf >= 5:
             return 0.01, 3, 0.80
         else:
             return 0.01, 2, 0.60
+
     elif capital < 70.0:
+        # $25.00 - $69.99 (Seen in video at $32.43 entering 6x 0.02)
         count = 5 if abs_conf >= 7 else 3
         return 0.02, count, 2.50
+
     elif capital < 200.0:
+        # $70.00 - $199.99 (Seen in video at $139.28 entering 6x 0.02)
         count = 6 if abs_conf >= 7 else 4
         lot = 0.03 if abs_conf >= 8 else 0.02
         return lot, count, 5.00
+
     elif capital < 800.0:
+        # $200.00 - $799.99 (Seen in video at $373.07 entering 6x 0.10)
         count = 6 if abs_conf >= 6 else 4
         return 0.10, count, 15.00
+
     elif capital < 2000.0:
+        # $800.00 - $1,999.99 (Seen in video at $1,484.55 entering 6x 0.20)
         count = 6 if abs_conf >= 6 else 4
         return 0.20, count, 35.00
+
     elif capital < 5000.0:
+        # $2,000.00 - $4,999.99 (Seen in video at $2,640.19 entering 6x 0.30)
         count = 6 if abs_conf >= 6 else 4
         return 0.30, count, 80.00
+
     elif capital < 15000.0:
+        # $5,000.00 - $14,999.99 (Seen in video at $6,838.86 entering 6x 0.90)
         count = 6 if abs_conf >= 6 else 4
         return 0.90, count, 200.00
+
     elif capital < 50000.0:
+        # $15,000.00 - $49,999.99 (Seen in video at $24,259.38 entering 6x 2.00)
         count = 6 if abs_conf >= 6 else 4
         return 2.00, count, 500.00
+
     else:
+        # $50,000.00+ Enterprise Tier (Seen in video at $66k-$189k entering 3.00 lots)
         count = 8 if abs_conf >= 6 else 5
         return 3.00, count, 1200.00
 
@@ -196,12 +221,17 @@ class MicroMomentumTracker:
         self.ticks.append(price)
 
     def evaluate(self) -> tuple:
+        """
+        Calculates instant buyer vs seller pressure.
+        Returns: (direction: "BUY"|"SELL", confidence_score: int from -10 to +10)
+        """
         if len(self.ticks) < 3:
             return "BUY", 6
 
         score = 0
         latest = self.ticks[-1]
 
+        # 1. Immediate Tick Velocity (last 3 ticks)
         short_delta = latest - self.ticks[-3]
         if short_delta > 0.05:
             score += 4
@@ -212,6 +242,7 @@ class MicroMomentumTracker:
         elif short_delta < 0:
             score -= 2
 
+        # 2. Window Velocity across sample
         full_delta = latest - self.ticks[0]
         if full_delta > 0.15:
             score += 3
@@ -222,6 +253,7 @@ class MicroMomentumTracker:
         elif full_delta < 0:
             score -= 1
 
+        # 3. Micro-Candle Position
         if self.candle_open is not None:
             candle_delta = latest - self.candle_open
             if candle_delta > 0.10:
@@ -269,6 +301,7 @@ async def fire_stacked_batch(connection, symbol: str, direction: str, volume: fl
     return successful
 
 async def purge_entire_basket_instantly(connection, positions):
+    """Instantly closes all open positions in parallel"""
     close_tasks = [connection.close_position(position["id"]) for position in positions if "id" in position]
     if close_tasks:
         results = await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -311,7 +344,7 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
     return requested_symbol
 
 # ============================================================
-# RESILIENT ACCOUNT CONNECTION & SOCKET CLEANUP
+# SAFE ACCOUNT SELECTION & CONNECTION (WITH RE-DEPLOY PROTECTION)
 # ============================================================
 async def ensure_account_deployed(account):
     state = getattr(account, "state", "")
@@ -343,8 +376,9 @@ async def get_or_create_metaapi_account(api, login, password, server):
             if str(getattr(acc, "login", "")).strip() == login_str
         ]
 
-        print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching account(s) for login {login_str}.")
+        print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching MetaApi account(s).")
 
+        # Reuse deployed account or redeploy if inactive
         for account in matching_accounts:
             await ensure_account_deployed(account)
             print(f"[ACCOUNT BOUND] Reusing MetaApi node: {getattr(account, 'id', '')}")
@@ -353,7 +387,8 @@ async def get_or_create_metaapi_account(api, login, password, server):
     except Exception as error:
         print(f"[ACCOUNT SEARCH NOTICE] {error}")
 
-    print(f"[ACCOUNT CREATE] Creating new MetaApi account for {login_str}...")
+    # Create new account only if none exist
+    print("[ACCOUNT CREATE] No matching account found. Creating new MetaApi account.")
     new_acc = await api.metatrader_account_api.create_account({
         "name": f"Node_{login_str}",
         "type": "cloud",
@@ -370,7 +405,7 @@ async def connect_metaapi_account(account, login):
     last_error = None
     login_str = str(login).strip()
 
-    # Close any lingering streaming connection from a previous STOP
+    # Clean up lingering connection from previous STOP click
     if login_str in active_connections:
         try:
             old_conn = active_connections.pop(login_str, None)
@@ -486,6 +521,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 net_floating_profit = equity - balance
                 direction, confidence = tracker.evaluate()
 
+                # Always update live telemetry
                 update_telemetry(
                     connected=broker_connected,
                     sym=active_symbol,
@@ -518,7 +554,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
                     # Safety Drawdown Cutoff
                     if balance > 10.0 and net_floating_profit < -(balance * 0.35):
-                        print(f"[CIRCUIT BREAKER] Cutoff reached (-{abs(net_floating_profit):.2f} USD). Flushing.")
+                        print(
+                            f"[CIRCUIT BREAKER] Drawdown cutoff reached: "
+                            f"-{abs(net_floating_profit):.2f} USD"
+                        )
                         await purge_entire_basket_instantly(connection, symbol_positions)
                         await asyncio.sleep(0.5)
                         continue
@@ -639,183 +678,3 @@ def get_account_metadata():
                 "status": "success",
                 "account": {
                     "mt5_login": credentials["mt5_login"],
-                    "mt5_server": credentials["mt5_server"],
-                    "mt5_symbol": credentials["mt5_symbol"],
-                    "has_stored_password": bool(credentials["mt5_password"])
-                }
-            }), 200
-    return jsonify({"status": "not_found"}), 200
-
-@app.route("/status", methods=["GET", "OPTIONS"])
-@app.route("/api/status", methods=["GET", "OPTIONS"])
-def status_endpoint():
-    active_accounts = [
-        login for login, running in active_trading_nodes.items() if running
-    ]
-    return jsonify({
-        "status": "online",
-        "active_nodes_count": len(active_accounts),
-        "active_accounts": active_accounts,
-        "telemetry": live_account_telemetry
-    }), 200
-
-@app.route("/api/connection-status", methods=["GET", "OPTIONS"])
-def connection_status_endpoint():
-    login = request.args.get("mt5_login", "").strip()
-    return jsonify(live_account_telemetry.get(login, {"connected_to_broker": False})), 200
-
-@app.route("/control", methods=["GET", "POST", "OPTIONS"])
-@app.route("/start", methods=["GET", "POST", "OPTIONS"])
-@app.route("/api/control", methods=["GET", "POST", "OPTIONS"])
-@app.route("/api/start", methods=["GET", "POST", "OPTIONS"])
-def control_dispatcher():
-    if request.method == "OPTIONS":
-        return jsonify({"status": "ok"}), 200
-
-    try:
-        data = extract_request_data(request)
-
-        command = str(
-            data.get("command") or
-            data.get("action") or
-            "START"
-        ).strip().upper()
-
-        license_key = str(
-            data.get("license_key") or
-            data.get("key") or
-            "BOSSMODE99"
-        ).strip().upper()
-
-        if license_key not in ALLOWED_LICENSES:
-            return jsonify({
-                "status": "error",
-                "success": False,
-                "message": "Invalid License Key. Allowed keys: BOSSMODE98, BOSSMODE99."
-            }), 200
-
-        mt5_login = str(
-            data.get("mt5_login") or
-            data.get("login") or
-            data.get("account") or
-            ""
-        ).strip()
-
-        mt5_password = str(
-            data.get("mt5_password") or
-            data.get("password") or
-            data.get("pass") or
-            ""
-        ).strip()
-
-        mt5_server = str(
-            data.get("mt5_server") or
-            data.get("server") or
-            data.get("broker") or
-            ""
-        ).strip()
-
-        mt5_symbol = str(
-            data.get("mt5_symbol") or
-            data.get("symbol") or
-            "XAUUSDm"
-        ).strip()
-
-        saved_credentials = db_get_credentials(license_key)
-        if saved_credentials:
-            mt5_login = mt5_login or saved_credentials["mt5_login"]
-            mt5_password = mt5_password or saved_credentials["mt5_password"]
-            mt5_server = mt5_server or saved_credentials["mt5_server"]
-            mt5_symbol = mt5_symbol or saved_credentials["mt5_symbol"]
-
-        if command == "SAVE":
-            if not mt5_login or not mt5_server:
-                return jsonify({
-                    "status": "error",
-                    "message": "Login and Server are required to save."
-                }), 200
-
-            db_save_credentials(license_key, mt5_login, mt5_password, mt5_server, mt5_symbol)
-            return jsonify({
-                "status": "success",
-                "message": "Credentials saved securely on server database."
-            }), 200
-
-        if not mt5_login or not mt5_password or not mt5_server:
-            return jsonify({
-                "status": "error",
-                "success": False,
-                "message": "Missing credentials. Enter login, password, and server."
-            }), 200
-
-        db_save_credentials(license_key, mt5_login, mt5_password, mt5_server, mt5_symbol)
-        login_str = str(mt5_login).strip()
-
-        if command == "STOP":
-            active_trading_nodes[login_str] = False
-            return jsonify({
-                "status": "success",
-                "success": True,
-                "message": "STOP command accepted. Worker stopping."
-            }), 200
-
-        if command in ["START", "RUN"]:
-            if active_trading_nodes.get(login_str, False):
-                return jsonify({
-                    "status": "success",
-                    "success": True,
-                    "message": "Bot is already running."
-                }), 200
-
-            active_trading_nodes[login_str] = True
-            token_override = str(
-                data.get("metaapi_token") or
-                data.get("token") or
-                request.headers.get("Authorization", "")
-            ).replace("Bearer ", "").strip()
-
-            worker = threading.Thread(
-                target=launch_async_worker_thread,
-                args=(
-                    login_str,
-                    mt5_password,
-                    mt5_server,
-                    mt5_symbol,
-                    license_key,
-                    token_override if token_override else None
-                ),
-                daemon=True,
-                name=f"Worker-{login_str}"
-            )
-            trading_threads[login_str] = worker
-            worker.start()
-
-            return jsonify({
-                "status": "success",
-                "success": True,
-                "message": f"License [{license_key}] Verified. Scalper active on {mt5_symbol}.",
-                "login": login_str,
-                "symbol": mt5_symbol
-            }), 200
-
-        return jsonify({
-            "status": "success",
-            "message": f"Command '{command}' processed."
-        }), 200
-
-    except Exception as error:
-        print(f"[CONTROLLER FAULT] {error}")
-        traceback.print_exc()
-        return jsonify({
-            "status": "error",
-            "success": False,
-            "message": str(error)
-        }), 200
-
-# ============================================================
-# PRODUCTION ENTRYPOINT
-# ============================================================
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Running Gold Scalper AI Server on 0.0.0.0:{port}...")
-    serve(app, host="0.0.0.0", port=port, threads=8)
