@@ -340,33 +340,84 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
 # ============================================================
 # SAFE ACCOUNT SELECTION & CONNECTION
 # ============================================================
+async def get_existing_metaapi_accounts(api):
+    """
+    Retrieves MetaApi accounts safely.
+    Supports both current SDK versions and older SDK versions.
+    """
+    try:
+        accounts_response = await api.metatrader_account_api.get_accounts_with_infinite_scroll_pagination()
+
+        # Current SDK returns a paginated response containing "items"
+        if isinstance(accounts_response, dict):
+            accounts = accounts_response.get("items", [])
+        else:
+            accounts = accounts_response
+
+        if accounts is None:
+            accounts = []
+
+        return accounts
+
+    except AttributeError:
+        # Fallback for older MetaApi SDK versions
+        print("[SDK COMPATIBILITY] Using legacy get_accounts() method...")
+        try:
+            accounts = await api.metatrader_account_api.get_accounts()
+            if isinstance(accounts, dict):
+                return accounts.get("items", [])
+            return accounts or []
+        except Exception as legacy_error:
+            print(f"[LEGACY ACCOUNT SEARCH NOTICE] {legacy_error}")
+            return []
+
+    except Exception as error:
+        print(f"[ACCOUNT SEARCH NOTICE] {error}")
+        return []
+
+def extract_account_field(account, field: str, default=""):
+    """
+    Safely reads a field from either an SDK account object or a dictionary.
+    """
+    try:
+        if isinstance(account, dict):
+            return account.get(field, default)
+        return getattr(account, field, default)
+    except Exception:
+        return default
+
 async def get_or_create_metaapi_account(api, login, password, server):
     login_str = str(login).strip()
     server_str = str(server).strip()
 
     try:
-        accounts = await api.metatrader_account_api.get_accounts()
+        accounts = await get_existing_metaapi_accounts(api)
+
         matching_accounts = [
-            acc for acc in accounts
-            if str(getattr(acc, "login", "")).strip() == login_str
+            account for account in accounts
+            if str(extract_account_field(account, "login", "")).strip() == login_str
         ]
 
         print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching MetaApi account(s).")
 
         # Reuse an already deployed account
         for account in matching_accounts:
-            if getattr(account, "state", "") == "DEPLOYED":
-                print(f"[ACCOUNT BOUND] Reusing deployed MetaApi node: {getattr(account, 'id', '')}")
+            if str(extract_account_field(account, "state", "")).upper() == "DEPLOYED":
+                account_id = extract_account_field(account, "id", "")
+                print(f"[ACCOUNT BOUND] Reusing deployed MetaApi node: {account_id}")
                 return account
 
         # Deploy existing account if undeployed
         for account in matching_accounts:
-            print(f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: {getattr(account, 'id', '')}")
+            account_id = extract_account_field(account, "id", "")
+            print(f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: {account_id}")
+
             try:
                 await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
                 await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
             except Exception as deploy_error:
                 print(f"[DEPLOY WARNING] {deploy_error}")
+
             return account
 
     except Exception as error:
@@ -374,21 +425,38 @@ async def get_or_create_metaapi_account(api, login, password, server):
 
     # Create new account only if none exist
     print("[ACCOUNT CREATE] No matching account found. Creating new MetaApi account.")
-    new_acc = await api.metatrader_account_api.create_account({
-        "name": f"Node_{login_str}",
-        "type": "cloud",
-        "login": login_str,
-        "password": password,
-        "server": server_str,
-        "platform": "mt5",
-        "magic": 9924102
-    })
+
     try:
-        await asyncio.wait_for(new_acc.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-        await asyncio.wait_for(new_acc.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
-    except Exception as deploy_error:
-        print(f"[DEPLOY WARNING] {deploy_error}")
-    return new_acc
+        new_acc = await api.metatrader_account_api.create_account({
+            "name": f"Node_{login_str}",
+            "type": "cloud",
+            "login": login_str,
+            "password": password,
+            "server": server_str,
+            "platform": "mt5",
+            "magic": 9924102,
+            "reliability": "regular"
+        })
+
+        try:
+            await asyncio.wait_for(new_acc.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
+            await asyncio.wait_for(new_acc.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
+        except Exception as deploy_error:
+            print(f"[DEPLOY WARNING] {deploy_error}")
+
+        return new_acc
+
+    except Exception as create_error:
+        error_text = str(create_error)
+
+        if "top up" in error_text.lower() or "403" in error_text or "Forbidden" in error_text:
+            raise Exception(
+                "METAAPI BILLING BLOCKED: MetaApi rejected account creation because your MetaApi "
+                "balance/quota needs to be topped up. Log in to the MetaApi dashboard, top up or "
+                "resolve the account restriction, then press START again."
+            )
+
+        raise create_error
 
 async def connect_metaapi_account(account, login):
     last_error = None
@@ -396,7 +464,9 @@ async def connect_metaapi_account(account, login):
         try:
             print(f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] Connecting MT5 account {login}...")
 
-            if getattr(account, "state", "") != "DEPLOYED":
+            account_state = str(extract_account_field(account, "state", "")).upper()
+
+            if account_state != "DEPLOYED":
                 try:
                     await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
                     await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
@@ -417,14 +487,17 @@ async def connect_metaapi_account(account, login):
                 return connection
             except Exception as sync_error:
                 print(f"[SYNC NOTICE] Synchronization notice on attempt {attempt}: {sync_error}")
+
                 if attempt == MAX_CONNECTION_ATTEMPTS:
                     return connection
+
                 await asyncio.sleep(CONNECTION_RETRY_DELAY)
                 continue
 
         except Exception as error:
             last_error = error
             print(f"[CONNECTION FAILED] Attempt {attempt}/{MAX_CONNECTION_ATTEMPTS}: {error}")
+
             if attempt < MAX_CONNECTION_ATTEMPTS:
                 await asyncio.sleep(CONNECTION_RETRY_DELAY)
 
@@ -440,8 +513,8 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
     connection = None
     tracker = MicroMomentumTracker()
 
-    def update_telemetry(connected, sym, bal=0, eq=0, f_margin=0, m_level=0, pnl=0, open_count=0, price_obj=None, conf=0):
-        live_account_telemetry[str(login)] = {
+    def update_telemetry(connected, sym, bal=0, eq=0, f_margin=0, m_level=0, pnl=0, open_count=0, price_obj=None, conf=0, err=None):
+        telemetry = {
             "connected_to_broker": connected,
             "balance": bal,
             "equity": eq,
@@ -454,6 +527,11 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             "symbol_price": price_obj or {},
             "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
+
+        if err:
+            telemetry["error"] = err
+
+        live_account_telemetry[str(login)] = telemetry
 
     update_telemetry(False, symbol)
 
@@ -497,7 +575,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 net_floating_profit = equity - balance
                 direction, confidence = tracker.evaluate()
 
-                # Always update live telemetry
                 update_telemetry(
                     connected=broker_connected,
                     sym=active_symbol,
@@ -519,7 +596,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 # 1. INSTANT BASKET PROFIT TRAPPING (VIDEO BEHAVIOR)
                 # ----------------------------------------------------
                 if len(symbol_positions) > 0:
-                    # Basket target reached: flush all positions immediately
                     if net_floating_profit >= profit_target:
                         print(
                             f"[PROFIT TRAPPED] Reached +{net_floating_profit:.2f} USD "
@@ -567,15 +643,18 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             await asyncio.sleep(POLL_LATENCY_DELAY)
 
     except Exception as error:
-        print(f"[CRITICAL ENGINE ERROR] Failed to run account {login}: {str(error)}")
+        error_text = str(error)
+        print(f"[CRITICAL ENGINE ERROR] Failed to run account {login}: {error_text}")
         traceback.print_exc()
-        update_telemetry(False, symbol)
+        update_telemetry(False, symbol, err=error_text)
 
     finally:
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
+
         if str(login) in live_account_telemetry:
             live_account_telemetry[str(login)]["connected_to_broker"] = False
+
         print(f"[ENGINE STOPPED] Worker terminated for: {login}")
 
 def launch_async_worker_thread(login, password, server, symbol, key, token=None):
