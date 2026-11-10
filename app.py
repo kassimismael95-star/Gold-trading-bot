@@ -43,7 +43,7 @@ metaapi_lock = threading.Lock()
 active_trading_nodes = {}
 trading_threads = {}
 live_account_telemetry = {}
-active_connections = {}  # Tracks open streaming connections to prevent socket locks
+active_connections = {}
 
 # Fast Execution Parameters
 MAX_ALLOWED_SPREAD_PIPS = 35.0     # Wide spread tolerance for Gold volatility
@@ -136,71 +136,46 @@ def get_metaapi_client(override_token: str = None):
 # VIDEO-STYLE CAPITAL SCALER (SAME-LOT BATCH BURSTS)
 # ============================================================
 def calculate_video_dynamic_burst(equity: float, balance: float, confidence_score: int) -> tuple:
-    """
-    Evaluates account capital and returns: (lot_size, burst_count, profit_target_usd)
-    Matches the exact video scaling progression from micro to multi-lot waves.
-    """
     capital = max(equity, balance)
     abs_conf = abs(confidence_score)
 
     if capital < 4.0:
-        # Sub-$4 Ultra-Micro Mode (e.g. 0.92 starting capital in video)
         count = 2 if abs_conf >= 7 else 1
         return 0.01, count, 0.35
-
     elif capital < 10.0:
-        # $4.00 - $9.99
         count = 2 if abs_conf >= 6 else 1
         lot = 0.02 if abs_conf >= 8 else 0.01
         return lot, count, 0.60
-
     elif capital < 25.0:
-        # $10.00 - $24.99: bursts of 0.01 to 0.02
         if abs_conf >= 8:
             return 0.02, 4, 1.20
         elif abs_conf >= 5:
             return 0.01, 3, 0.80
         else:
             return 0.01, 2, 0.60
-
     elif capital < 70.0:
-        # $25.00 - $69.99 (Seen in video at $32.43 entering 6x 0.02)
         count = 5 if abs_conf >= 7 else 3
         return 0.02, count, 2.50
-
     elif capital < 200.0:
-        # $70.00 - $199.99 (Seen in video at $139.28 entering 6x 0.02)
         count = 6 if abs_conf >= 7 else 4
         lot = 0.03 if abs_conf >= 8 else 0.02
         return lot, count, 5.00
-
     elif capital < 800.0:
-        # $200.00 - $799.99 (Seen in video at $373.07 entering 6x 0.10)
         count = 6 if abs_conf >= 6 else 4
         return 0.10, count, 15.00
-
     elif capital < 2000.0:
-        # $800.00 - $1,999.99 (Seen in video at $1,484.55 entering 6x 0.20)
         count = 6 if abs_conf >= 6 else 4
         return 0.20, count, 35.00
-
     elif capital < 5000.0:
-        # $2,000.00 - $4,999.99 (Seen in video at $2,640.19 entering 6x 0.30)
         count = 6 if abs_conf >= 6 else 4
         return 0.30, count, 80.00
-
     elif capital < 15000.0:
-        # $5,000.00 - $14,999.99 (Seen in video at $6,838.86 entering 6x 0.90)
         count = 6 if abs_conf >= 6 else 4
         return 0.90, count, 200.00
-
     elif capital < 50000.0:
-        # $15,000.00 - $49,999.99 (Seen in video at $24,259.38 entering 6x 2.00)
         count = 6 if abs_conf >= 6 else 4
         return 2.00, count, 500.00
-
     else:
-        # $50,000.00+ Enterprise Tier (Seen in video at $66k-$189k entering 3.00 lots)
         count = 8 if abs_conf >= 6 else 5
         return 3.00, count, 1200.00
 
@@ -221,17 +196,12 @@ class MicroMomentumTracker:
         self.ticks.append(price)
 
     def evaluate(self) -> tuple:
-        """
-        Calculates instant buyer vs seller pressure.
-        Returns: (direction: "BUY"|"SELL", confidence_score: int from -10 to +10)
-        """
         if len(self.ticks) < 3:
             return "BUY", 6
 
         score = 0
         latest = self.ticks[-1]
 
-        # 1. Immediate Tick Velocity (last 3 ticks)
         short_delta = latest - self.ticks[-3]
         if short_delta > 0.05:
             score += 4
@@ -242,7 +212,6 @@ class MicroMomentumTracker:
         elif short_delta < 0:
             score -= 2
 
-        # 2. Window Velocity across sample
         full_delta = latest - self.ticks[0]
         if full_delta > 0.15:
             score += 3
@@ -253,7 +222,6 @@ class MicroMomentumTracker:
         elif full_delta < 0:
             score -= 1
 
-        # 3. Micro-Candle Position
         if self.candle_open is not None:
             candle_delta = latest - self.candle_open
             if candle_delta > 0.10:
@@ -301,7 +269,6 @@ async def fire_stacked_batch(connection, symbol: str, direction: str, volume: fl
     return successful
 
 async def purge_entire_basket_instantly(connection, positions):
-    """Instantly closes all open positions in parallel"""
     close_tasks = [connection.close_position(position["id"]) for position in positions if "id" in position]
     if close_tasks:
         results = await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -344,26 +311,36 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
     return requested_symbol
 
 # ============================================================
-# SAFE ACCOUNT SELECTION & CONNECTION (WITH RE-DEPLOY PROTECTION)
+# SAFE NON-BLOCKING ACCOUNT DEPLOYMENT & RETRIEVAL
 # ============================================================
-async def ensure_account_deployed(account):
-    state = getattr(account, "state", "")
-    if state == "DEPLOYED":
-        return True
-
-    print(f"[DEPLOY] Account is in '{state}'. Deploying now...")
+async def safe_ensure_deployed(account):
+    """Safely checks and deploys account without throwing fatal abort exceptions"""
     try:
-        await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-    except Exception as e:
-        print(f"[DEPLOY CALL WARNING] {e}")
+        curr_state = getattr(account, "state", "")
+        if curr_state == "DEPLOYED":
+            return True
 
-    try:
-        await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
-        print("[DEPLOY SUCCESS] Account is DEPLOYED.")
-        return True
+        print(f"[DEPLOY] Account is in state '{curr_state}'. Initiating deployment...")
+        if curr_state != "DEPLOYING":
+            try:
+                await account.deploy()
+            except Exception as d_err:
+                print(f"[DEPLOY CALL NOTICE] {d_err}")
+
+        # Wait non-blockingly for deployment to complete
+        for _ in range(30):
+            try:
+                if getattr(account, "state", "") == "DEPLOYED":
+                    print("[DEPLOY SUCCESS] Account is DEPLOYED.")
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+
     except Exception as e:
-        print(f"[DEPLOY WAIT NOTICE] {e}")
-        return getattr(account, "state", "") == "DEPLOYED"
+        print(f"[DEPLOY HANDLER NOTICE] {e}")
+
+    return getattr(account, "state", "") == "DEPLOYED"
 
 async def get_or_create_metaapi_account(api, login, password, server):
     login_str = str(login).strip()
@@ -378,17 +355,23 @@ async def get_or_create_metaapi_account(api, login, password, server):
 
         print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching MetaApi account(s).")
 
-        # Reuse deployed account or redeploy if inactive
+        # 1. Prefer an already deployed account
         for account in matching_accounts:
-            await ensure_account_deployed(account)
-            print(f"[ACCOUNT BOUND] Reusing MetaApi node: {getattr(account, 'id', '')}")
+            if getattr(account, "state", "") == "DEPLOYED":
+                print(f"[ACCOUNT BOUND] Reusing active deployed node: {getattr(account, 'id', '')}")
+                return account
+
+        # 2. Deploy existing account if undeployed
+        for account in matching_accounts:
+            print(f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: {getattr(account, 'id', '')}")
+            await safe_ensure_deployed(account)
             return account
 
     except Exception as error:
         print(f"[ACCOUNT SEARCH NOTICE] {error}")
 
-    # Create new account only if none exist
-    print("[ACCOUNT CREATE] No matching account found. Creating new MetaApi account.")
+    # 3. Create new account only if none exist
+    print(f"[ACCOUNT CREATE] No matching account found. Creating new MetaApi account for {login_str}...")
     new_acc = await api.metatrader_account_api.create_account({
         "name": f"Node_{login_str}",
         "type": "cloud",
@@ -398,19 +381,19 @@ async def get_or_create_metaapi_account(api, login, password, server):
         "platform": "mt5",
         "magic": 9924102
     })
-    await ensure_account_deployed(new_acc)
+    await safe_ensure_deployed(new_acc)
     return new_acc
 
 async def connect_metaapi_account(account, login):
     last_error = None
     login_str = str(login).strip()
 
-    # Clean up lingering connection from previous STOP click
+    # Clean up lingering streaming socket from a previous STOP
     if login_str in active_connections:
         try:
             old_conn = active_connections.pop(login_str, None)
             if old_conn:
-                print(f"[CLEANUP] Closing previous streaming socket for {login_str}...")
+                print(f"[CLEANUP] Closing previous socket for {login_str}...")
                 await old_conn.close()
         except Exception as e:
             print(f"[CLEANUP NOTICE] {e}")
@@ -419,10 +402,13 @@ async def connect_metaapi_account(account, login):
         try:
             print(f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] Connecting MT5 account {login}...")
 
-            await ensure_account_deployed(account)
+            await safe_ensure_deployed(account)
 
             print(f"[WAITING BROKER] Waiting for MT5 account {login} to connect...")
-            await asyncio.wait_for(account.wait_connected(), timeout=BROKER_CONNECT_TIMEOUT_SECONDS)
+            try:
+                await asyncio.wait_for(account.wait_connected(), timeout=BROKER_CONNECT_TIMEOUT_SECONDS)
+            except Exception as wc_err:
+                print(f"[WAIT CONNECTED NOTICE] {wc_err}")
 
             connection = account.get_streaming_connection()
             await asyncio.wait_for(connection.connect(), timeout=STREAM_CONNECT_TIMEOUT_SECONDS)
@@ -436,7 +422,7 @@ async def connect_metaapi_account(account, login):
                 active_connections[login_str] = connection
                 return connection
             except Exception as sync_error:
-                print(f"[SYNC NOTICE] Synchronization notice on attempt {attempt}: {sync_error}")
+                print(f"[SYNC NOTICE] Synchronization notice: {sync_error}")
                 if attempt == MAX_CONNECTION_ATTEMPTS:
                     active_connections[login_str] = connection
                     return connection
@@ -521,7 +507,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 net_floating_profit = equity - balance
                 direction, confidence = tracker.evaluate()
 
-                # Always update live telemetry
                 update_telemetry(
                     connected=broker_connected,
                     sym=active_symbol,
@@ -678,3 +663,103 @@ def get_account_metadata():
                 "status": "success",
                 "account": {
                     "mt5_login": credentials["mt5_login"],
+                    "mt5_server": credentials["mt5_server"],
+                    "mt5_symbol": credentials["mt5_symbol"],
+                    "has_stored_password": bool(credentials["mt5_password"])
+                }
+            }), 200
+    return jsonify({"status": "not_found"}), 200
+
+@app.route("/status", methods=["GET", "OPTIONS"])
+@app.route("/api/status", methods=["GET", "OPTIONS"])
+def status_endpoint():
+    active_accounts = [
+        login for login, running in active_trading_nodes.items() if running
+    ]
+    return jsonify({
+        "status": "online",
+        "active_nodes_count": len(active_accounts),
+        "active_accounts": active_accounts,
+        "telemetry": live_account_telemetry
+    }), 200
+
+@app.route("/api/connection-status", methods=["GET", "OPTIONS"])
+def connection_status_endpoint():
+    login = request.args.get("mt5_login", "").strip()
+    return jsonify(live_account_telemetry.get(login, {"connected_to_broker": False})), 200
+
+@app.route("/control", methods=["GET", "POST", "OPTIONS"])
+@app.route("/start", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/control", methods=["GET", "POST", "OPTIONS"])
+@app.route("/api/start", methods=["GET", "POST", "OPTIONS"])
+def control_dispatcher():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
+    try:
+        data = extract_request_data(request)
+
+        command = str(
+            data.get("command") or
+            data.get("action") or
+            "START"
+        ).strip().upper()
+
+        license_key = str(
+            data.get("license_key") or
+            data.get("key") or
+            "BOSSMODE99"
+        ).strip().upper()
+
+        if license_key not in ALLOWED_LICENSES:
+            return jsonify({
+                "status": "error",
+                "success": False,
+                "message": "Invalid License Key. Allowed keys: BOSSMODE98, BOSSMODE99."
+            }), 200
+
+        mt5_login = str(
+            data.get("mt5_login") or
+            data.get("login") or
+            data.get("account") or
+            ""
+        ).strip()
+
+        mt5_password = str(
+            data.get("mt5_password") or
+            data.get("password") or
+            data.get("pass") or
+            ""
+        ).strip()
+
+        mt5_server = str(
+            data.get("mt5_server") or
+            data.get("server") or
+            data.get("broker") or
+            ""
+        ).strip()
+
+        mt5_symbol = str(
+            data.get("mt5_symbol") or
+            data.get("symbol") or
+            "XAUUSDm"
+        ).strip()
+
+        saved_credentials = db_get_credentials(license_key)
+        if saved_credentials:
+            mt5_login = mt5_login or saved_credentials["mt5_login"]
+            mt5_password = mt5_password or saved_credentials["mt5_password"]
+            mt5_server = mt5_server or saved_credentials["mt5_server"]
+            mt5_symbol = mt5_symbol or saved_credentials["mt5_symbol"]
+
+        if command == "SAVE":
+            if not mt5_login or not mt5_server:
+                return jsonify({
+                    "status": "error",
+                    "message": "Login and Server are required to save."
+                }), 200
+
+            db_save_credentials(license_key, mt5_login, mt5_password, mt5_server, mt5_symbol)
+            return jsonify({
+                "status": "success",
+                "message":
