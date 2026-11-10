@@ -43,11 +43,12 @@ metaapi_lock = threading.Lock()
 active_trading_nodes = {}
 trading_threads = {}
 live_account_telemetry = {}
+active_connections = {}  # Tracks open streaming connections to prevent socket locks
 
 # Fast Execution Parameters
-MAX_ALLOWED_SPREAD_PIPS = 35.0     # Wide spread tolerance for Gold volatility
-POLL_LATENCY_DELAY = 0.05          # 50ms rapid polling loop
-BURST_SPACING_DELAY = 0.08         # 80ms spacing between batch executions
+MAX_ALLOWED_SPREAD_PIPS = 35.0
+POLL_LATENCY_DELAY = 0.05
+BURST_SPACING_DELAY = 0.08
 
 # Connection Timeouts
 MAX_CONNECTION_ATTEMPTS = 10
@@ -80,6 +81,11 @@ def init_db():
 init_db()
 
 def db_save_credentials(license_key, login, password, server, symbol):
+    if not password:
+        existing = db_get_credentials(license_key)
+        if existing and existing.get("mt5_password"):
+            password = existing["mt5_password"]
+
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
@@ -130,71 +136,46 @@ def get_metaapi_client(override_token: str = None):
 # VIDEO-STYLE CAPITAL SCALER (SAME-LOT BATCH BURSTS)
 # ============================================================
 def calculate_video_dynamic_burst(equity: float, balance: float, confidence_score: int) -> tuple:
-    """
-    Evaluates account capital and returns: (lot_size, burst_count, profit_target_usd)
-    Matches the exact video scaling progression from micro to multi-lot waves.
-    """
     capital = max(equity, balance)
     abs_conf = abs(confidence_score)
 
     if capital < 4.0:
-        # Sub-$4 Ultra-Micro Mode (e.g. 0.92 starting capital in video)
         count = 2 if abs_conf >= 7 else 1
         return 0.01, count, 0.35
-
     elif capital < 10.0:
-        # $4.00 - $9.99
         count = 2 if abs_conf >= 6 else 1
         lot = 0.02 if abs_conf >= 8 else 0.01
         return lot, count, 0.60
-
     elif capital < 25.0:
-        # $10.00 - $24.99: bursts of 0.01 to 0.02
         if abs_conf >= 8:
             return 0.02, 4, 1.20
         elif abs_conf >= 5:
             return 0.01, 3, 0.80
         else:
             return 0.01, 2, 0.60
-
     elif capital < 70.0:
-        # $25.00 - $69.99 (Seen in video at $32.43 entering 6x 0.02)
         count = 5 if abs_conf >= 7 else 3
         return 0.02, count, 2.50
-
     elif capital < 200.0:
-        # $70.00 - $199.99 (Seen in video at $139.28 entering 6x 0.02)
         count = 6 if abs_conf >= 7 else 4
         lot = 0.03 if abs_conf >= 8 else 0.02
         return lot, count, 5.00
-
     elif capital < 800.0:
-        # $200.00 - $799.99 (Seen in video at $373.07 entering 6x 0.10)
         count = 6 if abs_conf >= 6 else 4
         return 0.10, count, 15.00
-
     elif capital < 2000.0:
-        # $800.00 - $1,999.99 (Seen in video at $1,484.55 entering 6x 0.20)
         count = 6 if abs_conf >= 6 else 4
         return 0.20, count, 35.00
-
     elif capital < 5000.0:
-        # $2,000.00 - $4,999.99 (Seen in video at $2,640.19 entering 6x 0.30)
         count = 6 if abs_conf >= 6 else 4
         return 0.30, count, 80.00
-
     elif capital < 15000.0:
-        # $5,000.00 - $14,999.99 (Seen in video at $6,838.86 entering 6x 0.90)
         count = 6 if abs_conf >= 6 else 4
         return 0.90, count, 200.00
-
     elif capital < 50000.0:
-        # $15,000.00 - $49,999.99 (Seen in video at $24,259.38 entering 6x 2.00)
         count = 6 if abs_conf >= 6 else 4
         return 2.00, count, 500.00
-
     else:
-        # $50,000.00+ Enterprise Tier (Seen in video at $66k-$189k entering 3.00 lots)
         count = 8 if abs_conf >= 6 else 5
         return 3.00, count, 1200.00
 
@@ -215,17 +196,12 @@ class MicroMomentumTracker:
         self.ticks.append(price)
 
     def evaluate(self) -> tuple:
-        """
-        Calculates instant buyer vs seller pressure.
-        Returns: (direction: "BUY"|"SELL", confidence_score: int from -10 to +10)
-        """
         if len(self.ticks) < 3:
             return "BUY", 6
 
         score = 0
         latest = self.ticks[-1]
 
-        # 1. Immediate Tick Velocity (last 3 ticks)
         short_delta = latest - self.ticks[-3]
         if short_delta > 0.05:
             score += 4
@@ -236,7 +212,6 @@ class MicroMomentumTracker:
         elif short_delta < 0:
             score -= 2
 
-        # 2. Window Velocity across sample
         full_delta = latest - self.ticks[0]
         if full_delta > 0.15:
             score += 3
@@ -247,7 +222,6 @@ class MicroMomentumTracker:
         elif full_delta < 0:
             score -= 1
 
-        # 3. Micro-Candle Position
         if self.candle_open is not None:
             candle_delta = latest - self.candle_open
             if candle_delta > 0.10:
@@ -295,7 +269,6 @@ async def fire_stacked_batch(connection, symbol: str, direction: str, volume: fl
     return successful
 
 async def purge_entire_basket_instantly(connection, positions):
-    """Instantly closes all open positions in parallel"""
     close_tasks = [connection.close_position(position["id"]) for position in positions if "id" in position]
     if close_tasks:
         results = await asyncio.gather(*close_tasks, return_exceptions=True)
@@ -338,8 +311,27 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
     return requested_symbol
 
 # ============================================================
-# SAFE ACCOUNT SELECTION & CONNECTION
+# RESILIENT ACCOUNT CONNECTION & SOCKET CLEANUP
 # ============================================================
+async def ensure_account_deployed(account):
+    state = getattr(account, "state", "")
+    if state == "DEPLOYED":
+        return True
+
+    print(f"[DEPLOY] Account is in '{state}'. Deploying now...")
+    try:
+        await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
+    except Exception as e:
+        print(f"[DEPLOY CALL WARNING] {e}")
+
+    try:
+        await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
+        print("[DEPLOY SUCCESS] Account is DEPLOYED.")
+        return True
+    except Exception as e:
+        print(f"[DEPLOY WAIT NOTICE] {e}")
+        return getattr(account, "state", "") == "DEPLOYED"
+
 async def get_or_create_metaapi_account(api, login, password, server):
     login_str = str(login).strip()
     server_str = str(server).strip()
@@ -351,29 +343,17 @@ async def get_or_create_metaapi_account(api, login, password, server):
             if str(getattr(acc, "login", "")).strip() == login_str
         ]
 
-        print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching MetaApi account(s).")
+        print(f"[ACCOUNT SEARCH] Found {len(matching_accounts)} matching account(s) for login {login_str}.")
 
-        # Reuse an already deployed account
         for account in matching_accounts:
-            if getattr(account, "state", "") == "DEPLOYED":
-                print(f"[ACCOUNT BOUND] Reusing deployed MetaApi node: {getattr(account, 'id', '')}")
-                return account
-
-        # Deploy existing account if undeployed
-        for account in matching_accounts:
-            print(f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: {getattr(account, 'id', '')}")
-            try:
-                await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-                await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
-            except Exception as deploy_error:
-                print(f"[DEPLOY WARNING] {deploy_error}")
+            await ensure_account_deployed(account)
+            print(f"[ACCOUNT BOUND] Reusing MetaApi node: {getattr(account, 'id', '')}")
             return account
 
     except Exception as error:
         print(f"[ACCOUNT SEARCH NOTICE] {error}")
 
-    # Create new account only if none exist
-    print("[ACCOUNT CREATE] No matching account found. Creating new MetaApi account.")
+    print(f"[ACCOUNT CREATE] Creating new MetaApi account for {login_str}...")
     new_acc = await api.metatrader_account_api.create_account({
         "name": f"Node_{login_str}",
         "type": "cloud",
@@ -383,26 +363,30 @@ async def get_or_create_metaapi_account(api, login, password, server):
         "platform": "mt5",
         "magic": 9924102
     })
-    try:
-        await asyncio.wait_for(new_acc.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-        await asyncio.wait_for(new_acc.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
-    except Exception as deploy_error:
-        print(f"[DEPLOY WARNING] {deploy_error}")
+    await ensure_account_deployed(new_acc)
     return new_acc
 
 async def connect_metaapi_account(account, login):
     last_error = None
+    login_str = str(login).strip()
+
+    # Close any lingering streaming connection from a previous STOP
+    if login_str in active_connections:
+        try:
+            old_conn = active_connections.pop(login_str, None)
+            if old_conn:
+                print(f"[CLEANUP] Closing previous streaming socket for {login_str}...")
+                await old_conn.close()
+        except Exception as e:
+            print(f"[CLEANUP NOTICE] {e}")
+
     for attempt in range(1, MAX_CONNECTION_ATTEMPTS + 1):
         try:
             print(f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] Connecting MT5 account {login}...")
 
-            if getattr(account, "state", "") != "DEPLOYED":
-                try:
-                    await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-                    await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
-                except Exception as deploy_error:
-                    print(f"[DEPLOY WARNING] {deploy_error}")
+            await ensure_account_deployed(account)
 
+            print(f"[WAITING BROKER] Waiting for MT5 account {login} to connect...")
             await asyncio.wait_for(account.wait_connected(), timeout=BROKER_CONNECT_TIMEOUT_SECONDS)
 
             connection = account.get_streaming_connection()
@@ -414,10 +398,12 @@ async def connect_metaapi_account(account, login):
                     timeout=SYNC_TIMEOUT_SECONDS
                 )
                 print(f"[CORE LIVE & SYNCHRONIZED] Connected account: {login}")
+                active_connections[login_str] = connection
                 return connection
             except Exception as sync_error:
                 print(f"[SYNC NOTICE] Synchronization notice on attempt {attempt}: {sync_error}")
                 if attempt == MAX_CONNECTION_ATTEMPTS:
+                    active_connections[login_str] = connection
                     return connection
                 await asyncio.sleep(CONNECTION_RETRY_DELAY)
                 continue
@@ -440,8 +426,8 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
     connection = None
     tracker = MicroMomentumTracker()
 
-    def update_telemetry(connected, sym, bal=0, eq=0, f_margin=0, m_level=0, pnl=0, open_count=0, price_obj=None, conf=0):
-        live_account_telemetry[str(login)] = {
+    def update_telemetry(connected, sym, bal=0, eq=0, f_margin=0, m_level=0, pnl=0, open_count=0, price_obj=None, conf=0, err=None):
+        telemetry_dict = {
             "connected_to_broker": connected,
             "balance": bal,
             "equity": eq,
@@ -454,6 +440,9 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             "symbol_price": price_obj or {},
             "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
+        if err:
+            telemetry_dict["error"] = err
+        live_account_telemetry[str(login)] = telemetry_dict
 
     update_telemetry(False, symbol)
 
@@ -497,7 +486,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 net_floating_profit = equity - balance
                 direction, confidence = tracker.evaluate()
 
-                # Always update live telemetry
                 update_telemetry(
                     connected=broker_connected,
                     sym=active_symbol,
@@ -519,7 +507,6 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                 # 1. INSTANT BASKET PROFIT TRAPPING (VIDEO BEHAVIOR)
                 # ----------------------------------------------------
                 if len(symbol_positions) > 0:
-                    # Basket target reached: flush all positions immediately
                     if net_floating_profit >= profit_target:
                         print(
                             f"[PROFIT TRAPPED] Reached +{net_floating_profit:.2f} USD "
@@ -529,12 +516,9 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         await asyncio.sleep(BURST_SPACING_DELAY)
                         continue
 
-                    # Hard Safety Drawdown Cutoff
+                    # Safety Drawdown Cutoff
                     if balance > 10.0 and net_floating_profit < -(balance * 0.35):
-                        print(
-                            f"[CIRCUIT BREAKER] Drawdown cutoff reached: "
-                            f"-{abs(net_floating_profit):.2f} USD"
-                        )
+                        print(f"[CIRCUIT BREAKER] Cutoff reached (-{abs(net_floating_profit):.2f} USD). Flushing.")
                         await purge_entire_basket_instantly(connection, symbol_positions)
                         await asyncio.sleep(0.5)
                         continue
@@ -567,16 +551,24 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             await asyncio.sleep(POLL_LATENCY_DELAY)
 
     except Exception as error:
-        print(f"[CRITICAL ENGINE ERROR] Failed to run account {login}: {str(error)}")
+        err_msg = str(error)
+        print(f"[CRITICAL ENGINE ERROR] Failed to run account {login}: {err_msg}")
         traceback.print_exc()
-        update_telemetry(False, symbol)
+        update_telemetry(False, symbol, err=err_msg)
 
     finally:
         active_trading_nodes.pop(str(login), None)
         trading_threads.pop(str(login), None)
+        if str(login) in active_connections:
+            try:
+                old_conn = active_connections.pop(str(login), None)
+                if old_conn:
+                    await old_conn.close()
+            except Exception:
+                pass
         if str(login) in live_account_telemetry:
             live_account_telemetry[str(login)]["connected_to_broker"] = False
-        print(f"[ENGINE STOPPED] Worker terminated for: {login}")
+        print(f"[ENGINE STOPPED] Worker terminated cleanly for: {login}")
 
 def launch_async_worker_thread(login, password, server, symbol, key, token=None):
     loop = asyncio.new_event_loop()
@@ -801,7 +793,7 @@ def control_dispatcher():
             return jsonify({
                 "status": "success",
                 "success": True,
-                "message": f"License [{license_key}] Verified. Video-style scalper active on {mt5_symbol}.",
+                "message": f"License [{license_key}] Verified. Scalper active on {mt5_symbol}.",
                 "login": login_str,
                 "symbol": mt5_symbol
             }), 200
