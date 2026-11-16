@@ -7,6 +7,7 @@ import threading
 import datetime
 import traceback
 import functools
+import random
 from collections import deque
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -137,67 +138,79 @@ def get_metaapi_client(override_token: str = None):
     return metaapi_instance
 
 # ============================================================
-# VIDEO-STYLE CAPITAL SCALER (SAME-LOT BATCH BURSTS)
+# HYBRID DYNAMIC VOLUME SPLITTER (GHOST EA VIDEO STYLE)
 # ============================================================
-def calculate_video_dynamic_burst(equity: float, balance: float, confidence_score: int) -> tuple:
+def calculate_hybrid_dynamic_batch(equity: float, balance: float, confidence_score: int) -> tuple:
+    """
+    Hybrid Ghost EA logic:
+    - Determines Total Target Volume based on capital and confidence.
+    - Splits total volume into 5-6 weighted/randomized slices.
+    - Returns (list_of_lots, basket_profit_target).
+    """
     capital = max(equity, balance)
     abs_conf = abs(confidence_score)
 
+    # Base total volume scaling with capital
     if capital < 4.0:
-        count = 2 if abs_conf >= 7 else 1
-        return 0.01, count, 0.35
-
+        total_volume = 0.02 if abs_conf >= 7 else 0.01
+        profit_target = 0.35
     elif capital < 10.0:
-        count = 2 if abs_conf >= 6 else 1
-        lot = 0.02 if abs_conf >= 8 else 0.01
-        return lot, count, 0.60
-
+        total_volume = 0.04 if abs_conf >= 8 else 0.02
+        profit_target = 0.60
     elif capital < 25.0:
-        if abs_conf >= 8:
-            return 0.02, 4, 1.20
-        elif abs_conf >= 5:
-            return 0.01, 3, 0.80
-        else:
-            return 0.01, 2, 0.60
-
+        total_volume = 0.08 if abs_conf >= 8 else 0.05
+        profit_target = 1.20
     elif capital < 70.0:
-        count = 5 if abs_conf >= 7 else 3
-        return 0.02, count, 2.50
-
+        total_volume = 0.15 if abs_conf >= 7 else 0.10
+        profit_target = 2.50
     elif capital < 200.0:
-        count = 6 if abs_conf >= 7 else 4
-        lot = 0.03 if abs_conf >= 8 else 0.02
-        return lot, count, 5.00
-
+        total_volume = 0.25 if abs_conf >= 8 else 0.18
+        profit_target = 5.00
     elif capital < 800.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.10, count, 15.00
-
+        total_volume = 0.60 if abs_conf >= 6 else 0.40
+        profit_target = 15.00
     elif capital < 2000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.20, count, 35.00
-
+        total_volume = 1.20 if abs_conf >= 6 else 0.80
+        profit_target = 35.00
     elif capital < 5000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.30, count, 80.00
-
+        total_volume = 1.80 if abs_conf >= 6 else 1.20
+        profit_target = 80.00
     elif capital < 15000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 0.90, count, 200.00
-
+        total_volume = 5.40 if abs_conf >= 6 else 3.60
+        profit_target = 200.00
     elif capital < 50000.0:
-        count = 6 if abs_conf >= 6 else 4
-        return 2.00, count, 500.00
-
+        total_volume = 12.00 if abs_conf >= 6 else 8.00
+        profit_target = 500.00
     else:
-        count = 8 if abs_conf >= 6 else 5
-        return 3.00, count, 1200.00
+        total_volume = 24.00 if abs_conf >= 6 else 15.00
+        profit_target = 1200.00
+
+    # Split total volume into 5-6 weighted/randomized slices (Ghost EA video style)
+    num_orders = random.choice([5, 6])
+    weights = [random.uniform(0.8, 1.5) for _ in range(num_orders)]
+    total_weight = sum(weights)
+    lots = []
+    remaining = total_volume
+    for i, w in enumerate(weights):
+        if i == num_orders - 1:
+            slice_lot = round(remaining, 2)
+        else:
+            slice_lot = round((w / total_weight) * total_volume, 2)
+            remaining -= slice_lot
+        lots.append(max(slice_lot, 0.01))
+
+    # Ensure last slice absorbs rounding remainder
+    diff = round(total_volume - sum(lots), 2)
+    if diff != 0:
+        lots[-1] = round(lots[-1] + diff, 2)
+
+    return lots, profit_target
 
 # ============================================================
-# BUYER / SELLER MICRO-MOMENTUM TRACKER
+# BUYER / SELLER MICRO-MOMENTUM TRACKER (ZERO-IDLE)
 # ============================================================
 class MicroMomentumTracker:
-    def __init__(self, capacity=20):
+    def __init__(self, capacity=10):
         self.ticks = deque(maxlen=capacity)
         self.candle_open = None
         self.last_minute = None
@@ -218,6 +231,7 @@ class MicroMomentumTracker:
         score = 0
         latest = self.ticks[-1]
 
+        # Short-term impulse (last 3 ticks)
         short_delta = latest - self.ticks[-3]
         if short_delta > 0.05:
             score += 4
@@ -228,6 +242,7 @@ class MicroMomentumTracker:
         elif short_delta < 0:
             score -= 2
 
+        # Full window momentum
         full_delta = latest - self.ticks[0]
         if full_delta > 0.15:
             score += 3
@@ -238,6 +253,7 @@ class MicroMomentumTracker:
         elif full_delta < 0:
             score -= 1
 
+        # Candle open bias
         if self.candle_open is not None:
             candle_delta = latest - self.candle_open
             if candle_delta > 0.10:
@@ -256,17 +272,17 @@ class MicroMomentumTracker:
 # ============================================================
 # PARALLEL BATCH DISPATCH & LIQUIDATION
 # ============================================================
-async def fire_stacked_batch(connection, symbol: str, direction: str, volume: float, count: int, key: str):
+async def fire_hybrid_split_batch(connection, symbol: str, direction: str, lots: list, key: str):
     tasks = []
-    bot_signature = f"SCALPER [{key}]"
+    bot_signature = f"GHOST HYBRID [{key}]"
 
-    print(f"[DISPATCH] Firing {count} concurrent {direction} orders on {symbol} @ {volume} lots...")
+    print(f"[HYBRID DISPATCH] Firing {len(lots)} split orders {direction} on {symbol}: {lots}")
 
-    for _ in range(count):
+    for lot in lots:
         if direction == "BUY":
             tasks.append(connection.create_market_buy_order(
                 symbol=symbol,
-                volume=volume,
+                volume=lot,
                 stop_loss=None,
                 take_profit=None,
                 options={"comment": bot_signature}
@@ -274,7 +290,7 @@ async def fire_stacked_batch(connection, symbol: str, direction: str, volume: fl
         else:
             tasks.append(connection.create_market_sell_order(
                 symbol=symbol,
-                volume=volume,
+                volume=lot,
                 stop_loss=None,
                 take_profit=None,
                 options={"comment": bot_signature}
@@ -283,7 +299,7 @@ async def fire_stacked_batch(connection, symbol: str, direction: str, volume: fl
     results = await asyncio.gather(*tasks, return_exceptions=True)
     successful = sum(1 for result in results if not isinstance(result, Exception))
 
-    print(f"[DISPATCH COMPLETE] {successful}/{count} {direction} orders filled on {symbol}.")
+    print(f"[HYBRID DISPATCH COMPLETE] {successful}/{len(lots)} {direction} orders filled on {symbol}.")
     return successful
 
 async def purge_entire_basket_instantly(connection, positions):
@@ -554,10 +570,10 @@ async def connect_metaapi_account(account, login):
     )
 
 # ============================================================
-# VIDEO-STYLE CORE TRADING ENGINE
+# HYBRID GHOST EA CORE TRADING ENGINE (WITH 35-PIP SPREAD FILTER)
 # ============================================================
 async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
-    print(f"[VIDEO-STYLE ENGINE INITIALIZED] Starting trading loop for {login}...")
+    print(f"[HYBRID GHOST ENGINE INITIALIZED] Starting trading loop for {login}...")
 
     tracker = MicroMomentumTracker()
 
@@ -602,7 +618,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         active_symbol = await resolve_broker_gold_symbol(connection, symbol)
 
         terminal_state = connection.terminal_state
-        print(f"[CORE LIVE] Engine trading active on {active_symbol}!")
+        print(f"[HYBRID LIVE] Engine trading active on {active_symbol}!")
 
         while active_trading_nodes.get(str(login), False):
             try:
@@ -657,13 +673,13 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                     conf=confidence
                 )
 
-                lot_size, burst_count, profit_target = calculate_video_dynamic_burst(
+                lots, profit_target = calculate_hybrid_dynamic_batch(
                     equity,
                     balance,
                     confidence
                 )
 
-                # 1. INSTANT BASKET PROFIT TRAPPING
+                # 1. INSTANT BASKET PROFIT TRAPPING (VIRTUAL, NO BROKER SL/TP)
                 if len(symbol_positions) > 0:
                     if net_floating_profit >= profit_target:
                         print(
@@ -683,22 +699,21 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         await asyncio.sleep(0.5)
                         continue
 
-                # 2. IMMEDIATE NEW BATCH DISPATCH
+                # 2. ZERO-IDLE IMMEDIATE NEW BATCH DISPATCH (WITH 35-PIP SPREAD FILTER)
                 if len(symbol_positions) == 0:
                     current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
 
                     if current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS:
                         print(
-                            f"[IMMEDIATE TRIGGER] Confidence: {confidence} | "
-                            f"Dispatching {burst_count}x {direction} @ {lot_size} lots..."
+                            f"[ZERO-IDLE TRIGGER] Confidence: {confidence} | "
+                            f"Dispatching {len(lots)} split orders {direction}: {lots}"
                         )
 
-                        await fire_stacked_batch(
+                        await fire_hybrid_split_batch(
                             connection,
                             active_symbol,
                             direction,
-                            lot_size,
-                            burst_count,
+                            lots,
                             key
                         )
 
@@ -792,8 +807,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Gold Scalper AI Video-Style Engine",
-        "mode": "Zero-Idle Micro-Momentum Trapping"
+        "service": "Ghost Hybrid Split-Stack Momentum Engine",
+        "mode": "Zero-Idle Micro-Momentum Trapping + 35-Pip Spread Filter"
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -801,7 +816,7 @@ def health_root():
 def health_ping():
     return jsonify({
         "status": "healthy",
-        "service": "Gold Scalper Engine",
+        "service": "Ghost Hybrid Engine",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }), 200
 
@@ -998,8 +1013,8 @@ def control_dispatcher():
                 "status": "success",
                 "success": True,
                 "message": (
-                    f"License [{license_key}] Verified. Video-style scalper active "
-                    f"on {mt5_symbol}."
+                    f"License [{license_key}] Verified. Ghost Hybrid Split-Stack Engine active "
+                    f"on {mt5_symbol} with 35-pip spread protection."
                 ),
                 "login": login_str,
                 "symbol": mt5_symbol
@@ -1025,5 +1040,5 @@ def control_dispatcher():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Running Gold Scalper AI Server on 0.0.0.0:{port}...")
+    print(f"[STARTUP] Running Ghost Hybrid Split-Stack Engine on 0.0.0.0:{port}...")
     serve(app, host="0.0.0.0", port=port, threads=8)
