@@ -46,10 +46,16 @@ trading_threads = {}
 live_account_telemetry = {}
 active_connections = {}
 
-# Fast Execution Parameters
+# ============================================================
+# GOLD-ONLY CONTINUOUS MULTI-POSITION SCALPER SETTINGS
+# ============================================================
 MAX_ALLOWED_SPREAD_PIPS = 35.0
 POLL_LATENCY_DELAY = 0.05
-BURST_SPACING_DELAY = 0.08
+FAST_REENTRY_COOLDOWN_SECONDS = 3.0
+MIN_PRICE_DISTANCE_USD = 0.20
+ADD_POSITION_MOVE_USD = 0.15
+M5_RANGE_LOOKBACK = 20
+M5_REJECTION_BUFFER = 0.50
 
 # Connection Timeouts
 MAX_CONNECTION_ATTEMPTS = 5
@@ -138,76 +144,288 @@ def get_metaapi_client(override_token: str = None):
     return metaapi_instance
 
 # ============================================================
-# HYBRID DYNAMIC VOLUME SPLITTER (GHOST EA VIDEO STYLE)
+# DYNAMIC EQUITY-BASED SCALP PLAN
 # ============================================================
-def calculate_hybrid_dynamic_batch(equity: float, balance: float, confidence_score: int) -> tuple:
+def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_score: int):
     """
-    Hybrid Ghost EA logic:
-    - Determines Total Target Volume based on capital and confidence.
-    - Splits total volume into 5-6 weighted/randomized slices.
-    - Returns (list_of_lots, basket_profit_target).
+    Returns:
+        position_lot
+        max_positions
+        basket_profit_target
+        basket_max_loss
     """
+
     capital = max(equity, balance)
-    abs_conf = abs(confidence_score)
+    score = entry_quality_score
 
-    # Base total volume scaling with capital
+    # ------------------------------------------------------------
+    # UNDER $4: 1-2 POSITIONS, 0.01-0.02 LOT
+    # ------------------------------------------------------------
     if capital < 4.0:
-        total_volume = 0.02 if abs_conf >= 7 else 0.01
-        profit_target = 0.35
-    elif capital < 10.0:
-        total_volume = 0.04 if abs_conf >= 8 else 0.02
-        profit_target = 0.60
-    elif capital < 25.0:
-        total_volume = 0.08 if abs_conf >= 8 else 0.05
-        profit_target = 1.20
-    elif capital < 70.0:
-        total_volume = 0.15 if abs_conf >= 7 else 0.10
-        profit_target = 2.50
-    elif capital < 200.0:
-        total_volume = 0.25 if abs_conf >= 8 else 0.18
-        profit_target = 5.00
-    elif capital < 800.0:
-        total_volume = 0.60 if abs_conf >= 6 else 0.40
-        profit_target = 15.00
-    elif capital < 2000.0:
-        total_volume = 1.20 if abs_conf >= 6 else 0.80
-        profit_target = 35.00
-    elif capital < 5000.0:
-        total_volume = 1.80 if abs_conf >= 6 else 1.20
-        profit_target = 80.00
-    elif capital < 15000.0:
-        total_volume = 5.40 if abs_conf >= 6 else 3.60
-        profit_target = 200.00
-    elif capital < 50000.0:
-        total_volume = 12.00 if abs_conf >= 6 else 8.00
-        profit_target = 500.00
-    else:
-        total_volume = 24.00 if abs_conf >= 6 else 15.00
-        profit_target = 1200.00
 
-    # Split total volume into 5-6 weighted/randomized slices (Ghost EA video style)
-    num_orders = random.choice([5, 6])
-    weights = [random.uniform(0.8, 1.5) for _ in range(num_orders)]
-    total_weight = sum(weights)
-    lots = []
-    remaining = total_volume
-    for i, w in enumerate(weights):
-        if i == num_orders - 1:
-            slice_lot = round(remaining, 2)
+        if score <= 3:
+            position_lot = 0.01
+            max_positions = 1
+        elif score <= 6:
+            position_lot = 0.01 if capital < 3.0 else 0.02
+            max_positions = 1
         else:
-            slice_lot = round((w / total_weight) * total_volume, 2)
-            remaining -= slice_lot
-        lots.append(max(slice_lot, 0.01))
+            position_lot = 0.02
+            max_positions = 2
 
-    # Ensure last slice absorbs rounding remainder
-    diff = round(total_volume - sum(lots), 2)
-    if diff != 0:
-        lots[-1] = round(lots[-1] + diff, 2)
+        return position_lot, max_positions, 0.40, 0.80
 
-    return lots, profit_target
+    # ------------------------------------------------------------
+    # $4-$10: 2-3 POSITIONS, 0.01-0.02 LOT
+    # ------------------------------------------------------------
+    elif capital < 10.0:
+
+        if score <= 3:
+            position_lot = 0.01
+            max_positions = 2
+        elif score <= 6:
+            position_lot = 0.01 if capital < 7.0 else 0.02
+            max_positions = 2
+        else:
+            position_lot = 0.02
+            max_positions = 3
+
+        return position_lot, max_positions, 0.50, 1.00
+
+    # ------------------------------------------------------------
+    # $10-$25: 3-5 POSITIONS, 0.01-0.03 LOT
+    # ------------------------------------------------------------
+    elif capital < 25.0:
+
+        if score <= 3:
+            position_lot = 0.01
+            max_positions = 3
+        elif score <= 6:
+            position_lot = 0.02
+            max_positions = 4
+        else:
+            position_lot = 0.03
+            max_positions = 5
+
+        return position_lot, max_positions, 1.00, 2.00
+
+    # ------------------------------------------------------------
+    # $25-$50: 5-7 POSITIONS, 0.02-0.03 LOT
+    # ------------------------------------------------------------
+    elif capital < 50.0:
+
+        if score <= 3:
+            position_lot = 0.02
+            max_positions = 5
+        elif score <= 6:
+            position_lot = 0.02
+            max_positions = 6
+        else:
+            position_lot = 0.03
+            max_positions = 7
+
+        return position_lot, max_positions, 1.50, 3.00
+
+    # ------------------------------------------------------------
+    # $50-$100: 7-9 POSITIONS, 0.02-0.04 LOT
+    # ------------------------------------------------------------
+    elif capital < 100.0:
+
+        if score <= 3:
+            position_lot = 0.02
+            max_positions = 7
+        elif score <= 6:
+            position_lot = 0.03
+            max_positions = 8
+        else:
+            position_lot = 0.04
+            max_positions = 9
+
+        return position_lot, max_positions, 2.00, 4.00
+
+    # ------------------------------------------------------------
+    # $100-$250: 9-12 POSITIONS, 0.02-0.05 LOT
+    # ------------------------------------------------------------
+    elif capital < 250.0:
+
+        if score <= 3:
+            position_lot = 0.02
+            max_positions = 9
+        elif score <= 6:
+            position_lot = 0.03 if capital < 180 else 0.04
+            max_positions = 10
+        else:
+            position_lot = 0.05
+            max_positions = 12
+
+        return position_lot, max_positions, 3.00, 6.00
+
+    # ------------------------------------------------------------
+    # $250-$500: 12-14 POSITIONS, 0.03-0.06 LOT
+    # ------------------------------------------------------------
+    elif capital < 500.0:
+
+        if score <= 3:
+            position_lot = 0.03
+            max_positions = 12
+        elif score <= 6:
+            position_lot = 0.04 if capital < 380 else 0.05
+            max_positions = 13
+        else:
+            position_lot = 0.06
+            max_positions = 14
+
+        return position_lot, max_positions, 5.00, 10.00
+
+    # ------------------------------------------------------------
+    # $500-$1,000: 14-16 POSITIONS, 0.04-0.08 LOT
+    # ------------------------------------------------------------
+    elif capital < 1000.0:
+
+        if score <= 3:
+            position_lot = 0.04
+            max_positions = 14
+        elif score <= 6:
+            position_lot = 0.05 if capital < 750 else 0.06
+            max_positions = 15
+        else:
+            position_lot = 0.08
+            max_positions = 16
+
+        return position_lot, max_positions, 8.00, 16.00
+
+    # ------------------------------------------------------------
+    # $1,000-$2,000: 16-18 POSITIONS, 0.05-0.10 LOT
+    # ------------------------------------------------------------
+    elif capital < 2000.0:
+
+        if score <= 3:
+            position_lot = 0.05
+            max_positions = 16
+        elif score <= 6:
+            position_lot = 0.07 if capital < 1500 else 0.08
+            max_positions = 17
+        else:
+            position_lot = 0.10
+            max_positions = 18
+
+        return position_lot, max_positions, 12.00, 24.00
+
+    # ------------------------------------------------------------
+    # $2,000-$5,000: 18 POSITIONS, 0.08-0.15 LOT
+    # ------------------------------------------------------------
+    elif capital < 5000.0:
+
+        if score <= 3:
+            position_lot = 0.08
+            max_positions = 18
+        elif score <= 6:
+            position_lot = 0.10 if capital < 3500 else 0.12
+            max_positions = 18
+        else:
+            position_lot = 0.15
+            max_positions = 18
+
+        return position_lot, max_positions, 18.00, 36.00
+
+    # ------------------------------------------------------------
+    # $5,000-$10,000: 18 POSITIONS, 0.10-0.20 LOT
+    # ------------------------------------------------------------
+    elif capital < 10000.0:
+
+        if score <= 3:
+            position_lot = 0.10
+            max_positions = 18
+        elif score <= 6:
+            position_lot = 0.15
+            max_positions = 18
+        else:
+            position_lot = 0.20
+            max_positions = 18
+
+        return position_lot, max_positions, 30.00, 60.00
+
+    # ------------------------------------------------------------
+    # ABOVE $10,000: 18 POSITIONS, 0.15-0.30 LOT
+    # ------------------------------------------------------------
+    else:
+
+        if score <= 3:
+            position_lot = 0.15
+            max_positions = 18
+        elif score <= 6:
+            position_lot = 0.20 if capital < 20000 else 0.25
+            max_positions = 18
+        else:
+            position_lot = 0.30
+            max_positions = 18
+
+        return position_lot, max_positions, 45.00, 90.00
 
 # ============================================================
-# BUYER / SELLER MICRO-MOMENTUM TRACKER (ZERO-IDLE)
+# ENTRY-QUALITY SCORER
+# ============================================================
+def calculate_entry_quality_score(
+    tick_direction,
+    tick_confidence,
+    m5_signal,
+    momentum_continuation,
+    pullback_continuation,
+    breakout_confirmed,
+    current_spread_pips,
+    price_distance
+):
+    """
+    The original tick-momentum logic is the ONLY entry trigger.
+    These signals only score the quality of that original entry.
+    """
+
+    score = 0
+
+    # Original tick momentum trigger
+    if tick_direction in ["BUY", "SELL"]:
+        score += 2
+
+    # Tick confidence
+    if abs(tick_confidence) >= 8:
+        score += 2
+    elif abs(tick_confidence) >= 6:
+        score += 1
+
+    # M5 reversal confirmation
+    if m5_signal == tick_direction:
+        score += 3
+    elif m5_signal in ["BUY", "SELL"]:
+        score += 1
+    elif m5_signal and m5_signal != tick_direction:
+        score -= 2
+
+    # Momentum continuation confirmation
+    if momentum_continuation:
+        score += 2
+
+    # Pullback continuation confirmation
+    if pullback_continuation:
+        score += 2
+
+    # Breakout confirmation
+    if breakout_confirmed:
+        score += 2
+
+    # Spread quality
+    if current_spread_pips <= 20:
+        score += 2
+    elif current_spread_pips <= 30:
+        score += 1
+
+    # Distance from last basket
+    if price_distance >= 0.50:
+        score += 1
+
+    return max(0, min(score, 10))
+
+# ============================================================
+# BUYER / SELLER MICRO-MOMENTUM TRACKER
 # ============================================================
 class MicroMomentumTracker:
     def __init__(self, capacity=10):
@@ -231,8 +449,8 @@ class MicroMomentumTracker:
         score = 0
         latest = self.ticks[-1]
 
-        # Short-term impulse (last 3 ticks)
         short_delta = latest - self.ticks[-3]
+
         if short_delta > 0.05:
             score += 4
         elif short_delta < -0.05:
@@ -242,8 +460,8 @@ class MicroMomentumTracker:
         elif short_delta < 0:
             score -= 2
 
-        # Full window momentum
         full_delta = latest - self.ticks[0]
+
         if full_delta > 0.15:
             score += 3
         elif full_delta < -0.15:
@@ -253,9 +471,9 @@ class MicroMomentumTracker:
         elif full_delta < 0:
             score -= 1
 
-        # Candle open bias
         if self.candle_open is not None:
             candle_delta = latest - self.candle_open
+
             if candle_delta > 0.10:
                 score += 3
             elif candle_delta < -0.10:
@@ -267,65 +485,276 @@ class MicroMomentumTracker:
 
         score = max(-10, min(10, score))
         direction = "BUY" if score >= 0 else "SELL"
+
         return direction, score
 
 # ============================================================
-# PARALLEL BATCH DISPATCH & LIQUIDATION
+# M5 REVERSAL SIGNAL
 # ============================================================
-async def fire_hybrid_split_batch(connection, symbol: str, direction: str, lots: list, key: str):
-    tasks = []
-    bot_signature = f"GHOST HYBRID [{key}]"
+async def get_m5_reversal_signal(account, connection, symbol):
+    """
+    Returns:
+        BUY  -> bullish rejection near range low
+        SELL -> bearish rejection near range high
+        None -> no valid M5 reversal setup
+    """
 
-    print(f"[HYBRID DISPATCH] Firing {len(lots)} split orders {direction} on {symbol}: {lots}")
+    try:
+        candles = await account.get_historical_candles(
+            symbol=symbol,
+            timeframe="5m",
+            start_time=datetime.datetime.now(datetime.timezone.utc),
+            limit=25
+        )
 
-    for lot in lots:
-        if direction == "BUY":
-            tasks.append(connection.create_market_buy_order(
-                symbol=symbol,
-                volume=lot,
-                stop_loss=None,
-                take_profit=None,
-                options={"comment": bot_signature}
-            ))
-        else:
-            tasks.append(connection.create_market_sell_order(
-                symbol=symbol,
-                volume=lot,
-                stop_loss=None,
-                take_profit=None,
-                options={"comment": bot_signature}
-            ))
+        if not candles:
+            return None
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    successful = sum(1 for result in results if not isinstance(result, Exception))
+        highs = []
+        lows = []
+        opens = []
+        closes = []
 
-    print(f"[HYBRID DISPATCH COMPLETE] {successful}/{len(lots)} {direction} orders filled on {symbol}.")
-    return successful
+        for candle in candles:
+            highs.append(float(candle.get("high", 0) or 0))
+            lows.append(float(candle.get("low", 0) or 0))
+            opens.append(float(candle.get("open", 0) or 0))
+            closes.append(float(candle.get("close", 0) or 0))
 
-async def purge_entire_basket_instantly(connection, positions):
+        if len(closes) < M5_RANGE_LOOKBACK:
+            return None
+
+        recent_highs = highs[-M5_RANGE_LOOKBACK:]
+        recent_lows = lows[-M5_RANGE_LOOKBACK:]
+
+        range_high = max(recent_highs)
+        range_low = min(recent_lows)
+
+        last_open = opens[-1]
+        last_high = highs[-1]
+        last_low = lows[-1]
+        last_close = closes[-1]
+
+        body = abs(last_close - last_open)
+        upper_wick = last_high - max(last_open, last_close)
+        lower_wick = min(last_open, last_close) - last_low
+
+        if last_high >= range_high - M5_REJECTION_BUFFER and upper_wick > body:
+            return "SELL"
+
+        if last_low <= range_low + M5_REJECTION_BUFFER and lower_wick > body:
+            return "BUY"
+
+        return None
+
+    except Exception as error:
+        print(f"[M5 SIGNAL ERROR] {error}")
+        return None
+
+# ============================================================
+# MOMENTUM / PULLBACK / BREAKOUT DETECTORS
+# ============================================================
+def detect_momentum_continuation(tracker, direction):
+    ticks = list(tracker.ticks)
+
+    if len(ticks) < 5:
+        return False
+
+    latest = ticks[-1]
+
+    if direction == "BUY":
+        recent_high = max(ticks[-5:-1])
+        return latest > recent_high
+
+    elif direction == "SELL":
+        recent_low = min(ticks[-5:-1])
+        return latest < recent_low
+
+    return False
+
+def detect_pullback_continuation(tracker, direction):
+    ticks = list(tracker.ticks)
+
+    if len(ticks) < 6:
+        return False
+
+    latest = ticks[-1]
+    previous = ticks[-2]
+    pullback_low = min(ticks[-6:-1])
+    pullback_high = max(ticks[-6:-1])
+
+    if direction == "BUY":
+        return previous < latest and previous > pullback_low and latest > pullback_low
+
+    elif direction == "SELL":
+        return previous > latest and previous < pullback_high and latest < pullback_high
+
+    return False
+
+def detect_breakout(tracker, direction):
+    ticks = list(tracker.ticks)
+
+    if len(ticks) < 10:
+        return False
+
+    latest = ticks[-1]
+    recent_high = max(ticks[:-1])
+    recent_low = min(ticks[:-1])
+
+    if direction == "BUY":
+        return latest > recent_high
+
+    elif direction == "SELL":
+        return latest < recent_low
+
+    return False
+
+# ============================================================
+# ORDER EXECUTION
+# ============================================================
+async def open_first_scalp_position(
+    connection,
+    symbol,
+    direction,
+    volume,
+    key,
+    specification=None
+):
+    volume = normalize_lot_size(
+        volume,
+        specification
+    )
+
+    bot_signature = f"GHOST-CONTINUOUS [{key}]"
+
+    if direction == "BUY":
+        result = await connection.create_market_buy_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=None,
+            take_profit=None,
+            options={"comment": bot_signature}
+        )
+
+    else:
+        result = await connection.create_market_sell_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=None,
+            take_profit=None,
+            options={"comment": bot_signature}
+        )
+
+    print(
+        f"[FIRST POSITION OPENED] {direction} {volume} lots | "
+        f"{symbol} | Entry quality engine active"
+    )
+
+    return result
+
+async def add_scalp_position(
+    connection,
+    symbol,
+    direction,
+    volume,
+    key,
+    position_number,
+    specification=None
+):
+    volume = normalize_lot_size(
+        volume,
+        specification
+    )
+
+    bot_signature = f"GHOST-CONTINUOUS-{position_number} [{key}]"
+
+    if direction == "BUY":
+        result = await connection.create_market_buy_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=None,
+            take_profit=None,
+            options={"comment": bot_signature}
+        )
+
+    else:
+        result = await connection.create_market_sell_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=None,
+            take_profit=None,
+            options={"comment": bot_signature}
+        )
+
+    print(
+        f"[POSITION ADDED] {direction} {volume} lots | "
+        f"{symbol} | Position {position_number}"
+    )
+
+    return result
+
+async def close_basket(connection, basket_positions):
     close_tasks = [
         connection.close_position(position["id"])
-        for position in positions
-        if "id" in position
+        for position in basket_positions
+        if position.get("id")
     ]
 
-    if close_tasks:
-        results = await asyncio.gather(*close_tasks, return_exceptions=True)
-        successful = sum(1 for result in results if not isinstance(result, Exception))
-        print(f"[LIQUIDATOR] Liquidated {successful}/{len(close_tasks)} positions.")
+    if not close_tasks:
+        print("[BASKET CLOSE] No positions to close.")
+        return 0
+
+    results = await asyncio.gather(*close_tasks, return_exceptions=True)
+
+    closed_count = sum(
+        1 for result in results
+        if not isinstance(result, Exception)
+    )
+
+    print(
+        f"[BASKET CLOSED] {closed_count}/{len(close_tasks)} positions closed."
+    )
+
+    return closed_count
 
 # ============================================================
-# EXNESS SYMBOL RESOLVER
+# LOT-SIZE NORMALIZATION
 # ============================================================
-async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
-    candidates = [
-        requested_symbol,
-        "XAUUSDm",
-        "XAUUSD",
-        "XAUUSDc",
-        "XAUUSDr",
-        "GOLD"
-    ]
+def normalize_lot_size(lot, specification):
+    if not specification:
+        return round(lot, 2)
+
+    min_volume = float(specification.get("minVolume", 0.01) or 0.01)
+    volume_step = float(specification.get("volumeStep", 0.01) or 0.01)
+    max_volume = float(specification.get("maxVolume", 100.0) or 100.0)
+
+    if lot < min_volume:
+        lot = min_volume
+
+    steps = round(lot / volume_step)
+    lot = steps * volume_step
+
+    if lot > max_volume:
+        lot = max_volume
+
+    return round(lot, 2)
+
+# ============================================================
+# GOLD SYMBOL RESOLVER
+# ============================================================
+GOLD_SYMBOL_CANDIDATES = [
+    "XAUUSD",
+    "XAUUSDm",
+    "XAUUSD.r",
+    "XAUUSDc",
+    "XAUUSDr",
+    "XAU/USD",
+    "GOLD",
+    "GOLDm"
+]
+
+async def resolve_broker_gold_symbol(connection, requested_symbol):
+    candidates = [requested_symbol] + GOLD_SYMBOL_CANDIDATES
 
     seen = set()
     filtered_candidates = []
@@ -335,22 +764,59 @@ async def resolve_broker_gold_symbol(connection, requested_symbol: str) -> str:
             seen.add(symbol)
             filtered_candidates.append(symbol)
 
+    available_symbols = set(await connection.get_symbols())
+
     for symbol in filtered_candidates:
-        try:
-            await connection.subscribe_to_market_data(symbol)
-            await asyncio.sleep(0.15)
-
-            price = connection.terminal_state.price(symbol)
-
-            if price and (price.get("ask") or price.get("bid")):
-                print(f"[SYMBOL VERIFIED] Using verified symbol: '{symbol}'")
-                return symbol
-
-        except Exception:
+        if symbol not in available_symbols:
             continue
 
+        validated = await validate_gold_symbol(connection, symbol)
+
+        if validated:
+            print(f"[GOLD SYMBOL RESOLVED] Using: {validated}")
+            return validated
+
+    for symbol in available_symbols:
+        symbol_upper = symbol.upper()
+
+        if "XAUUSD" in symbol_upper or symbol_upper in ["GOLD", "GOLDM"]:
+            validated = await validate_gold_symbol(connection, symbol)
+
+            if validated:
+                print(f"[GOLD SYMBOL RESOLVED] Using: {validated}")
+                return validated
+
     await connection.subscribe_to_market_data(requested_symbol)
+    print(f"[GOLD SYMBOL FALLBACK] Using requested symbol: {requested_symbol}")
+
     return requested_symbol
+
+async def validate_gold_symbol(connection, symbol):
+    try:
+        specification = await connection.get_symbol_specification(symbol)
+
+        if not specification:
+            return None
+
+        symbol_upper = symbol.upper()
+        description = str(specification.get("description", "")).upper()
+
+        is_gold = (
+            "XAU" in symbol_upper
+            or "GOLD" in symbol_upper
+            or "GOLD" in description
+        )
+
+        is_tradable = specification.get("tradeMode") != "SYMBOL_TRADE_MODE_DISABLED"
+
+        if is_gold and is_tradable:
+            return symbol
+
+        return None
+
+    except Exception as error:
+        print(f"[GOLD SYMBOL VALIDATION ERROR] {symbol}: {error}")
+        return None
 
 # ============================================================
 # SAFE METAAPI ACCOUNT RETRIEVAL
@@ -376,6 +842,7 @@ async def get_existing_metaapi_accounts(api):
 
     except AttributeError:
         print("[SDK COMPATIBILITY] Falling back to legacy get_accounts()...")
+
         try:
             accounts = await api.metatrader_account_api.get_accounts()
 
@@ -383,6 +850,7 @@ async def get_existing_metaapi_accounts(api):
                 return accounts.get("items", [])
 
             return accounts or []
+
         except Exception as legacy_error:
             print(f"[LEGACY ACCOUNT SEARCH NOTICE] {legacy_error}")
             return []
@@ -427,7 +895,6 @@ async def get_or_create_metaapi_account(api, login, password, server):
             f"for login {login_str}."
         )
 
-        # 1. Reuse an already deployed account
         for account in matching_accounts:
             state = str(account_value(account, "state", "")).upper()
 
@@ -436,16 +903,26 @@ async def get_or_create_metaapi_account(api, login, password, server):
                 print(f"[ACCOUNT BOUND] Reusing deployed MetaApi node: {account_id}")
                 return account
 
-        # 2. Deploy one existing matching account
         for account in matching_accounts:
             account_id = account_value(account, "id", "")
             state = str(account_value(account, "state", "")).upper()
 
-            print(f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: {account_id} ({state})")
+            print(
+                f"[ACCOUNT DEPLOYING] Deploying existing MetaApi account: "
+                f"{account_id} ({state})"
+            )
 
             try:
-                await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-                await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
+                await asyncio.wait_for(
+                    account.deploy(),
+                    timeout=DEPLOY_TIMEOUT_SECONDS
+                )
+
+                await asyncio.wait_for(
+                    account.wait_deployed(),
+                    timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+                )
+
             except Exception as deploy_error:
                 error_text = str(deploy_error)
 
@@ -468,8 +945,10 @@ async def get_or_create_metaapi_account(api, login, password, server):
 
         print(f"[ACCOUNT SEARCH NOTICE] {error_text}")
 
-    # 3. Create a new account only if none exists
-    print(f"[ACCOUNT CREATE] No matching account found. Creating MetaApi account for {login_str}...")
+    print(
+        f"[ACCOUNT CREATE] No matching account found. "
+        f"Creating MetaApi account for {login_str}..."
+    )
 
     try:
         new_account = await api.metatrader_account_api.create_account({
@@ -484,8 +963,16 @@ async def get_or_create_metaapi_account(api, login, password, server):
         })
 
         try:
-            await asyncio.wait_for(new_account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-            await asyncio.wait_for(new_account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                new_account.deploy(),
+                timeout=DEPLOY_TIMEOUT_SECONDS
+            )
+
+            await asyncio.wait_for(
+                new_account.wait_deployed(),
+                timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+            )
+
         except Exception as deploy_error:
             error_text = str(deploy_error)
 
@@ -517,14 +1004,25 @@ async def connect_metaapi_account(account, login):
 
     for attempt in range(1, MAX_CONNECTION_ATTEMPTS + 1):
         try:
-            print(f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] Connecting MT5 account {login}...")
+            print(
+                f"[CONNECTION ATTEMPT {attempt}/{MAX_CONNECTION_ATTEMPTS}] "
+                f"Connecting MT5 account {login}..."
+            )
 
             state = str(account_value(account, "state", "")).upper()
 
             if state != "DEPLOYED":
                 try:
-                    await asyncio.wait_for(account.deploy(), timeout=DEPLOY_TIMEOUT_SECONDS)
-                    await asyncio.wait_for(account.wait_deployed(), timeout=DEPLOY_WAIT_TIMEOUT_SECONDS)
+                    await asyncio.wait_for(
+                        account.deploy(),
+                        timeout=DEPLOY_TIMEOUT_SECONDS
+                    )
+
+                    await asyncio.wait_for(
+                        account.wait_deployed(),
+                        timeout=DEPLOY_WAIT_TIMEOUT_SECONDS
+                    )
+
                 except Exception as deploy_error:
                     error_text = str(deploy_error)
 
@@ -536,21 +1034,32 @@ async def connect_metaapi_account(account, login):
 
                     print(f"[DEPLOY WARNING] {error_text}")
 
-            await asyncio.wait_for(account.wait_connected(), timeout=BROKER_CONNECT_TIMEOUT_SECONDS)
+            await asyncio.wait_for(
+                account.wait_connected(),
+                timeout=BROKER_CONNECT_TIMEOUT_SECONDS
+            )
 
             connection = account.get_streaming_connection()
-            await asyncio.wait_for(connection.connect(), timeout=STREAM_CONNECT_TIMEOUT_SECONDS)
+
+            await asyncio.wait_for(
+                connection.connect(),
+                timeout=STREAM_CONNECT_TIMEOUT_SECONDS
+            )
 
             try:
                 await asyncio.wait_for(
                     connection.wait_synchronized(),
                     timeout=SYNC_TIMEOUT_SECONDS
                 )
+
                 print(f"[CORE LIVE & SYNCHRONIZED] Connected account: {login}")
                 return connection
 
             except Exception as sync_error:
-                print(f"[SYNC NOTICE] Synchronization notice on attempt {attempt}: {sync_error}")
+                print(
+                    f"[SYNC NOTICE] Synchronization notice on attempt {attempt}: "
+                    f"{sync_error}"
+                )
 
                 if attempt == MAX_CONNECTION_ATTEMPTS:
                     return connection
@@ -560,22 +1069,39 @@ async def connect_metaapi_account(account, login):
 
         except Exception as error:
             last_error = error
-            print(f"[CONNECTION FAILED] Attempt {attempt}/{MAX_CONNECTION_ATTEMPTS}: {error}")
+            print(
+                f"[CONNECTION FAILED] Attempt {attempt}/{MAX_CONNECTION_ATTEMPTS}: "
+                f"{error}"
+            )
 
             if attempt < MAX_CONNECTION_ATTEMPTS:
                 await asyncio.sleep(CONNECTION_RETRY_DELAY)
 
     raise Exception(
-        f"Failed to connect MetaApi account {login} after {MAX_CONNECTION_ATTEMPTS} attempts: {last_error}"
+        f"Failed to connect MetaApi account {login} after "
+        f"{MAX_CONNECTION_ATTEMPTS} attempts: {last_error}"
     )
 
 # ============================================================
-# HYBRID GHOST EA CORE TRADING ENGINE (WITH 35-PIP SPREAD FILTER)
+# GOLD-ONLY CONTINUOUS MULTI-POSITION ENGINE
 # ============================================================
-async def high_frequency_trading_engine(login, password, server, symbol, key, token=None):
-    print(f"[HYBRID GHOST ENGINE INITIALIZED] Starting trading loop for {login}...")
+async def high_frequency_trading_engine(
+    login,
+    password,
+    server,
+    symbol,
+    key,
+    token=None
+):
+    print(
+        f"[GOLD CONTINUOUS ENGINE INITIALIZED] Starting trading loop for {login}..."
+    )
 
     tracker = MicroMomentumTracker()
+
+    last_batch_entry_price = 0.0
+    last_batch_close_time = 0.0
+    last_batch_direction = None
 
     def update_telemetry(
         connected,
@@ -588,6 +1114,8 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         open_count=0,
         price_obj=None,
         conf=0,
+        entry_score=0,
+        entry_type="WAITING",
         err=None
     ):
         telemetry = {
@@ -600,6 +1128,8 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
             "open_positions_count": open_count,
             "active_symbol": sym,
             "confidence_score": conf,
+            "entry_quality_score": entry_score,
+            "entry_type": entry_type,
             "symbol_price": price_obj or {},
             "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }
@@ -615,10 +1145,19 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         api = get_metaapi_client(token)
         account = await get_or_create_metaapi_account(api, login, password, server)
         connection = await connect_metaapi_account(account, login)
+
         active_symbol = await resolve_broker_gold_symbol(connection, symbol)
 
+        specification = await connection.get_symbol_specification(active_symbol)
+
+        await connection.subscribe_to_market_data(active_symbol)
+
         terminal_state = connection.terminal_state
-        print(f"[HYBRID LIVE] Engine trading active on {active_symbol}!")
+
+        print(
+            f"[GOLD ENGINE LIVE] Trading {active_symbol} | "
+            f"Continuous multi-position scalping enabled"
+        )
 
         while active_trading_nodes.get(str(login), False):
             try:
@@ -634,6 +1173,7 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
                 if not price or not price.get("bid"):
                     await connection.subscribe_to_market_data(active_symbol)
+
                     update_telemetry(
                         broker_connected,
                         active_symbol,
@@ -642,23 +1182,85 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                         free_margin,
                         margin_level
                     )
+
                     await asyncio.sleep(0.1)
                     continue
 
                 current_ask = float(price.get("ask", 0) or 0)
                 current_bid = float(price.get("bid", 0) or 0)
-                mid_price = (current_ask + current_bid) / 2.0
+                current_price = (current_ask + current_bid) / 2.0
 
-                tracker.record_tick(mid_price)
+                tracker.record_tick(current_price)
 
                 positions = terminal_state.positions or []
-                symbol_positions = [
+
+                basket_positions = [
                     position for position in positions
                     if position.get("symbol") == active_symbol
                 ]
 
-                net_floating_profit = equity - balance
+                open_position_count = len(basket_positions)
+
+                basket_profit = 0.0
+
+                for position in basket_positions:
+                    basket_profit += float(position.get("profit", 0) or 0)
+
+                basket_profit = round(basket_profit, 2)
+
                 direction, confidence = tracker.evaluate()
+
+                current_spread_pips = round(
+                    (current_ask - current_bid) / 0.1,
+                    2
+                )
+
+                price_distance = abs(current_price - last_batch_entry_price)
+
+                m5_signal = await get_m5_reversal_signal(
+                    account,
+                    connection,
+                    active_symbol
+                )
+
+                momentum_continuation = detect_momentum_continuation(
+                    tracker,
+                    direction
+                )
+
+                pullback_continuation = detect_pullback_continuation(
+                    tracker,
+                    direction
+                )
+
+                breakout_confirmed = detect_breakout(
+                    tracker,
+                    direction
+                )
+
+                entry_quality_score = calculate_entry_quality_score(
+                    direction,
+                    confidence,
+                    m5_signal,
+                    momentum_continuation,
+                    pullback_continuation,
+                    breakout_confirmed,
+                    current_spread_pips,
+                    price_distance
+                )
+
+                position_lot, max_positions, basket_profit_target, basket_max_loss = calculate_dynamic_scalp_plan(
+                    equity,
+                    balance,
+                    entry_quality_score
+                )
+
+                if entry_quality_score >= 7:
+                    entry_type = "STRONG"
+                elif entry_quality_score >= 4:
+                    entry_type = "NORMAL"
+                else:
+                    entry_type = "WEAK"
 
                 update_telemetry(
                     connected=broker_connected,
@@ -667,57 +1269,143 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
                     eq=equity,
                     f_margin=free_margin,
                     m_level=margin_level,
-                    pnl=net_floating_profit,
-                    open_count=len(symbol_positions),
-                    price_obj={"ask": current_ask, "bid": current_bid},
-                    conf=confidence
+                    pnl=basket_profit,
+                    open_count=open_position_count,
+                    price_obj={
+                        "ask": current_ask,
+                        "bid": current_bid
+                    },
+                    conf=confidence,
+                    entry_score=entry_quality_score,
+                    entry_type=entry_type
                 )
 
-                lots, profit_target = calculate_hybrid_dynamic_batch(
-                    equity,
-                    balance,
-                    confidence
-                )
+                # ====================================================
+                # 1. CLOSE WHOLE BASKET AT PROFIT TARGET
+                # ====================================================
+                if open_position_count > 0:
 
-                # 1. INSTANT BASKET PROFIT TRAPPING (VIRTUAL, NO BROKER SL/TP)
-                if len(symbol_positions) > 0:
-                    if net_floating_profit >= profit_target:
+                    if basket_profit >= basket_profit_target:
+
                         print(
-                            f"[PROFIT TRAPPED] Reached +{net_floating_profit:.2f} USD "
-                            f"(Target: {profit_target:.2f} USD). Liquidating basket!"
+                            f"[BASKET PROFIT TARGET REACHED] "
+                            f"+{basket_profit:.2f} USD | "
+                            f"Target: +{basket_profit_target:.2f} USD | "
+                            f"Closing all {open_position_count} positions"
                         )
-                        await purge_entire_basket_instantly(connection, symbol_positions)
-                        await asyncio.sleep(BURST_SPACING_DELAY)
+
+                        await close_basket(
+                            connection,
+                            basket_positions
+                        )
+
+                        last_batch_close_time = time.time()
+                        last_batch_direction = None
+
+                        await asyncio.sleep(FAST_REENTRY_COOLDOWN_SECONDS)
                         continue
 
-                    if balance > 10.0 and net_floating_profit < -(balance * 0.35):
+                    # ================================================
+                    # 2. CLOSE WHOLE BASKET AT LOSS CUTOFF
+                    # ================================================
+                    if basket_profit <= -basket_max_loss:
+
                         print(
-                            f"[CIRCUIT BREAKER] Drawdown cutoff reached: "
-                            f"-{abs(net_floating_profit):.2f} USD"
+                            f"[BASKET LOSS CUTOFF REACHED] "
+                            f"-{abs(basket_profit):.2f} USD | "
+                            f"Limit: -{basket_max_loss:.2f} USD | "
+                            f"Closing all {open_position_count} positions"
                         )
-                        await purge_entire_basket_instantly(connection, symbol_positions)
-                        await asyncio.sleep(0.5)
+
+                        await close_basket(
+                            connection,
+                            basket_positions
+                        )
+
+                        last_batch_close_time = time.time()
+                        last_batch_direction = None
+
+                        await asyncio.sleep(FAST_REENTRY_COOLDOWN_SECONDS)
                         continue
 
-                # 2. ZERO-IDLE IMMEDIATE NEW BATCH DISPATCH (WITH 35-PIP SPREAD FILTER)
-                if len(symbol_positions) == 0:
-                    current_spread_pips = round((current_ask - current_bid) / 0.1, 2)
+                    # ================================================
+                    # 3. ADD POSITIONS ONLY WHILE BASKET IS PROFITABLE
+                    # ================================================
+                    if open_position_count < max_positions:
 
-                    if current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS:
-                        print(
-                            f"[ZERO-IDLE TRIGGER] Confidence: {confidence} | "
-                            f"Dispatching {len(lots)} split orders {direction}: {lots}"
+                        if last_batch_direction == "BUY":
+                            price_progress = current_price - last_batch_entry_price
+
+                        elif last_batch_direction == "SELL":
+                            price_progress = last_batch_entry_price - current_price
+
+                        else:
+                            price_progress = 0
+
+                        can_add_position = (
+                            basket_profit > 0
+                            and price_progress >= ADD_POSITION_MOVE_USD
+                            and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
+                            and free_margin > 0
                         )
 
-                        await fire_hybrid_split_batch(
+                        if can_add_position:
+
+                            await add_scalp_position(
+                                connection,
+                                active_symbol,
+                                last_batch_direction,
+                                position_lot,
+                                key,
+                                open_position_count + 1,
+                                specification
+                            )
+
+                            last_batch_entry_price = current_price
+
+                            await asyncio.sleep(0.2)
+                            continue
+
+                # ================================================
+                # 4. ORIGINAL TICK-MOMENTUM ENTRY TRIGGER
+                # ================================================
+                if open_position_count == 0:
+
+                    time_since_last_entry = time.time() - last_batch_close_time
+
+                    pre_entry_conditions_pass = (
+                        broker_connected
+                        and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
+                        and free_margin > 0
+                        and time_since_last_entry >= FAST_REENTRY_COOLDOWN_SECONDS
+                        and price_distance >= MIN_PRICE_DISTANCE_USD
+                    )
+
+                    if pre_entry_conditions_pass and direction in ["BUY", "SELL"]:
+
+                        print(
+                            f"[ORIGINAL TICK ENTRY] {direction} | "
+                            f"Confidence: {confidence} | "
+                            f"Entry score: {entry_quality_score} | "
+                            f"Entry type: {entry_type} | "
+                            f"Lot: {position_lot} | "
+                            f"Max positions: {max_positions}"
+                        )
+
+                        await open_first_scalp_position(
                             connection,
                             active_symbol,
                             direction,
-                            lots,
-                            key
+                            position_lot,
+                            key,
+                            specification
                         )
 
-                        await asyncio.sleep(BURST_SPACING_DELAY)
+                        last_batch_entry_price = current_price
+                        last_batch_close_time = time.time()
+                        last_batch_direction = direction
+
+                        await asyncio.sleep(0.2)
                         continue
 
             except Exception as loop_error:
@@ -728,7 +1416,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
 
     except Exception as error:
         error_text = str(error)
-        print(f"[CRITICAL ENGINE ERROR] Failed to run account {login}: {error_text}")
+        print(
+            f"[CRITICAL ENGINE ERROR] Failed to run account {login}: "
+            f"{error_text}"
+        )
         traceback.print_exc()
         update_telemetry(False, symbol, err=error_text)
 
@@ -739,8 +1430,10 @@ async def high_frequency_trading_engine(login, password, server, symbol, key, to
         if str(login) in active_connections:
             try:
                 old_connection = active_connections.pop(str(login), None)
+
                 if old_connection:
                     await old_connection.close()
+
             except Exception:
                 pass
 
@@ -764,8 +1457,10 @@ def launch_async_worker_thread(login, password, server, symbol, key, token=None)
                 token
             )
         )
+
     except Exception as error:
         print(f"[THREAD ERROR] {error}")
+
     finally:
         try:
             loop.close()
@@ -807,8 +1502,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Ghost Hybrid Split-Stack Momentum Engine",
-        "mode": "Zero-Idle Micro-Momentum Trapping + 35-Pip Spread Filter"
+        "service": "Ghost Continuous Gold Multi-Position Scalper",
+        "mode": "Original Tick-Momentum Entry + Quality Scoring + Dynamic Basket Sizing"
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -816,7 +1511,7 @@ def health_root():
 def health_ping():
     return jsonify({
         "status": "healthy",
-        "service": "Ghost Hybrid Engine",
+        "service": "Ghost Continuous Gold Engine",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }), 200
 
@@ -858,6 +1553,7 @@ def status_endpoint():
 @app.route("/api/connection-status", methods=["GET", "OPTIONS"])
 def connection_status_endpoint():
     login = request.args.get("mt5_login", "").strip()
+
     return jsonify(
         live_account_telemetry.get(
             login,
@@ -1013,8 +1709,8 @@ def control_dispatcher():
                 "status": "success",
                 "success": True,
                 "message": (
-                    f"License [{license_key}] Verified. Ghost Hybrid Split-Stack Engine active "
-                    f"on {mt5_symbol} with 35-pip spread protection."
+                    f"License [{license_key}] Verified. Continuous Gold Multi-Position "
+                    f"Scalper active on {mt5_symbol}."
                 ),
                 "login": login_str,
                 "symbol": mt5_symbol
@@ -1040,5 +1736,8 @@ def control_dispatcher():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    print(f"[STARTUP] Running Ghost Hybrid Split-Stack Engine on 0.0.0.0:{port}...")
+    print(
+        f"[STARTUP] Running Ghost Continuous Gold Multi-Position Scalper "
+        f"on 0.0.0.0:{port}..."
+    )
     serve(app, host="0.0.0.0", port=port, threads=8)
