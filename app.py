@@ -47,13 +47,23 @@ live_account_telemetry = {}
 active_connections = {}
 
 # ============================================================
-# GOLD-ONLY CONTINUOUS MULTI-POSITION SCALPER SETTINGS
+# GOLD-ONLY CONTINUOUS INDIVIDUAL-TP SCALPER SETTINGS
 # ============================================================
 MAX_ALLOWED_SPREAD_PIPS = 35.0
 POLL_LATENCY_DELAY = 0.05
 FAST_REENTRY_COOLDOWN_SECONDS = 3.0
 MIN_PRICE_DISTANCE_USD = 0.20
 ADD_POSITION_MOVE_USD = 0.15
+
+POSITION_TAKE_PROFIT_DISTANCE_USD = 0.40
+POSITION_STOP_LOSS_DISTANCE_USD = 0.80
+POSITION_TP_STEP_USD = 0.05
+
+USE_INDIVIDUAL_TAKE_PROFIT = True
+USE_BASKET_PROFIT_TARGET = False
+
+MAX_LOSING_POSITIONS = 3
+
 M5_RANGE_LOOKBACK = 20
 M5_REJECTION_BUFFER = 0.50
 
@@ -151,8 +161,6 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
     Returns:
         position_lot
         max_positions
-        basket_profit_target
-        basket_max_loss
     """
 
     capital = max(equity, balance)
@@ -166,14 +174,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.01
             max_positions = 1
+
         elif score <= 6:
             position_lot = 0.01 if capital < 3.0 else 0.02
             max_positions = 1
+
         else:
             position_lot = 0.02
             max_positions = 2
 
-        return position_lot, max_positions, 0.40, 0.80
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $4-$10: 2-3 POSITIONS, 0.01-0.02 LOT
@@ -183,14 +193,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.01
             max_positions = 2
+
         elif score <= 6:
             position_lot = 0.01 if capital < 7.0 else 0.02
             max_positions = 2
+
         else:
             position_lot = 0.02
             max_positions = 3
 
-        return position_lot, max_positions, 0.50, 1.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $10-$25: 3-5 POSITIONS, 0.01-0.03 LOT
@@ -200,14 +212,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.01
             max_positions = 3
+
         elif score <= 6:
             position_lot = 0.02
             max_positions = 4
+
         else:
             position_lot = 0.03
             max_positions = 5
 
-        return position_lot, max_positions, 1.00, 2.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $25-$50: 5-7 POSITIONS, 0.02-0.03 LOT
@@ -217,14 +231,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.02
             max_positions = 5
+
         elif score <= 6:
             position_lot = 0.02
             max_positions = 6
+
         else:
             position_lot = 0.03
             max_positions = 7
 
-        return position_lot, max_positions, 1.50, 3.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $50-$100: 7-9 POSITIONS, 0.02-0.04 LOT
@@ -234,14 +250,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.02
             max_positions = 7
+
         elif score <= 6:
             position_lot = 0.03
             max_positions = 8
+
         else:
             position_lot = 0.04
             max_positions = 9
 
-        return position_lot, max_positions, 2.00, 4.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $100-$250: 9-12 POSITIONS, 0.02-0.05 LOT
@@ -251,14 +269,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.02
             max_positions = 9
+
         elif score <= 6:
             position_lot = 0.03 if capital < 180 else 0.04
             max_positions = 10
+
         else:
             position_lot = 0.05
             max_positions = 12
 
-        return position_lot, max_positions, 3.00, 6.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $250-$500: 12-14 POSITIONS, 0.03-0.06 LOT
@@ -268,14 +288,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.03
             max_positions = 12
+
         elif score <= 6:
             position_lot = 0.04 if capital < 380 else 0.05
             max_positions = 13
+
         else:
             position_lot = 0.06
             max_positions = 14
 
-        return position_lot, max_positions, 5.00, 10.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $500-$1,000: 14-16 POSITIONS, 0.04-0.08 LOT
@@ -285,14 +307,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.04
             max_positions = 14
+
         elif score <= 6:
             position_lot = 0.05 if capital < 750 else 0.06
             max_positions = 15
+
         else:
             position_lot = 0.08
             max_positions = 16
 
-        return position_lot, max_positions, 8.00, 16.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $1,000-$2,000: 16-18 POSITIONS, 0.05-0.10 LOT
@@ -302,14 +326,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.05
             max_positions = 16
+
         elif score <= 6:
             position_lot = 0.07 if capital < 1500 else 0.08
             max_positions = 17
+
         else:
             position_lot = 0.10
             max_positions = 18
 
-        return position_lot, max_positions, 12.00, 24.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $2,000-$5,000: 18 POSITIONS, 0.08-0.15 LOT
@@ -319,14 +345,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.08
             max_positions = 18
+
         elif score <= 6:
             position_lot = 0.10 if capital < 3500 else 0.12
             max_positions = 18
+
         else:
             position_lot = 0.15
             max_positions = 18
 
-        return position_lot, max_positions, 18.00, 36.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # $5,000-$10,000: 18 POSITIONS, 0.10-0.20 LOT
@@ -336,14 +364,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.10
             max_positions = 18
+
         elif score <= 6:
             position_lot = 0.15
             max_positions = 18
+
         else:
             position_lot = 0.20
             max_positions = 18
 
-        return position_lot, max_positions, 30.00, 60.00
+        return position_lot, max_positions
 
     # ------------------------------------------------------------
     # ABOVE $10,000: 18 POSITIONS, 0.15-0.30 LOT
@@ -353,14 +383,16 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
         if score <= 3:
             position_lot = 0.15
             max_positions = 18
+
         elif score <= 6:
             position_lot = 0.20 if capital < 20000 else 0.25
             max_positions = 18
+
         else:
             position_lot = 0.30
             max_positions = 18
 
-        return position_lot, max_positions, 45.00, 90.00
+        return position_lot, max_positions
 
 # ============================================================
 # ENTRY-QUALITY SCORER
@@ -376,23 +408,20 @@ def calculate_entry_quality_score(
     price_distance
 ):
     """
-    The original tick-momentum logic is the ONLY entry trigger.
+    Original tick-momentum logic is the ONLY entry trigger.
     These signals only score the quality of that original entry.
     """
 
     score = 0
 
-    # Original tick momentum trigger
     if tick_direction in ["BUY", "SELL"]:
         score += 2
 
-    # Tick confidence
     if abs(tick_confidence) >= 8:
         score += 2
     elif abs(tick_confidence) >= 6:
         score += 1
 
-    # M5 reversal confirmation
     if m5_signal == tick_direction:
         score += 3
     elif m5_signal in ["BUY", "SELL"]:
@@ -400,25 +429,20 @@ def calculate_entry_quality_score(
     elif m5_signal and m5_signal != tick_direction:
         score -= 2
 
-    # Momentum continuation confirmation
     if momentum_continuation:
         score += 2
 
-    # Pullback continuation confirmation
     if pullback_continuation:
         score += 2
 
-    # Breakout confirmation
     if breakout_confirmed:
         score += 2
 
-    # Spread quality
     if current_spread_pips <= 20:
         score += 2
     elif current_spread_pips <= 30:
         score += 1
 
-    # Distance from last basket
     if price_distance >= 0.50:
         score += 1
 
@@ -492,13 +516,6 @@ class MicroMomentumTracker:
 # M5 REVERSAL SIGNAL
 # ============================================================
 async def get_m5_reversal_signal(account, connection, symbol):
-    """
-    Returns:
-        BUY  -> bullish rejection near range low
-        SELL -> bearish rejection near range high
-        None -> no valid M5 reversal setup
-    """
-
     try:
         candles = await account.get_historical_candles(
             symbol=symbol,
@@ -610,114 +627,6 @@ def detect_breakout(tracker, direction):
     return False
 
 # ============================================================
-# ORDER EXECUTION
-# ============================================================
-async def open_first_scalp_position(
-    connection,
-    symbol,
-    direction,
-    volume,
-    key,
-    specification=None
-):
-    volume = normalize_lot_size(
-        volume,
-        specification
-    )
-
-    bot_signature = f"GHOST-CONTINUOUS [{key}]"
-
-    if direction == "BUY":
-        result = await connection.create_market_buy_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=None,
-            take_profit=None,
-            options={"comment": bot_signature}
-        )
-
-    else:
-        result = await connection.create_market_sell_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=None,
-            take_profit=None,
-            options={"comment": bot_signature}
-        )
-
-    print(
-        f"[FIRST POSITION OPENED] {direction} {volume} lots | "
-        f"{symbol} | Entry quality engine active"
-    )
-
-    return result
-
-async def add_scalp_position(
-    connection,
-    symbol,
-    direction,
-    volume,
-    key,
-    position_number,
-    specification=None
-):
-    volume = normalize_lot_size(
-        volume,
-        specification
-    )
-
-    bot_signature = f"GHOST-CONTINUOUS-{position_number} [{key}]"
-
-    if direction == "BUY":
-        result = await connection.create_market_buy_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=None,
-            take_profit=None,
-            options={"comment": bot_signature}
-        )
-
-    else:
-        result = await connection.create_market_sell_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=None,
-            take_profit=None,
-            options={"comment": bot_signature}
-        )
-
-    print(
-        f"[POSITION ADDED] {direction} {volume} lots | "
-        f"{symbol} | Position {position_number}"
-    )
-
-    return result
-
-async def close_basket(connection, basket_positions):
-    close_tasks = [
-        connection.close_position(position["id"])
-        for position in basket_positions
-        if position.get("id")
-    ]
-
-    if not close_tasks:
-        print("[BASKET CLOSE] No positions to close.")
-        return 0
-
-    results = await asyncio.gather(*close_tasks, return_exceptions=True)
-
-    closed_count = sum(
-        1 for result in results
-        if not isinstance(result, Exception)
-    )
-
-    print(
-        f"[BASKET CLOSED] {closed_count}/{len(close_tasks)} positions closed."
-    )
-
-    return closed_count
-
-# ============================================================
 # LOT-SIZE NORMALIZATION
 # ============================================================
 def normalize_lot_size(lot, specification):
@@ -738,6 +647,131 @@ def normalize_lot_size(lot, specification):
         lot = max_volume
 
     return round(lot, 2)
+
+# ============================================================
+# INDIVIDUAL TP / SL CALCULATION
+# ============================================================
+def calculate_individual_tp_sl(
+    direction,
+    entry_price,
+    position_number
+):
+    tp_distance = (
+        POSITION_TAKE_PROFIT_DISTANCE_USD
+        + (POSITION_TP_STEP_USD * (position_number - 1))
+    )
+
+    if direction == "BUY":
+        take_profit_price = entry_price + tp_distance
+        stop_loss_price = entry_price - POSITION_STOP_LOSS_DISTANCE_USD
+
+    else:
+        take_profit_price = entry_price - tp_distance
+        stop_loss_price = entry_price + POSITION_STOP_LOSS_DISTANCE_USD
+
+    return (
+        round(take_profit_price, 2),
+        round(stop_loss_price, 2)
+    )
+
+# ============================================================
+# ORDER EXECUTION
+# ============================================================
+async def open_first_scalp_position(
+    connection,
+    symbol,
+    direction,
+    volume,
+    key,
+    entry_price,
+    specification=None
+):
+    volume = normalize_lot_size(
+        volume,
+        specification
+    )
+
+    take_profit_price, stop_loss_price = calculate_individual_tp_sl(
+        direction,
+        entry_price,
+        1
+    )
+
+    bot_signature = f"GHOST-INDIVIDUAL-TP [{key}]"
+
+    if direction == "BUY":
+        result = await connection.create_market_buy_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
+            options={"comment": bot_signature}
+        )
+
+    else:
+        result = await connection.create_market_sell_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
+            options={"comment": bot_signature}
+        )
+
+    print(
+        f"[FIRST TICKET OPENED] {direction} {volume} lots | "
+        f"{symbol} | TP: {take_profit_price} | SL: {stop_loss_price}"
+    )
+
+    return result
+
+async def add_scalp_position(
+    connection,
+    symbol,
+    direction,
+    volume,
+    key,
+    position_number,
+    entry_price,
+    specification=None
+):
+    volume = normalize_lot_size(
+        volume,
+        specification
+    )
+
+    take_profit_price, stop_loss_price = calculate_individual_tp_sl(
+        direction,
+        entry_price,
+        position_number
+    )
+
+    bot_signature = f"GHOST-INDIVIDUAL-TP-{position_number} [{key}]"
+
+    if direction == "BUY":
+        result = await connection.create_market_buy_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
+            options={"comment": bot_signature}
+        )
+
+    else:
+        result = await connection.create_market_sell_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
+            options={"comment": bot_signature}
+        )
+
+    print(
+        f"[TICKET ADDED] {direction} {volume} lots | "
+        f"{symbol} | Position {position_number} | "
+        f"TP: {take_profit_price} | SL: {stop_loss_price}"
+    )
+
+    return result
 
 # ============================================================
 # GOLD SYMBOL RESOLVER
@@ -1083,7 +1117,7 @@ async def connect_metaapi_account(account, login):
     )
 
 # ============================================================
-# GOLD-ONLY CONTINUOUS MULTI-POSITION ENGINE
+# GOLD-ONLY CONTINUOUS INDIVIDUAL-TP ENGINE
 # ============================================================
 async def high_frequency_trading_engine(
     login,
@@ -1094,7 +1128,7 @@ async def high_frequency_trading_engine(
     token=None
 ):
     print(
-        f"[GOLD CONTINUOUS ENGINE INITIALIZED] Starting trading loop for {login}..."
+        f"[GOLD INDIVIDUAL-TP ENGINE INITIALIZED] Starting trading loop for {login}..."
     )
 
     tracker = MicroMomentumTracker()
@@ -1156,7 +1190,7 @@ async def high_frequency_trading_engine(
 
         print(
             f"[GOLD ENGINE LIVE] Trading {active_symbol} | "
-            f"Continuous multi-position scalping enabled"
+            f"Continuous individual-TP scalping enabled"
         )
 
         while active_trading_nodes.get(str(login), False):
@@ -1194,19 +1228,25 @@ async def high_frequency_trading_engine(
 
                 positions = terminal_state.positions or []
 
-                basket_positions = [
+                gold_positions = [
                     position for position in positions
                     if position.get("symbol") == active_symbol
                 ]
 
-                open_position_count = len(basket_positions)
+                open_position_count = len(gold_positions)
 
-                basket_profit = 0.0
+                losing_position_count = 0
 
-                for position in basket_positions:
-                    basket_profit += float(position.get("profit", 0) or 0)
+                for position in gold_positions:
+                    if float(position.get("profit", 0) or 0) < 0:
+                        losing_position_count += 1
 
-                basket_profit = round(basket_profit, 2)
+                floating_profit = 0.0
+
+                for position in gold_positions:
+                    floating_profit += float(position.get("profit", 0) or 0)
+
+                floating_profit = round(floating_profit, 2)
 
                 direction, confidence = tracker.evaluate()
 
@@ -1249,7 +1289,7 @@ async def high_frequency_trading_engine(
                     price_distance
                 )
 
-                position_lot, max_positions, basket_profit_target, basket_max_loss = calculate_dynamic_scalp_plan(
+                position_lot, max_positions = calculate_dynamic_scalp_plan(
                     equity,
                     balance,
                     entry_quality_score
@@ -1269,7 +1309,7 @@ async def high_frequency_trading_engine(
                     eq=equity,
                     f_margin=free_margin,
                     m_level=margin_level,
-                    pnl=basket_profit,
+                    pnl=floating_profit,
                     open_count=open_position_count,
                     price_obj={
                         "ask": current_ask,
@@ -1280,94 +1320,8 @@ async def high_frequency_trading_engine(
                     entry_type=entry_type
                 )
 
-                # ====================================================
-                # 1. CLOSE WHOLE BASKET AT PROFIT TARGET
-                # ====================================================
-                if open_position_count > 0:
-
-                    if basket_profit >= basket_profit_target:
-
-                        print(
-                            f"[BASKET PROFIT TARGET REACHED] "
-                            f"+{basket_profit:.2f} USD | "
-                            f"Target: +{basket_profit_target:.2f} USD | "
-                            f"Closing all {open_position_count} positions"
-                        )
-
-                        await close_basket(
-                            connection,
-                            basket_positions
-                        )
-
-                        last_batch_close_time = time.time()
-                        last_batch_direction = None
-
-                        await asyncio.sleep(FAST_REENTRY_COOLDOWN_SECONDS)
-                        continue
-
-                    # ================================================
-                    # 2. CLOSE WHOLE BASKET AT LOSS CUTOFF
-                    # ================================================
-                    if basket_profit <= -basket_max_loss:
-
-                        print(
-                            f"[BASKET LOSS CUTOFF REACHED] "
-                            f"-{abs(basket_profit):.2f} USD | "
-                            f"Limit: -{basket_max_loss:.2f} USD | "
-                            f"Closing all {open_position_count} positions"
-                        )
-
-                        await close_basket(
-                            connection,
-                            basket_positions
-                        )
-
-                        last_batch_close_time = time.time()
-                        last_batch_direction = None
-
-                        await asyncio.sleep(FAST_REENTRY_COOLDOWN_SECONDS)
-                        continue
-
-                    # ================================================
-                    # 3. ADD POSITIONS ONLY WHILE BASKET IS PROFITABLE
-                    # ================================================
-                    if open_position_count < max_positions:
-
-                        if last_batch_direction == "BUY":
-                            price_progress = current_price - last_batch_entry_price
-
-                        elif last_batch_direction == "SELL":
-                            price_progress = last_batch_entry_price - current_price
-
-                        else:
-                            price_progress = 0
-
-                        can_add_position = (
-                            basket_profit > 0
-                            and price_progress >= ADD_POSITION_MOVE_USD
-                            and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
-                            and free_margin > 0
-                        )
-
-                        if can_add_position:
-
-                            await add_scalp_position(
-                                connection,
-                                active_symbol,
-                                last_batch_direction,
-                                position_lot,
-                                key,
-                                open_position_count + 1,
-                                specification
-                            )
-
-                            last_batch_entry_price = current_price
-
-                            await asyncio.sleep(0.2)
-                            continue
-
                 # ================================================
-                # 4. ORIGINAL TICK-MOMENTUM ENTRY TRIGGER
+                # 1. OPEN FIRST TICKET FROM ORIGINAL TICK LOGIC
                 # ================================================
                 if open_position_count == 0:
 
@@ -1398,12 +1352,53 @@ async def high_frequency_trading_engine(
                             direction,
                             position_lot,
                             key,
+                            current_price,
                             specification
                         )
 
                         last_batch_entry_price = current_price
                         last_batch_close_time = time.time()
                         last_batch_direction = direction
+
+                        await asyncio.sleep(0.2)
+                        continue
+
+                # ================================================
+                # 2. ADD ANOTHER TICKET ONLY IN PROFIT
+                # ================================================
+                elif open_position_count < max_positions:
+
+                    if last_batch_direction == "BUY":
+                        price_progress = current_price - last_batch_entry_price
+
+                    elif last_batch_direction == "SELL":
+                        price_progress = last_batch_entry_price - current_price
+
+                    else:
+                        price_progress = 0
+
+                    can_add_ticket = (
+                        floating_profit > 0
+                        and price_progress >= ADD_POSITION_MOVE_USD
+                        and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
+                        and free_margin > 0
+                        and losing_position_count < MAX_LOSING_POSITIONS
+                    )
+
+                    if can_add_ticket:
+
+                        await add_scalp_position(
+                            connection,
+                            active_symbol,
+                            last_batch_direction,
+                            position_lot,
+                            key,
+                            open_position_count + 1,
+                            current_price,
+                            specification
+                        )
+
+                        last_batch_entry_price = current_price
 
                         await asyncio.sleep(0.2)
                         continue
@@ -1502,8 +1497,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Ghost Continuous Gold Multi-Position Scalper",
-        "mode": "Original Tick-Momentum Entry + Quality Scoring + Dynamic Basket Sizing"
+        "service": "Ghost Continuous Gold Individual-TP Scalper",
+        "mode": "Original Tick-Momentum Entry + Individual TP/SL + Dynamic Sizing"
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -1709,7 +1704,7 @@ def control_dispatcher():
                 "status": "success",
                 "success": True,
                 "message": (
-                    f"License [{license_key}] Verified. Continuous Gold Multi-Position "
+                    f"License [{license_key}] Verified. Continuous Gold Individual-TP "
                     f"Scalper active on {mt5_symbol}."
                 ),
                 "login": login_str,
@@ -1737,7 +1732,7 @@ def control_dispatcher():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     print(
-        f"[STARTUP] Running Ghost Continuous Gold Multi-Position Scalper "
+        f"[STARTUP] Running Ghost Continuous Gold Individual-TP Scalper "
         f"on 0.0.0.0:{port}..."
     )
     serve(app, host="0.0.0.0", port=port, threads=8)
