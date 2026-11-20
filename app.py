@@ -46,7 +46,7 @@ live_account_telemetry = {}
 active_connections = {}
 
 # ============================================================
-# GHOST FAST CONTINUOUS INDIVIDUAL-TP SCALPER
+# GHOST MULTI-POSITION INDIVIDUAL-TP SCALPER
 # ============================================================
 MAX_ALLOWED_SPREAD_PIPS = 25.0
 POLL_LATENCY_DELAY = 0.05
@@ -54,8 +54,8 @@ FAST_REENTRY_COOLDOWN_SECONDS = 2.0
 
 POSITION_TAKE_PROFIT_DISTANCE_USD = 0.40
 POSITION_STOP_LOSS_DISTANCE_USD = 0.80
+ADD_POSITION_MOVE_USD = 0.15
 
-MAX_OPEN_POSITIONS = 1
 DAILY_LOSS_LIMIT_PERCENT = 0.0
 MAX_CONSECUTIVE_LOSSES = 0
 
@@ -156,93 +156,100 @@ def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_sc
     score = entry_quality_score
 
     if capital < 4.0:
-        return 0.01, 1
-
-    elif capital < 10.0:
-        if score <= 6:
+        if score <= 3:
+            return 0.01, 1
+        elif score <= 6:
             return 0.01, 1
         else:
-            return 0.02, 1
+            return 0.01, 2
+
+    elif capital < 10.0:
+        if score <= 3:
+            return 0.01, 2
+        elif score <= 6:
+            return 0.01, 2
+        else:
+            return 0.02, 3
 
     elif capital < 25.0:
         if score <= 3:
-            return 0.01, 1
+            return 0.01, 3
         elif score <= 6:
-            return 0.02, 1
+            return 0.02, 4
         else:
-            return 0.02, 1
+            return 0.02, 5
 
     elif capital < 50.0:
         if score <= 3:
-            return 0.02, 1
+            return 0.02, 5
         elif score <= 6:
-            return 0.02, 1
+            return 0.02, 6
         else:
-            return 0.03, 1
+            return 0.03, 7
 
     elif capital < 100.0:
         if score <= 3:
-            return 0.02, 1
+            return 0.02, 7
         elif score <= 6:
-            return 0.03, 1
+            return 0.03, 8
         else:
-            return 0.04, 1
+            return 0.04, 9
 
     elif capital < 250.0:
         if score <= 3:
-            return 0.02, 1
+            return 0.02, 9
         elif score <= 6:
-            return 0.03, 1
+            return 0.03, 10
         else:
-            return 0.05, 1
+            return 0.05, 12
 
     elif capital < 500.0:
         if score <= 3:
-            return 0.03, 1
+            return 0.03, 12
         elif score <= 6:
-            return 0.04, 1
+            return 0.04, 13
         else:
-            return 0.06, 1
+            return 0.06, 14
 
     elif capital < 1000.0:
         if score <= 3:
-            return 0.04, 1
+            return 0.04, 14
         elif score <= 6:
-            return 0.05, 1
+            return 0.05, 15
         else:
-            return 0.08, 1
+            return 0.08, 16
 
     elif capital < 2000.0:
         if score <= 3:
-            return 0.05, 1
+            return 0.05, 16
         elif score <= 6:
-            return 0.07, 1
+            return 0.07, 17
         else:
-            return 0.10, 1
+            return 0.10, 18
 
     elif capital < 5000.0:
         if score <= 3:
-            return 0.08, 1
+            return 0.08, 18
         elif score <= 6:
-            return 0.10, 1
+            return 0.10, 18
         else:
-            return 0.15, 1
+            return 0.15, 18
 
     elif capital < 10000.0:
         if score <= 3:
-            return 0.10, 1
+            return 0.10, 18
         elif score <= 6:
-            return 0.15, 1
+            return 0.15, 18
         else:
-            return 0.20, 1
+            return 0.20, 18
 
     else:
         if score <= 3:
-            return 0.15, 1
+            return 0.15, 18
         elif score <= 6:
-            return 0.20, 1
+            return 0.20, 18
         else:
-            return 0.30, 1
+            return 0.30, 18
 
 # ============================================================
 # ENTRY-QUALITY SCORER
@@ -509,7 +516,7 @@ def calculate_individual_tp_sl(direction, entry_price):
 # ============================================================
 # ORDER EXECUTION
 # ============================================================
-async def open_fast_individual_tp_ticket(
+async def open_first_scalp_position(
     connection,
     symbol,
     direction,
@@ -528,7 +535,7 @@ async def open_fast_individual_tp_ticket(
         entry_price
     )
 
-    bot_signature = f"GHOST-FAST-INDIVIDUAL-TP [{key}]"
+    bot_signature = f"GHOST-INDIVIDUAL-TP [{key}]"
 
     if direction == "BUY":
         result = await connection.create_market_buy_order(
@@ -549,8 +556,56 @@ async def open_fast_individual_tp_ticket(
         )
 
     print(
-        f"[FAST TICKET OPENED] {direction} {volume} lots | "
+        f"[FIRST TICKET OPENED] {direction} {volume} lots | "
         f"{symbol} | TP: {take_profit_price} | SL: {stop_loss_price}"
+    )
+
+    return result
+
+async def add_scalp_position(
+    connection,
+    symbol,
+    direction,
+    volume,
+    key,
+    position_number,
+    entry_price,
+    specification=None
+):
+    volume = normalize_lot_size(
+        volume,
+        specification
+    )
+
+    take_profit_price, stop_loss_price = calculate_individual_tp_sl(
+        direction,
+        entry_price
+    )
+
+    bot_signature = f"GHOST-INDIVIDUAL-TP-{position_number} [{key}]"
+
+    if direction == "BUY":
+        result = await connection.create_market_buy_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
+            options={"comment": bot_signature}
+        )
+
+    else:
+        result = await connection.create_market_sell_order(
+            symbol=symbol,
+            volume=volume,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
+            options={"comment": bot_signature}
+        )
+
+    print(
+        f"[TICKET ADDED] {direction} {volume} lots | "
+        f"{symbol} | Position {position_number} | "
+        f"TP: {take_profit_price} | SL: {stop_loss_price}"
     )
 
     return result
@@ -899,7 +954,7 @@ async def connect_metaapi_account(account, login):
     )
 
 # ============================================================
-# GHOST FAST CONTINUOUS INDIVIDUAL-TP ENGINE
+# GHOST MULTI-POSITION INDIVIDUAL-TP ENGINE
 # ============================================================
 async def high_frequency_trading_engine(
     login,
@@ -910,12 +965,14 @@ async def high_frequency_trading_engine(
     token=None
 ):
     print(
-        f"[GHOST FAST INDIVIDUAL-TP ENGINE INITIALIZED] Starting trading loop for {login}..."
+        f"[GHOST MULTI-POSITION INDIVIDUAL-TP ENGINE INITIALIZED] Starting trading loop for {login}..."
     )
 
     tracker = MicroMomentumTracker()
 
-    last_close_time = 0.0
+    last_batch_entry_price = 0.0
+    last_batch_close_time = 0.0
+    last_batch_direction = None
 
     def update_telemetry(
         connected,
@@ -970,7 +1027,7 @@ async def high_frequency_trading_engine(
 
         print(
             f"[GHOST ENGINE LIVE] Trading {active_symbol} | "
-            f"Fast continuous individual-TP scalping enabled"
+            f"Multi-position individual-TP scalping enabled"
         )
 
         while active_trading_nodes.get(str(login), False):
@@ -1092,13 +1149,13 @@ async def high_frequency_trading_engine(
                 )
 
                 # ================================================
-                # FAST CONTINUOUS INDIVIDUAL-TP ENTRY
+                # 1. OPEN FIRST TICKET FROM ORIGINAL TICK LOGIC
                 # ================================================
-                if open_position_count < max_positions:
+                if open_position_count == 0:
 
-                    time_since_last_close = time.time() - last_close_time
+                    time_since_last_close = time.time() - last_batch_close_time
 
-                    can_enter = (
+                    pre_entry_conditions_pass = (
                         broker_connected
                         and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
                         and free_margin > 0
@@ -1106,17 +1163,18 @@ async def high_frequency_trading_engine(
                         and direction in ["BUY", "SELL"]
                     )
 
-                    if can_enter:
+                    if pre_entry_conditions_pass:
 
                         print(
-                            f"[FAST ENTRY] {direction} | "
+                            f"[ORIGINAL TICK ENTRY] {direction} | "
                             f"Confidence: {confidence} | "
                             f"Entry score: {entry_quality_score} | "
                             f"Entry type: {entry_type} | "
-                            f"Lot: {position_lot}"
+                            f"Lot: {position_lot} | "
+                            f"Max positions: {max_positions}"
                         )
 
-                        await open_fast_individual_tp_ticket(
+                        await open_first_scalp_position(
                             connection,
                             active_symbol,
                             direction,
@@ -1125,6 +1183,49 @@ async def high_frequency_trading_engine(
                             current_price,
                             specification
                         )
+
+                        last_batch_entry_price = current_price
+                        last_batch_close_time = time.time()
+                        last_batch_direction = direction
+
+                        await asyncio.sleep(0.2)
+                        continue
+
+                # ================================================
+                # 2. ADD ANOTHER TICKET ONLY IN PROFIT
+                # ================================================
+                elif open_position_count < max_positions:
+
+                    if last_batch_direction == "BUY":
+                        price_progress = current_price - last_batch_entry_price
+
+                    elif last_batch_direction == "SELL":
+                        price_progress = last_batch_entry_price - current_price
+
+                    else:
+                        price_progress = 0
+
+                    can_add_ticket = (
+                        floating_profit > 0
+                        and price_progress >= ADD_POSITION_MOVE_USD
+                        and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
+                        and free_margin > 0
+                    )
+
+                    if can_add_ticket:
+
+                        await add_scalp_position(
+                            connection,
+                            active_symbol,
+                            last_batch_direction,
+                            position_lot,
+                            key,
+                            open_position_count + 1,
+                            current_price,
+                            specification
+                        )
+
+                        last_batch_entry_price = current_price
 
                         await asyncio.sleep(0.2)
                         continue
@@ -1223,8 +1324,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Ghost Fast Continuous Individual-TP Gold Scalper",
-        "mode": "Original Tick-Momentum Entry + Individual TP/SL + 2-Second Cooldown"
+        "service": "Ghost Multi-Position Individual-TP Gold Scalper",
+        "mode": "Original Tick-Momentum Entry + Individual TP/SL + Fast Re-Entry"
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -1232,7 +1333,7 @@ def health_root():
 def health_ping():
     return jsonify({
         "status": "healthy",
-        "service": "Ghost Fast Continuous Gold Engine",
+        "service": "Ghost Multi-Position Gold Engine",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }), 200
 
@@ -1430,7 +1531,7 @@ def control_dispatcher():
                 "status": "success",
                 "success": True,
                 "message": (
-                    f"License [{license_key}] Verified. Ghost Fast Continuous "
+                    f"License [{license_key}] Verified. Ghost Multi-Position "
                     f"Individual-TP Scalper active on {mt5_symbol}."
                 ),
                 "login": login_str,
@@ -1458,7 +1559,7 @@ def control_dispatcher():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     print(
-        f"[STARTUP] Running Ghost Fast Continuous Individual-TP Scalper "
+        f"[STARTUP] Running Ghost Multi-Position Individual-TP Scalper "
         f"on 0.0.0.0:{port}..."
     )
     serve(app, host="0.0.0.0", port=port, threads=8)
