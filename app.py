@@ -60,6 +60,16 @@ MULTI_SCALP_COOLDOWN_SECONDS = 3
 MAX_POSITIONS_HARD_LIMIT = 18
 
 # ============================================================
+# DYNAMIC TP / SL SETTINGS
+# ============================================================
+BASE_STOP_LOSS_USD = 3.00
+BASE_TAKE_PROFIT_USD = 2.50
+MIN_STOP_LOSS_USD = 2.00
+MIN_TAKE_PROFIT_USD = 1.50
+MAX_STOP_LOSS_USD = 12.00
+MAX_TAKE_PROFIT_USD = 10.00
+
+# ============================================================
 # CONNECTION TIMEOUTS
 # ============================================================
 MAX_CONNECTION_ATTEMPTS = 5
@@ -177,11 +187,10 @@ def get_metaapi_client(override_token=None):
     return metaapi_instance
 
 # ============================================================
-# AGGRESSIVE VIDEO-STYLE CAPITAL SCALER
+# AGGRESSIVE EQUITY / CONFIDENCE SCALER
 # ============================================================
 def calculate_video_dynamic_burst(equity, balance, confidence_score):
     """
-    AGGRESSIVE SCALER:
     Returns:
         first_position_lot
         max_positions_for_basket
@@ -191,7 +200,6 @@ def calculate_video_dynamic_burst(equity, balance, confidence_score):
     capital = max(equity, balance)
     abs_conf = abs(confidence_score)
 
-    # Very small accounts still start at minimum lot
     if capital < 4.0:
         max_positions = 2 if abs_conf >= 7 else 1
         return 0.01, max_positions, 0.35
@@ -245,17 +253,9 @@ def calculate_video_dynamic_burst(equity, balance, confidence_score):
         return 4.00, max_positions, 1500.00
 
 # ============================================================
-# AGGRESSIVE LOT SIZE FOR ADDED POSITIONS
+# AGGRESSIVE ADDED-POSITION LOT SIZE
 # ============================================================
 def calculate_added_position_lot(equity, balance, confidence_score, position_number):
-    """
-    AGGRESSIVE ADDED-POSITION LOT:
-    - Base lot grows faster with equity.
-    - Every 2 added positions increases lot by 0.01.
-    - Applies from $25 upward.
-    - No martingale.
-    """
-
     capital = max(equity, balance)
     abs_conf = abs(confidence_score)
 
@@ -295,13 +295,94 @@ def calculate_added_position_lot(equity, balance, confidence_score, position_num
     else:
         base_lot = 4.00 if abs_conf >= 6 else 2.00
 
-    # Aggressive promotion:
-    # Every 2 added positions increases lot by 0.01.
     if capital >= 25:
         bonus = ((position_number - 1) // 2) * 0.01
         base_lot += bonus
 
     return round(base_lot, 2)
+
+# ============================================================
+# DYNAMIC TP / SL CALCULATOR
+# ============================================================
+def calculate_dynamic_tp_sl(
+    direction,
+    entry_price,
+    current_spread_pips,
+    confidence_score,
+    position_number,
+    recent_price_movement
+):
+    """
+    Creates a non-fixed TP and SL for every position.
+
+    The SL becomes wider when:
+    - Spread is wider.
+    - Market movement is stronger.
+    - Confidence is lower.
+
+    The TP becomes wider when:
+    - Market movement is stronger.
+    - Confidence is higher.
+    """
+
+    spread_usd = current_spread_pips * 0.10
+
+    movement_multiplier = 1.0
+
+    if recent_price_movement > 0.50:
+        movement_multiplier = 1.50
+    elif recent_price_movement > 0.25:
+        movement_multiplier = 1.25
+    elif recent_price_movement > 0.10:
+        movement_multiplier = 1.10
+
+    confidence_multiplier = 1.0
+
+    if confidence_score >= 8:
+        confidence_multiplier = 1.20
+    elif confidence_score >= 6:
+        confidence_multiplier = 1.10
+    elif confidence_score <= 2:
+        confidence_multiplier = 0.85
+
+    position_adjustment = (position_number - 1) * 0.10
+
+    stop_loss_distance = (
+        BASE_STOP_LOSS_USD
+        + spread_usd
+        + position_adjustment
+    ) * movement_multiplier
+
+    take_profit_distance = (
+        BASE_TAKE_PROFIT_USD
+        + (spread_usd * 0.50)
+        + position_adjustment
+    ) * movement_multiplier * confidence_multiplier
+
+    stop_loss_distance = max(
+        MIN_STOP_LOSS_USD,
+        min(MAX_STOP_LOSS_USD, stop_loss_distance)
+    )
+
+    take_profit_distance = max(
+        MIN_TAKE_PROFIT_USD,
+        min(MAX_TAKE_PROFIT_USD, take_profit_distance)
+    )
+
+    if direction == "BUY":
+        stop_loss = entry_price - stop_loss_distance
+        take_profit = entry_price + take_profit_distance
+
+    else:
+        stop_loss = entry_price + stop_loss_distance
+        take_profit = entry_price - take_profit_distance
+
+    return {
+        "stop_loss": round(stop_loss, 2),
+        "take_profit": round(take_profit, 2),
+        "stop_loss_distance": round(stop_loss_distance, 2),
+        "take_profit_distance": round(take_profit_distance, 2)
+    }
 
 # ============================================================
 # BUYER / SELLER MICRO-MOMENTUM TRACKER
@@ -370,60 +451,33 @@ class MicroMomentumTracker:
 
         return direction, score
 
+    def recent_movement(self):
+        if len(self.ticks) < 3:
+            return 0.0
+
+        return abs(self.ticks[-1] - self.ticks[-3])
+
 # ============================================================
 # ORDER EXECUTION FUNCTIONS
 # ============================================================
-async def open_first_scalp_position(
+async def open_dynamic_scalp_position(
     connection,
     symbol,
     direction,
     volume,
-    key
-):
-    bot_signature = f"MULTI-SCALP [{key}]"
-
-    if direction == "BUY":
-        result = await connection.create_market_buy_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=None,
-            take_profit=None,
-            options={"comment": bot_signature}
-        )
-
-    else:
-        result = await connection.create_market_sell_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=None,
-            take_profit=None,
-            options={"comment": bot_signature}
-        )
-
-    print(
-        f"[FIRST POSITION OPENED] {direction} | "
-        f"{volume} lots | {symbol}"
-    )
-
-    return result
-
-
-async def add_scalp_position(
-    connection,
-    symbol,
-    direction,
-    volume,
+    stop_loss,
+    take_profit,
     key,
     position_number
 ):
-    bot_signature = f"MULTI-SCALP-{position_number} [{key}]"
+    bot_signature = f"DYNAMIC-SCALP-{position_number} [{key}]"
 
     if direction == "BUY":
         result = await connection.create_market_buy_order(
             symbol=symbol,
             volume=volume,
-            stop_loss=None,
-            take_profit=None,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             options={"comment": bot_signature}
         )
 
@@ -431,14 +485,15 @@ async def add_scalp_position(
         result = await connection.create_market_sell_order(
             symbol=symbol,
             volume=volume,
-            stop_loss=None,
-            take_profit=None,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
             options={"comment": bot_signature}
         )
 
     print(
-        f"[POSITION ADDED] #{position_number} | "
-        f"{direction} | {volume} lots | {symbol}"
+        f"[DYNAMIC POSITION OPENED] #{position_number} | "
+        f"{direction} | {volume} lots | {symbol} | "
+        f"SL={stop_loss} | TP={take_profit}"
     )
 
     return result
@@ -813,7 +868,7 @@ async def connect_metaapi_account(account, login):
     )
 
 # ============================================================
-# ORIGINAL CORE + MULTI-POSITION TRADING ENGINE
+# ORIGINAL CORE + DYNAMIC MULTI-POSITION ENGINE
 # ============================================================
 async def high_frequency_trading_engine(
     login,
@@ -824,7 +879,7 @@ async def high_frequency_trading_engine(
     token=None
 ):
     print(
-        f"[AGGRESSIVE MULTI-POSITION ENGINE INITIALIZED] "
+        f"[DYNAMIC MULTI-POSITION ENGINE INITIALIZED] "
         f"Starting trading loop for {login}..."
     )
 
@@ -893,7 +948,7 @@ async def high_frequency_trading_engine(
         terminal_state = connection.terminal_state
 
         print(
-            f"[CORE LIVE] Aggressive multi-position engine active "
+            f"[CORE LIVE] Dynamic multi-position engine active "
             f"on {active_symbol}!"
         )
 
@@ -955,6 +1010,8 @@ async def high_frequency_trading_engine(
                 ) / 2.0
 
                 tracker.record_tick(mid_price)
+
+                recent_price_movement = tracker.recent_movement()
 
                 positions = terminal_state.positions or []
 
@@ -1057,13 +1114,13 @@ async def high_frequency_trading_engine(
                         continue
 
                 # ========================================================
-                # OPEN FIRST POSITION
+                # OPEN FIRST DYNAMIC POSITION
                 # ========================================================
                 if open_position_count == 0:
 
                     if current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS:
 
-                        lot_size, max_positions, profit_target = calculate_video_dynamic_burst(
+                        first_lot, max_positions, profit_target = calculate_video_dynamic_burst(
                             equity,
                             balance,
                             confidence
@@ -1071,20 +1128,39 @@ async def high_frequency_trading_engine(
 
                         if direction in ["BUY", "SELL"]:
 
-                            print(
-                                f"[FIRST ENTRY] {direction} | "
-                                f"confidence={confidence} | "
-                                f"lot={lot_size} | "
-                                f"max_positions={max_positions} | "
-                                f"basket_target={profit_target}"
+                            entry_price = (
+                                current_ask
+                                if direction == "BUY"
+                                else current_bid
                             )
 
-                            await open_first_scalp_position(
+                            tp_sl = calculate_dynamic_tp_sl(
+                                direction,
+                                entry_price,
+                                current_spread_pips,
+                                confidence,
+                                1,
+                                recent_price_movement
+                            )
+
+                            print(
+                                f"[FIRST DYNAMIC ENTRY] {direction} | "
+                                f"confidence={confidence} | "
+                                f"lot={first_lot} | "
+                                f"max_positions={max_positions} | "
+                                f"SL={tp_sl['stop_loss']} | "
+                                f"TP={tp_sl['take_profit']}"
+                            )
+
+                            await open_dynamic_scalp_position(
                                 connection,
                                 active_symbol,
                                 direction,
-                                lot_size,
-                                key
+                                first_lot,
+                                tp_sl["stop_loss"],
+                                tp_sl["take_profit"],
+                                key,
+                                1
                             )
 
                             last_batch_entry_price = current_price
@@ -1098,12 +1174,16 @@ async def high_frequency_trading_engine(
                             continue
 
                 # ========================================================
-                # ADD POSITIONS ONLY WHILE BASKET IS IN PROFIT
+                # ADD DYNAMIC POSITIONS ONLY WHILE BASKET IS PROFITABLE
                 # ========================================================
                 elif (
                     open_position_count > 0
                     and open_position_count < min(
-                        max_positions,
+                        calculate_video_dynamic_burst(
+                            equity,
+                            balance,
+                            confidence
+                        )[1],
                         MAX_POSITIONS_HARD_LIMIT
                     )
                 ):
@@ -1143,20 +1223,38 @@ async def high_frequency_trading_engine(
                             open_position_count + 1
                         )
 
+                        entry_price = (
+                            current_ask
+                            if last_batch_direction == "BUY"
+                            else current_bid
+                        )
+
+                        tp_sl = calculate_dynamic_tp_sl(
+                            last_batch_direction,
+                            entry_price,
+                            current_spread_pips,
+                            confidence,
+                            open_position_count + 1,
+                            recent_price_movement
+                        )
+
                         print(
-                            f"[ADDING POSITION] "
+                            f"[ADDING DYNAMIC POSITION] "
                             f"#{open_position_count + 1} | "
                             f"{last_batch_direction} | "
                             f"lot={added_lot} | "
                             f"basket_profit={basket_profit:.2f} | "
-                            f"price_progress={price_progress:.2f}"
+                            f"SL={tp_sl['stop_loss']} | "
+                            f"TP={tp_sl['take_profit']}"
                         )
 
-                        await add_scalp_position(
+                        await open_dynamic_scalp_position(
                             connection,
                             active_symbol,
                             last_batch_direction,
                             added_lot,
+                            tp_sl["stop_loss"],
+                            tp_sl["take_profit"],
                             key,
                             open_position_count + 1
                         )
@@ -1295,8 +1393,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Gold Aggressive Multi-Position Scalper",
-        "mode": "Original Core + Aggressive Lot Scaling"
+        "service": "Gold Dynamic Multi-Position Scalper",
+        "mode": "Original Core + Dynamic TP/SL + Aggressive Lot Scaling"
     }), 200
 
 
@@ -1305,7 +1403,7 @@ def health_root():
 def health_ping():
     return jsonify({
         "status": "healthy",
-        "service": "Gold Aggressive Multi-Position Scalper",
+        "service": "Gold Dynamic Multi-Position Scalper",
         "timestamp": datetime.datetime.now(
             datetime.timezone.utc
         ).isoformat()
@@ -1532,7 +1630,7 @@ def control_dispatcher():
                 "success": True,
                 "message": (
                     f"License [{license_key}] Verified. "
-                    f"Aggressive multi-position scalper active "
+                    f"Dynamic multi-position scalper active "
                     f"on {mt5_symbol}."
                 ),
                 "login": login_str,
@@ -1561,7 +1659,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
 
     print(
-        f"[STARTUP] Running Gold Aggressive Multi-Position Scalper on "
+        f"[STARTUP] Running Gold Dynamic Multi-Position Scalper on "
         f"0.0.0.0:{port}..."
     )
 
@@ -1570,4 +1668,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         threads=8
-        )
+                )
