@@ -46,15 +46,21 @@ live_account_telemetry = {}
 active_connections = {}
 
 # ============================================================
-# GHOST MULTI-POSITION INDIVIDUAL-TP SCALPER
+# GHOST ADAPTIVE QUALITY INDIVIDUAL-TP SCALPER
 # ============================================================
 MAX_ALLOWED_SPREAD_PIPS = 25.0
 POLL_LATENCY_DELAY = 0.05
 FAST_REENTRY_COOLDOWN_SECONDS = 2.0
-
-POSITION_TAKE_PROFIT_DISTANCE_USD = 0.40
-POSITION_STOP_LOSS_DISTANCE_USD = 0.80
 ADD_POSITION_MOVE_USD = 0.15
+
+# Quality-based adaptive TP / SL
+BASE_STOP_LOSS_DISTANCE_USD = 0.80
+MIN_STOP_LOSS_DISTANCE_USD = 0.50
+MAX_STOP_LOSS_DISTANCE_USD = 1.50
+
+STRONG_TP_RR = 1.50
+NORMAL_TP_RR = 1.20
+WEAK_TP_RR = 1.00
 
 DAILY_LOSS_LIMIT_PERCENT = 0.0
 MAX_CONSECUTIVE_LOSSES = 0
@@ -151,17 +157,12 @@ def get_metaapi_client(override_token: str = None):
 # ============================================================
 # DYNAMIC EQUITY-BASED SCALP PLAN
 # ============================================================
-def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_score: int):
+def calculate_dynamic_scalp_plan(equity, balance, entry_quality_score):
     capital = max(equity, balance)
     score = entry_quality_score
 
     if capital < 4.0:
-        if score <= 3:
-            return 0.01, 1
-        elif score <= 6:
-            return 0.01, 1
-        else:
-            return 0.01, 2
+        return 0.01, 2
 
     elif capital < 10.0:
         if score <= 3:
@@ -300,12 +301,12 @@ def calculate_entry_quality_score(
 # MICRO-MOMENTUM TRACKER
 # ============================================================
 class MicroMomentumTracker:
-    def __init__(self, capacity=10):
+    def __init__(self, capacity=20):
         self.ticks = deque(maxlen=capacity)
         self.candle_open = None
         self.last_minute = None
 
-    def record_tick(self, price: float):
+    def record_tick(self, price):
         current_minute = datetime.datetime.now(datetime.timezone.utc).minute
 
         if self.last_minute != current_minute or self.candle_open is None:
@@ -314,7 +315,7 @@ class MicroMomentumTracker:
 
         self.ticks.append(price)
 
-    def evaluate(self) -> tuple:
+    def evaluate(self):
         if len(self.ticks) < 3:
             return "BUY", 6
 
@@ -359,6 +360,21 @@ class MicroMomentumTracker:
         direction = "BUY" if score >= 0 else "SELL"
 
         return direction, score
+
+    def calculate_live_atr(self):
+        ticks = list(self.ticks)
+
+        if len(ticks) < 5:
+            return 0.50
+
+        ranges = []
+
+        for i in range(1, len(ticks)):
+            ranges.append(abs(ticks[i] - ticks[i - 1]))
+
+        average_range = sum(ranges) / len(ranges)
+
+        return max(0.20, min(average_range * 3.0, 2.00))
 
 # ============================================================
 # M5 REVERSAL SIGNAL
@@ -497,32 +513,82 @@ def normalize_lot_size(lot, specification):
     return round(lot, 2)
 
 # ============================================================
-# INDIVIDUAL TP / SL CALCULATION
+# QUALITY-BASED INDIVIDUAL TP / SL
 # ============================================================
-def calculate_individual_tp_sl(direction, entry_price):
-    if direction == "BUY":
-        take_profit_price = entry_price + POSITION_TAKE_PROFIT_DISTANCE_USD
-        stop_loss_price = entry_price - POSITION_STOP_LOSS_DISTANCE_USD
+def calculate_quality_based_tp_sl(
+    direction,
+    entry_price,
+    entry_quality_score,
+    live_atr
+):
+    """
+    Strong entry:
+        Wider SL for protection
+        Larger TP for bigger move
+
+    Normal entry:
+        Balanced SL and TP
+
+    Weak entry:
+        Tighter SL
+        Smaller TP
+    """
+
+    if entry_quality_score >= 7:
+        quality_label = "STRONG"
+        stop_distance = BASE_STOP_LOSS_DISTANCE_USD * 1.25
+        tp_rr = STRONG_TP_RR
+
+    elif entry_quality_score >= 4:
+        quality_label = "NORMAL"
+        stop_distance = BASE_STOP_LOSS_DISTANCE_USD
+        tp_rr = NORMAL_TP_RR
 
     else:
-        take_profit_price = entry_price - POSITION_TAKE_PROFIT_DISTANCE_USD
-        stop_loss_price = entry_price + POSITION_STOP_LOSS_DISTANCE_USD
+        quality_label = "WEAK"
+        stop_distance = BASE_STOP_LOSS_DISTANCE_USD * 0.75
+        tp_rr = WEAK_TP_RR
+
+    # Adapt stop distance to live volatility
+    volatility_adjustment = live_atr * 0.50
+
+    stop_distance = stop_distance + volatility_adjustment
+
+    stop_distance = max(
+        MIN_STOP_LOSS_DISTANCE_USD,
+        min(stop_distance, MAX_STOP_LOSS_DISTANCE_USD)
+    )
+
+    take_profit_distance = stop_distance * tp_rr
+
+    if direction == "BUY":
+        take_profit_price = entry_price + take_profit_distance
+        stop_loss_price = entry_price - stop_distance
+
+    else:
+        take_profit_price = entry_price - take_profit_distance
+        stop_loss_price = entry_price + stop_distance
 
     return (
         round(take_profit_price, 2),
-        round(stop_loss_price, 2)
+        round(stop_loss_price, 2),
+        quality_label,
+        round(stop_distance, 2),
+        round(take_profit_distance, 2)
     )
 
 # ============================================================
 # ORDER EXECUTION
 # ============================================================
-async def open_first_scalp_position(
+async def open_quality_ticket(
     connection,
     symbol,
     direction,
     volume,
     key,
     entry_price,
+    entry_quality_score,
+    live_atr,
     specification=None
 ):
     volume = normalize_lot_size(
@@ -530,12 +596,14 @@ async def open_first_scalp_position(
         specification
     )
 
-    take_profit_price, stop_loss_price = calculate_individual_tp_sl(
+    take_profit_price, stop_loss_price, quality_label, stop_distance, tp_distance = calculate_quality_based_tp_sl(
         direction,
-        entry_price
+        entry_price,
+        entry_quality_score,
+        live_atr
     )
 
-    bot_signature = f"GHOST-INDIVIDUAL-TP [{key}]"
+    bot_signature = f"GHOST-QUALITY-{quality_label} [{key}]"
 
     if direction == "BUY":
         result = await connection.create_market_buy_order(
@@ -556,13 +624,15 @@ async def open_first_scalp_position(
         )
 
     print(
-        f"[FIRST TICKET OPENED] {direction} {volume} lots | "
-        f"{symbol} | TP: {take_profit_price} | SL: {stop_loss_price}"
+        f"[QUALITY TICKET OPENED] {direction} {volume} lots | "
+        f"{symbol} | Quality: {quality_label} | "
+        f"TP: {take_profit_price} (+{tp_distance}) | "
+        f"SL: {stop_loss_price} (-{stop_distance})"
     )
 
     return result
 
-async def add_scalp_position(
+async def add_quality_ticket(
     connection,
     symbol,
     direction,
@@ -570,6 +640,8 @@ async def add_scalp_position(
     key,
     position_number,
     entry_price,
+    entry_quality_score,
+    live_atr,
     specification=None
 ):
     volume = normalize_lot_size(
@@ -577,12 +649,14 @@ async def add_scalp_position(
         specification
     )
 
-    take_profit_price, stop_loss_price = calculate_individual_tp_sl(
+    take_profit_price, stop_loss_price, quality_label, stop_distance, tp_distance = calculate_quality_based_tp_sl(
         direction,
-        entry_price
+        entry_price,
+        entry_quality_score,
+        live_atr
     )
 
-    bot_signature = f"GHOST-INDIVIDUAL-TP-{position_number} [{key}]"
+    bot_signature = f"GHOST-QUALITY-{quality_label}-{position_number} [{key}]"
 
     if direction == "BUY":
         result = await connection.create_market_buy_order(
@@ -603,9 +677,10 @@ async def add_scalp_position(
         )
 
     print(
-        f"[TICKET ADDED] {direction} {volume} lots | "
-        f"{symbol} | Position {position_number} | "
-        f"TP: {take_profit_price} | SL: {stop_loss_price}"
+        f"[QUALITY TICKET ADDED] {direction} {volume} lots | "
+        f"{symbol} | Position {position_number} | Quality: {quality_label} | "
+        f"TP: {take_profit_price} (+{tp_distance}) | "
+        f"SL: {stop_loss_price} (-{stop_distance})"
     )
 
     return result
@@ -730,7 +805,7 @@ async def get_existing_metaapi_accounts(api):
         print(f"[ACCOUNT SEARCH NOTICE] {error}")
         return []
 
-def is_metaapi_quota_error(error_text: str) -> bool:
+def is_metaapi_quota_error(error_text):
     text = error_text.lower()
     return (
         "top up" in text
@@ -954,7 +1029,7 @@ async def connect_metaapi_account(account, login):
     )
 
 # ============================================================
-# GHOST MULTI-POSITION INDIVIDUAL-TP ENGINE
+# GHOST ADAPTIVE QUALITY INDIVIDUAL-TP ENGINE
 # ============================================================
 async def high_frequency_trading_engine(
     login,
@@ -965,7 +1040,7 @@ async def high_frequency_trading_engine(
     token=None
 ):
     print(
-        f"[GHOST MULTI-POSITION INDIVIDUAL-TP ENGINE INITIALIZED] Starting trading loop for {login}..."
+        f"[GHOST ADAPTIVE QUALITY INDIVIDUAL-TP ENGINE INITIALIZED] Starting trading loop for {login}..."
     )
 
     tracker = MicroMomentumTracker()
@@ -1027,7 +1102,7 @@ async def high_frequency_trading_engine(
 
         print(
             f"[GHOST ENGINE LIVE] Trading {active_symbol} | "
-            f"Multi-position individual-TP scalping enabled"
+            f"Adaptive quality individual-TP scalping enabled"
         )
 
         while active_trading_nodes.get(str(login), False):
@@ -1062,6 +1137,8 @@ async def high_frequency_trading_engine(
                 current_price = (current_ask + current_bid) / 2.0
 
                 tracker.record_tick(current_price)
+
+                live_atr = tracker.calculate_live_atr()
 
                 positions = terminal_state.positions or []
 
@@ -1171,16 +1248,19 @@ async def high_frequency_trading_engine(
                             f"Entry score: {entry_quality_score} | "
                             f"Entry type: {entry_type} | "
                             f"Lot: {position_lot} | "
-                            f"Max positions: {max_positions}"
+                            f"Max positions: {max_positions} | "
+                            f"Live ATR: {live_atr}"
                         )
 
-                        await open_first_scalp_position(
+                        await open_quality_ticket(
                             connection,
                             active_symbol,
                             direction,
                             position_lot,
                             key,
                             current_price,
+                            entry_quality_score,
+                            live_atr,
                             specification
                         )
 
@@ -1214,7 +1294,7 @@ async def high_frequency_trading_engine(
 
                     if can_add_ticket:
 
-                        await add_scalp_position(
+                        await add_quality_ticket(
                             connection,
                             active_symbol,
                             last_batch_direction,
@@ -1222,6 +1302,8 @@ async def high_frequency_trading_engine(
                             key,
                             open_position_count + 1,
                             current_price,
+                            entry_quality_score,
+                            live_atr,
                             specification
                         )
 
@@ -1324,8 +1406,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Ghost Multi-Position Individual-TP Gold Scalper",
-        "mode": "Original Tick-Momentum Entry + Individual TP/SL + Fast Re-Entry"
+        "service": "Ghost Adaptive Quality Individual-TP Gold Scalper",
+        "mode": "Original Tick-Momentum Entry + Quality-Based TP/SL + Multi-Position"
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -1333,7 +1415,7 @@ def health_root():
 def health_ping():
     return jsonify({
         "status": "healthy",
-        "service": "Ghost Multi-Position Gold Engine",
+        "service": "Ghost Adaptive Quality Gold Engine",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }), 200
 
@@ -1531,7 +1613,7 @@ def control_dispatcher():
                 "status": "success",
                 "success": True,
                 "message": (
-                    f"License [{license_key}] Verified. Ghost Multi-Position "
+                    f"License [{license_key}] Verified. Ghost Adaptive Quality "
                     f"Individual-TP Scalper active on {mt5_symbol}."
                 ),
                 "login": login_str,
@@ -1559,7 +1641,7 @@ def control_dispatcher():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     print(
-        f"[STARTUP] Running Ghost Multi-Position Individual-TP Scalper "
+        f"[STARTUP] Running Ghost Adaptive Quality Individual-TP Scalper "
         f"on 0.0.0.0:{port}..."
     )
     serve(app, host="0.0.0.0", port=port, threads=8)
