@@ -60,14 +60,17 @@ MULTI_SCALP_COOLDOWN_SECONDS = 3
 MAX_POSITIONS_HARD_LIMIT = 18
 
 # ============================================================
-# DYNAMIC TP / SL SETTINGS
+# BALANCED RISK SETTINGS
+# BETWEEN BOT 8 AND BOT 10
 # ============================================================
-BASE_STOP_LOSS_USD = 3.00
-BASE_TAKE_PROFIT_USD = 2.50
-MIN_STOP_LOSS_USD = 2.00
-MIN_TAKE_PROFIT_USD = 1.50
-MAX_STOP_LOSS_USD = 12.00
-MAX_TAKE_PROFIT_USD = 10.00
+BASE_STOP_LOSS_USD = 2.00
+BASE_TAKE_PROFIT_USD = 2.20
+
+MIN_STOP_LOSS_USD = 1.50
+MAX_STOP_LOSS_USD = 3.00
+
+MIN_TAKE_PROFIT_USD = 1.80
+MAX_TAKE_PROFIT_USD = 3.50
 
 # ============================================================
 # CONNECTION TIMEOUTS
@@ -302,7 +305,7 @@ def calculate_added_position_lot(equity, balance, confidence_score, position_num
     return round(base_lot, 2)
 
 # ============================================================
-# DYNAMIC TP / SL CALCULATOR
+# BALANCED DYNAMIC TP / SL CALCULATOR
 # ============================================================
 def calculate_dynamic_tp_sl(
     direction,
@@ -313,16 +316,12 @@ def calculate_dynamic_tp_sl(
     recent_price_movement
 ):
     """
-    Creates a non-fixed TP and SL for every position.
+    Balanced risk between Bot 8 and Bot 10.
 
-    The SL becomes wider when:
-    - Spread is wider.
-    - Market movement is stronger.
-    - Confidence is lower.
-
-    The TP becomes wider when:
-    - Market movement is stronger.
-    - Confidence is higher.
+    Typical result:
+    SL distance: $1.50 - $3.00
+    TP distance: $1.80 - $3.50
+    Reward-to-risk: about 1.0 - 1.2
     """
 
     spread_usd = current_spread_pips * 0.10
@@ -330,32 +329,32 @@ def calculate_dynamic_tp_sl(
     movement_multiplier = 1.0
 
     if recent_price_movement > 0.50:
-        movement_multiplier = 1.50
+        movement_multiplier = 1.30
     elif recent_price_movement > 0.25:
-        movement_multiplier = 1.25
+        movement_multiplier = 1.15
     elif recent_price_movement > 0.10:
-        movement_multiplier = 1.10
+        movement_multiplier = 1.05
 
     confidence_multiplier = 1.0
 
     if confidence_score >= 8:
-        confidence_multiplier = 1.20
+        confidence_multiplier = 1.15
     elif confidence_score >= 6:
-        confidence_multiplier = 1.10
+        confidence_multiplier = 1.08
     elif confidence_score <= 2:
-        confidence_multiplier = 0.85
+        confidence_multiplier = 0.90
 
-    position_adjustment = (position_number - 1) * 0.10
+    position_adjustment = (position_number - 1) * 0.08
 
     stop_loss_distance = (
         BASE_STOP_LOSS_USD
-        + spread_usd
+        + (spread_usd * 0.50)
         + position_adjustment
     ) * movement_multiplier
 
     take_profit_distance = (
         BASE_TAKE_PROFIT_USD
-        + (spread_usd * 0.50)
+        + (spread_usd * 0.30)
         + position_adjustment
     ) * movement_multiplier * confidence_multiplier
 
@@ -369,6 +368,10 @@ def calculate_dynamic_tp_sl(
         min(MAX_TAKE_PROFIT_USD, take_profit_distance)
     )
 
+    # Ensure TP is normally at least equal to SL
+    if take_profit_distance < stop_loss_distance:
+        take_profit_distance = stop_loss_distance
+
     if direction == "BUY":
         stop_loss = entry_price - stop_loss_distance
         take_profit = entry_price + take_profit_distance
@@ -381,7 +384,11 @@ def calculate_dynamic_tp_sl(
         "stop_loss": round(stop_loss, 2),
         "take_profit": round(take_profit, 2),
         "stop_loss_distance": round(stop_loss_distance, 2),
-        "take_profit_distance": round(take_profit_distance, 2)
+        "take_profit_distance": round(take_profit_distance, 2),
+        "reward_risk_ratio": round(
+            take_profit_distance / stop_loss_distance,
+            2
+        )
     }
 
 # ============================================================
@@ -470,7 +477,7 @@ async def open_dynamic_scalp_position(
     key,
     position_number
 ):
-    bot_signature = f"DYNAMIC-SCALP-{position_number} [{key}]"
+    bot_signature = f"BALANCED-SCALP-{position_number} [{key}]"
 
     if direction == "BUY":
         result = await connection.create_market_buy_order(
@@ -491,7 +498,7 @@ async def open_dynamic_scalp_position(
         )
 
     print(
-        f"[DYNAMIC POSITION OPENED] #{position_number} | "
+        f"[BALANCED DYNAMIC POSITION OPENED] #{position_number} | "
         f"{direction} | {volume} lots | {symbol} | "
         f"SL={stop_loss} | TP={take_profit}"
     )
@@ -868,7 +875,7 @@ async def connect_metaapi_account(account, login):
     )
 
 # ============================================================
-# ORIGINAL CORE + DYNAMIC MULTI-POSITION ENGINE
+# ORIGINAL CORE + BALANCED MULTI-POSITION ENGINE
 # ============================================================
 async def high_frequency_trading_engine(
     login,
@@ -879,7 +886,7 @@ async def high_frequency_trading_engine(
     token=None
 ):
     print(
-        f"[DYNAMIC MULTI-POSITION ENGINE INITIALIZED] "
+        f"[BALANCED MULTI-POSITION ENGINE INITIALIZED] "
         f"Starting trading loop for {login}..."
     )
 
@@ -948,7 +955,7 @@ async def high_frequency_trading_engine(
         terminal_state = connection.terminal_state
 
         print(
-            f"[CORE LIVE] Dynamic multi-position engine active "
+            f"[CORE LIVE] Balanced multi-position engine active "
             f"on {active_symbol}!"
         )
 
@@ -1114,7 +1121,7 @@ async def high_frequency_trading_engine(
                         continue
 
                 # ========================================================
-                # OPEN FIRST DYNAMIC POSITION
+                # OPEN FIRST BALANCED DYNAMIC POSITION
                 # ========================================================
                 if open_position_count == 0:
 
@@ -1144,12 +1151,13 @@ async def high_frequency_trading_engine(
                             )
 
                             print(
-                                f"[FIRST DYNAMIC ENTRY] {direction} | "
+                                f"[FIRST BALANCED ENTRY] {direction} | "
                                 f"confidence={confidence} | "
                                 f"lot={first_lot} | "
                                 f"max_positions={max_positions} | "
                                 f"SL={tp_sl['stop_loss']} | "
-                                f"TP={tp_sl['take_profit']}"
+                                f"TP={tp_sl['take_profit']} | "
+                                f"R:R={tp_sl['reward_risk_ratio']}"
                             )
 
                             await open_dynamic_scalp_position(
@@ -1174,7 +1182,7 @@ async def high_frequency_trading_engine(
                             continue
 
                 # ========================================================
-                # ADD DYNAMIC POSITIONS ONLY WHILE BASKET IS PROFITABLE
+                # ADD BALANCED DYNAMIC POSITIONS IN PROFIT
                 # ========================================================
                 elif (
                     open_position_count > 0
@@ -1239,13 +1247,14 @@ async def high_frequency_trading_engine(
                         )
 
                         print(
-                            f"[ADDING DYNAMIC POSITION] "
+                            f"[ADDING BALANCED POSITION] "
                             f"#{open_position_count + 1} | "
                             f"{last_batch_direction} | "
                             f"lot={added_lot} | "
                             f"basket_profit={basket_profit:.2f} | "
                             f"SL={tp_sl['stop_loss']} | "
-                            f"TP={tp_sl['take_profit']}"
+                            f"TP={tp_sl['take_profit']} | "
+                            f"R:R={tp_sl['reward_risk_ratio']}"
                         )
 
                         await open_dynamic_scalp_position(
@@ -1393,8 +1402,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Gold Dynamic Multi-Position Scalper",
-        "mode": "Original Core + Dynamic TP/SL + Aggressive Lot Scaling"
+        "service": "Gold Balanced Multi-Position Scalper",
+        "mode": "Original Core + Balanced Dynamic TP/SL"
     }), 200
 
 
@@ -1403,7 +1412,7 @@ def health_root():
 def health_ping():
     return jsonify({
         "status": "healthy",
-        "service": "Gold Dynamic Multi-Position Scalper",
+        "service": "Gold Balanced Multi-Position Scalper",
         "timestamp": datetime.datetime.now(
             datetime.timezone.utc
         ).isoformat()
@@ -1630,7 +1639,7 @@ def control_dispatcher():
                 "success": True,
                 "message": (
                     f"License [{license_key}] Verified. "
-                    f"Dynamic multi-position scalper active "
+                    f"Balanced multi-position scalper active "
                     f"on {mt5_symbol}."
                 ),
                 "login": login_str,
@@ -1659,7 +1668,7 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
 
     print(
-        f"[STARTUP] Running Gold Dynamic Multi-Position Scalper on "
+        f"[STARTUP] Running Gold Balanced Multi-Position Scalper on "
         f"0.0.0.0:{port}..."
     )
 
