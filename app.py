@@ -1,5 +1,5 @@
 import os
-import sys
+import time
 import json
 import sqlite3
 import asyncio
@@ -7,7 +7,6 @@ import threading
 import datetime
 import traceback
 import functools
-import random
 from collections import deque
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -19,7 +18,7 @@ print = functools.partial(print, flush=True)
 app = Flask(__name__)
 
 # ============================================================
-# CROSS-ORIGIN RESOURCE SHARING (CORS) CONFIGURATION
+# CORS CONFIGURATION
 # ============================================================
 CORS(app, resources={r"/*": {"origins": "*"}})
 
@@ -32,7 +31,7 @@ def add_cors_headers(response):
     return response
 
 # ============================================================
-# MASTER LICENSE & SECURITY CONFIGURATION
+# MASTER LICENSE & SECURITY
 # ============================================================
 METAAPI_TOKEN = os.environ.get("METAAPI_TOKEN", "").strip()
 ALLOWED_LICENSES = ["BOSSMODE98", "BOSSMODE99"]
@@ -47,22 +46,18 @@ live_account_telemetry = {}
 active_connections = {}
 
 # ============================================================
-# GOLD-ONLY CONTINUOUS INDIVIDUAL-TP SCALPER SETTINGS
+# GHOST FAST CONTINUOUS INDIVIDUAL-TP SCALPER
 # ============================================================
-MAX_ALLOWED_SPREAD_PIPS = 35.0
+MAX_ALLOWED_SPREAD_PIPS = 25.0
 POLL_LATENCY_DELAY = 0.05
-FAST_REENTRY_COOLDOWN_SECONDS = 3.0
-MIN_PRICE_DISTANCE_USD = 0.20
-ADD_POSITION_MOVE_USD = 0.15
+FAST_REENTRY_COOLDOWN_SECONDS = 2.0
 
 POSITION_TAKE_PROFIT_DISTANCE_USD = 0.40
 POSITION_STOP_LOSS_DISTANCE_USD = 0.80
-POSITION_TP_STEP_USD = 0.05
 
-USE_INDIVIDUAL_TAKE_PROFIT = True
-USE_BASKET_PROFIT_TARGET = False
-
-MAX_LOSING_POSITIONS = 3
+MAX_OPEN_POSITIONS = 1
+DAILY_LOSS_LIMIT_PERCENT = 0.0
+MAX_CONSECUTIVE_LOSSES = 0
 
 M5_RANGE_LOOKBACK = 20
 M5_REJECTION_BUFFER = 0.50
@@ -77,7 +72,7 @@ BROKER_CONNECT_TIMEOUT_SECONDS = 120
 STREAM_CONNECT_TIMEOUT_SECONDS = 60
 
 # ============================================================
-# SECURE SERVER-SIDE DATABASE (SQLITE)
+# SECURE SERVER-SIDE DATABASE
 # ============================================================
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -157,242 +152,97 @@ def get_metaapi_client(override_token: str = None):
 # DYNAMIC EQUITY-BASED SCALP PLAN
 # ============================================================
 def calculate_dynamic_scalp_plan(equity: float, balance: float, entry_quality_score: int):
-    """
-    Returns:
-        position_lot
-        max_positions
-    """
-
     capital = max(equity, balance)
     score = entry_quality_score
 
-    # ------------------------------------------------------------
-    # UNDER $4: 1-2 POSITIONS, 0.01-0.02 LOT
-    # ------------------------------------------------------------
     if capital < 4.0:
+        return 0.01, 1
 
-        if score <= 3:
-            position_lot = 0.01
-            max_positions = 1
-
-        elif score <= 6:
-            position_lot = 0.01 if capital < 3.0 else 0.02
-            max_positions = 1
-
-        else:
-            position_lot = 0.02
-            max_positions = 2
-
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $4-$10: 2-3 POSITIONS, 0.01-0.02 LOT
-    # ------------------------------------------------------------
     elif capital < 10.0:
-
-        if score <= 3:
-            position_lot = 0.01
-            max_positions = 2
-
-        elif score <= 6:
-            position_lot = 0.01 if capital < 7.0 else 0.02
-            max_positions = 2
-
+        if score <= 6:
+            return 0.01, 1
         else:
-            position_lot = 0.02
-            max_positions = 3
+            return 0.02, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $10-$25: 3-5 POSITIONS, 0.01-0.03 LOT
-    # ------------------------------------------------------------
     elif capital < 25.0:
-
         if score <= 3:
-            position_lot = 0.01
-            max_positions = 3
-
+            return 0.01, 1
         elif score <= 6:
-            position_lot = 0.02
-            max_positions = 4
-
+            return 0.02, 1
         else:
-            position_lot = 0.03
-            max_positions = 5
+            return 0.02, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $25-$50: 5-7 POSITIONS, 0.02-0.03 LOT
-    # ------------------------------------------------------------
     elif capital < 50.0:
-
         if score <= 3:
-            position_lot = 0.02
-            max_positions = 5
-
+            return 0.02, 1
         elif score <= 6:
-            position_lot = 0.02
-            max_positions = 6
-
+            return 0.02, 1
         else:
-            position_lot = 0.03
-            max_positions = 7
+            return 0.03, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $50-$100: 7-9 POSITIONS, 0.02-0.04 LOT
-    # ------------------------------------------------------------
     elif capital < 100.0:
-
         if score <= 3:
-            position_lot = 0.02
-            max_positions = 7
-
+            return 0.02, 1
         elif score <= 6:
-            position_lot = 0.03
-            max_positions = 8
-
+            return 0.03, 1
         else:
-            position_lot = 0.04
-            max_positions = 9
+            return 0.04, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $100-$250: 9-12 POSITIONS, 0.02-0.05 LOT
-    # ------------------------------------------------------------
     elif capital < 250.0:
-
         if score <= 3:
-            position_lot = 0.02
-            max_positions = 9
-
+            return 0.02, 1
         elif score <= 6:
-            position_lot = 0.03 if capital < 180 else 0.04
-            max_positions = 10
-
+            return 0.03, 1
         else:
-            position_lot = 0.05
-            max_positions = 12
+            return 0.05, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $250-$500: 12-14 POSITIONS, 0.03-0.06 LOT
-    # ------------------------------------------------------------
     elif capital < 500.0:
-
         if score <= 3:
-            position_lot = 0.03
-            max_positions = 12
-
+            return 0.03, 1
         elif score <= 6:
-            position_lot = 0.04 if capital < 380 else 0.05
-            max_positions = 13
-
+            return 0.04, 1
         else:
-            position_lot = 0.06
-            max_positions = 14
+            return 0.06, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $500-$1,000: 14-16 POSITIONS, 0.04-0.08 LOT
-    # ------------------------------------------------------------
     elif capital < 1000.0:
-
         if score <= 3:
-            position_lot = 0.04
-            max_positions = 14
-
+            return 0.04, 1
         elif score <= 6:
-            position_lot = 0.05 if capital < 750 else 0.06
-            max_positions = 15
-
+            return 0.05, 1
         else:
-            position_lot = 0.08
-            max_positions = 16
+            return 0.08, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $1,000-$2,000: 16-18 POSITIONS, 0.05-0.10 LOT
-    # ------------------------------------------------------------
     elif capital < 2000.0:
-
         if score <= 3:
-            position_lot = 0.05
-            max_positions = 16
-
+            return 0.05, 1
         elif score <= 6:
-            position_lot = 0.07 if capital < 1500 else 0.08
-            max_positions = 17
-
+            return 0.07, 1
         else:
-            position_lot = 0.10
-            max_positions = 18
+            return 0.10, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $2,000-$5,000: 18 POSITIONS, 0.08-0.15 LOT
-    # ------------------------------------------------------------
     elif capital < 5000.0:
-
         if score <= 3:
-            position_lot = 0.08
-            max_positions = 18
-
+            return 0.08, 1
         elif score <= 6:
-            position_lot = 0.10 if capital < 3500 else 0.12
-            max_positions = 18
-
+            return 0.10, 1
         else:
-            position_lot = 0.15
-            max_positions = 18
+            return 0.15, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # $5,000-$10,000: 18 POSITIONS, 0.10-0.20 LOT
-    # ------------------------------------------------------------
     elif capital < 10000.0:
-
         if score <= 3:
-            position_lot = 0.10
-            max_positions = 18
-
+            return 0.10, 1
         elif score <= 6:
-            position_lot = 0.15
-            max_positions = 18
-
+            return 0.15, 1
         else:
-            position_lot = 0.20
-            max_positions = 18
+            return 0.20, 1
 
-        return position_lot, max_positions
-
-    # ------------------------------------------------------------
-    # ABOVE $10,000: 18 POSITIONS, 0.15-0.30 LOT
-    # ------------------------------------------------------------
     else:
-
         if score <= 3:
-            position_lot = 0.15
-            max_positions = 18
-
+            return 0.15, 1
         elif score <= 6:
-            position_lot = 0.20 if capital < 20000 else 0.25
-            max_positions = 18
-
+            return 0.20, 1
         else:
-            position_lot = 0.30
-            max_positions = 18
-
-        return position_lot, max_positions
+            return 0.30, 1
 
 # ============================================================
 # ENTRY-QUALITY SCORER
@@ -404,14 +254,8 @@ def calculate_entry_quality_score(
     momentum_continuation,
     pullback_continuation,
     breakout_confirmed,
-    current_spread_pips,
-    price_distance
+    current_spread_pips
 ):
-    """
-    Original tick-momentum logic is the ONLY entry trigger.
-    These signals only score the quality of that original entry.
-    """
-
     score = 0
 
     if tick_direction in ["BUY", "SELL"]:
@@ -438,18 +282,15 @@ def calculate_entry_quality_score(
     if breakout_confirmed:
         score += 2
 
-    if current_spread_pips <= 20:
+    if current_spread_pips <= 15:
         score += 2
-    elif current_spread_pips <= 30:
-        score += 1
-
-    if price_distance >= 0.50:
+    elif current_spread_pips <= 20:
         score += 1
 
     return max(0, min(score, 10))
 
 # ============================================================
-# BUYER / SELLER MICRO-MOMENTUM TRACKER
+# MICRO-MOMENTUM TRACKER
 # ============================================================
 class MicroMomentumTracker:
     def __init__(self, capacity=10):
@@ -651,22 +492,13 @@ def normalize_lot_size(lot, specification):
 # ============================================================
 # INDIVIDUAL TP / SL CALCULATION
 # ============================================================
-def calculate_individual_tp_sl(
-    direction,
-    entry_price,
-    position_number
-):
-    tp_distance = (
-        POSITION_TAKE_PROFIT_DISTANCE_USD
-        + (POSITION_TP_STEP_USD * (position_number - 1))
-    )
-
+def calculate_individual_tp_sl(direction, entry_price):
     if direction == "BUY":
-        take_profit_price = entry_price + tp_distance
+        take_profit_price = entry_price + POSITION_TAKE_PROFIT_DISTANCE_USD
         stop_loss_price = entry_price - POSITION_STOP_LOSS_DISTANCE_USD
 
     else:
-        take_profit_price = entry_price - tp_distance
+        take_profit_price = entry_price - POSITION_TAKE_PROFIT_DISTANCE_USD
         stop_loss_price = entry_price + POSITION_STOP_LOSS_DISTANCE_USD
 
     return (
@@ -677,7 +509,7 @@ def calculate_individual_tp_sl(
 # ============================================================
 # ORDER EXECUTION
 # ============================================================
-async def open_first_scalp_position(
+async def open_fast_individual_tp_ticket(
     connection,
     symbol,
     direction,
@@ -693,11 +525,10 @@ async def open_first_scalp_position(
 
     take_profit_price, stop_loss_price = calculate_individual_tp_sl(
         direction,
-        entry_price,
-        1
+        entry_price
     )
 
-    bot_signature = f"GHOST-INDIVIDUAL-TP [{key}]"
+    bot_signature = f"GHOST-FAST-INDIVIDUAL-TP [{key}]"
 
     if direction == "BUY":
         result = await connection.create_market_buy_order(
@@ -718,57 +549,8 @@ async def open_first_scalp_position(
         )
 
     print(
-        f"[FIRST TICKET OPENED] {direction} {volume} lots | "
+        f"[FAST TICKET OPENED] {direction} {volume} lots | "
         f"{symbol} | TP: {take_profit_price} | SL: {stop_loss_price}"
-    )
-
-    return result
-
-async def add_scalp_position(
-    connection,
-    symbol,
-    direction,
-    volume,
-    key,
-    position_number,
-    entry_price,
-    specification=None
-):
-    volume = normalize_lot_size(
-        volume,
-        specification
-    )
-
-    take_profit_price, stop_loss_price = calculate_individual_tp_sl(
-        direction,
-        entry_price,
-        position_number
-    )
-
-    bot_signature = f"GHOST-INDIVIDUAL-TP-{position_number} [{key}]"
-
-    if direction == "BUY":
-        result = await connection.create_market_buy_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=stop_loss_price,
-            take_profit=take_profit_price,
-            options={"comment": bot_signature}
-        )
-
-    else:
-        result = await connection.create_market_sell_order(
-            symbol=symbol,
-            volume=volume,
-            stop_loss=stop_loss_price,
-            take_profit=take_profit_price,
-            options={"comment": bot_signature}
-        )
-
-    print(
-        f"[TICKET ADDED] {direction} {volume} lots | "
-        f"{symbol} | Position {position_number} | "
-        f"TP: {take_profit_price} | SL: {stop_loss_price}"
     )
 
     return result
@@ -1117,7 +899,7 @@ async def connect_metaapi_account(account, login):
     )
 
 # ============================================================
-# GOLD-ONLY CONTINUOUS INDIVIDUAL-TP ENGINE
+# GHOST FAST CONTINUOUS INDIVIDUAL-TP ENGINE
 # ============================================================
 async def high_frequency_trading_engine(
     login,
@@ -1128,14 +910,12 @@ async def high_frequency_trading_engine(
     token=None
 ):
     print(
-        f"[GOLD INDIVIDUAL-TP ENGINE INITIALIZED] Starting trading loop for {login}..."
+        f"[GHOST FAST INDIVIDUAL-TP ENGINE INITIALIZED] Starting trading loop for {login}..."
     )
 
     tracker = MicroMomentumTracker()
 
-    last_batch_entry_price = 0.0
-    last_batch_close_time = 0.0
-    last_batch_direction = None
+    last_close_time = 0.0
 
     def update_telemetry(
         connected,
@@ -1189,8 +969,8 @@ async def high_frequency_trading_engine(
         terminal_state = connection.terminal_state
 
         print(
-            f"[GOLD ENGINE LIVE] Trading {active_symbol} | "
-            f"Continuous individual-TP scalping enabled"
+            f"[GHOST ENGINE LIVE] Trading {active_symbol} | "
+            f"Fast continuous individual-TP scalping enabled"
         )
 
         while active_trading_nodes.get(str(login), False):
@@ -1235,12 +1015,6 @@ async def high_frequency_trading_engine(
 
                 open_position_count = len(gold_positions)
 
-                losing_position_count = 0
-
-                for position in gold_positions:
-                    if float(position.get("profit", 0) or 0) < 0:
-                        losing_position_count += 1
-
                 floating_profit = 0.0
 
                 for position in gold_positions:
@@ -1254,8 +1028,6 @@ async def high_frequency_trading_engine(
                     (current_ask - current_bid) / 0.1,
                     2
                 )
-
-                price_distance = abs(current_price - last_batch_entry_price)
 
                 m5_signal = await get_m5_reversal_signal(
                     account,
@@ -1285,8 +1057,7 @@ async def high_frequency_trading_engine(
                     momentum_continuation,
                     pullback_continuation,
                     breakout_confirmed,
-                    current_spread_pips,
-                    price_distance
+                    current_spread_pips
                 )
 
                 position_lot, max_positions = calculate_dynamic_scalp_plan(
@@ -1321,32 +1092,31 @@ async def high_frequency_trading_engine(
                 )
 
                 # ================================================
-                # 1. OPEN FIRST TICKET FROM ORIGINAL TICK LOGIC
+                # FAST CONTINUOUS INDIVIDUAL-TP ENTRY
                 # ================================================
-                if open_position_count == 0:
+                if open_position_count < max_positions:
 
-                    time_since_last_entry = time.time() - last_batch_close_time
+                    time_since_last_close = time.time() - last_close_time
 
-                    pre_entry_conditions_pass = (
+                    can_enter = (
                         broker_connected
                         and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
                         and free_margin > 0
-                        and time_since_last_entry >= FAST_REENTRY_COOLDOWN_SECONDS
-                        and price_distance >= MIN_PRICE_DISTANCE_USD
+                        and time_since_last_close >= FAST_REENTRY_COOLDOWN_SECONDS
+                        and direction in ["BUY", "SELL"]
                     )
 
-                    if pre_entry_conditions_pass and direction in ["BUY", "SELL"]:
+                    if can_enter:
 
                         print(
-                            f"[ORIGINAL TICK ENTRY] {direction} | "
+                            f"[FAST ENTRY] {direction} | "
                             f"Confidence: {confidence} | "
                             f"Entry score: {entry_quality_score} | "
                             f"Entry type: {entry_type} | "
-                            f"Lot: {position_lot} | "
-                            f"Max positions: {max_positions}"
+                            f"Lot: {position_lot}"
                         )
 
-                        await open_first_scalp_position(
+                        await open_fast_individual_tp_ticket(
                             connection,
                             active_symbol,
                             direction,
@@ -1355,50 +1125,6 @@ async def high_frequency_trading_engine(
                             current_price,
                             specification
                         )
-
-                        last_batch_entry_price = current_price
-                        last_batch_close_time = time.time()
-                        last_batch_direction = direction
-
-                        await asyncio.sleep(0.2)
-                        continue
-
-                # ================================================
-                # 2. ADD ANOTHER TICKET ONLY IN PROFIT
-                # ================================================
-                elif open_position_count < max_positions:
-
-                    if last_batch_direction == "BUY":
-                        price_progress = current_price - last_batch_entry_price
-
-                    elif last_batch_direction == "SELL":
-                        price_progress = last_batch_entry_price - current_price
-
-                    else:
-                        price_progress = 0
-
-                    can_add_ticket = (
-                        floating_profit > 0
-                        and price_progress >= ADD_POSITION_MOVE_USD
-                        and current_spread_pips <= MAX_ALLOWED_SPREAD_PIPS
-                        and free_margin > 0
-                        and losing_position_count < MAX_LOSING_POSITIONS
-                    )
-
-                    if can_add_ticket:
-
-                        await add_scalp_position(
-                            connection,
-                            active_symbol,
-                            last_batch_direction,
-                            position_lot,
-                            key,
-                            open_position_count + 1,
-                            current_price,
-                            specification
-                        )
-
-                        last_batch_entry_price = current_price
 
                         await asyncio.sleep(0.2)
                         continue
@@ -1497,8 +1223,8 @@ def extract_request_data(req):
 def health_root():
     return jsonify({
         "status": "online",
-        "service": "Ghost Continuous Gold Individual-TP Scalper",
-        "mode": "Original Tick-Momentum Entry + Individual TP/SL + Dynamic Sizing"
+        "service": "Ghost Fast Continuous Individual-TP Gold Scalper",
+        "mode": "Original Tick-Momentum Entry + Individual TP/SL + 2-Second Cooldown"
     }), 200
 
 @app.route("/health", methods=["GET"])
@@ -1506,7 +1232,7 @@ def health_root():
 def health_ping():
     return jsonify({
         "status": "healthy",
-        "service": "Ghost Continuous Gold Engine",
+        "service": "Ghost Fast Continuous Gold Engine",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }), 200
 
@@ -1704,8 +1430,8 @@ def control_dispatcher():
                 "status": "success",
                 "success": True,
                 "message": (
-                    f"License [{license_key}] Verified. Continuous Gold Individual-TP "
-                    f"Scalper active on {mt5_symbol}."
+                    f"License [{license_key}] Verified. Ghost Fast Continuous "
+                    f"Individual-TP Scalper active on {mt5_symbol}."
                 ),
                 "login": login_str,
                 "symbol": mt5_symbol
@@ -1732,7 +1458,7 @@ def control_dispatcher():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     print(
-        f"[STARTUP] Running Ghost Continuous Gold Individual-TP Scalper "
+        f"[STARTUP] Running Ghost Fast Continuous Individual-TP Scalper "
         f"on 0.0.0.0:{port}..."
     )
     serve(app, host="0.0.0.0", port=port, threads=8)
