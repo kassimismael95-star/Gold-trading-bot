@@ -1,146 +1,176 @@
 import unittest
 
 from core.risk_manager import (
-    calculate_video_dynamic_burst,
-    calculate_added_position_lot,
-    calculate_dynamic_tp_sl,
-    MAX_ALLOWED_SPREAD_PIPS
+    calculate_position_size,
+    calculate_stop_loss,
+    calculate_take_profit,
+    is_risk_within_limits,
+    should_block_new_trade
 )
 
 
 class TestRiskManager(unittest.TestCase):
-    def test_small_account_uses_minimum_lot(self):
-        result = calculate_video_dynamic_burst(
-            equity=3.00,
-            balance=3.00,
-            confidence_score=8
+    def test_calculate_position_size_returns_positive_value(self):
+        size = calculate_position_size(
+            balance=1000.00,
+            risk_percent=1.0,
+            stop_loss_pips=20.0,
+            pip_value=0.10
         )
 
-        first_lot, max_positions, basket_target = result
+        self.assertGreater(size, 0)
 
-        self.assertEqual(first_lot, 0.01)
-        self.assertEqual(max_positions, 2)
-        self.assertEqual(basket_target, 0.35)
-
-    def test_low_confidence_reduces_positions(self):
-        result = calculate_video_dynamic_burst(
-            equity=20.00,
-            balance=20.00,
-            confidence_score=3
+    def test_calculate_position_size_respects_risk_amount(self):
+        size = calculate_position_size(
+            balance=1000.00,
+            risk_percent=1.0,
+            stop_loss_pips=20.0,
+            pip_value=0.10
         )
 
-        first_lot, max_positions, basket_target = result
-
-        self.assertEqual(first_lot, 0.02)
-        self.assertEqual(max_positions, 3)
-        self.assertEqual(basket_target, 1.00)
-
-    def test_high_confidence_allows_more_positions(self):
-        result = calculate_video_dynamic_burst(
-            equity=20.00,
-            balance=20.00,
-            confidence_score=8
+        expected_risk_amount = 10.00
+        expected_size = expected_risk_amount / (
+            20.0 * 0.10
         )
 
-        first_lot, max_positions, basket_target = result
-
-        self.assertEqual(first_lot, 0.02)
-        self.assertEqual(max_positions, 5)
-        self.assertEqual(basket_target, 1.00)
-
-    def test_added_position_lot_increases_with_positions(self):
-        first_lot = calculate_added_position_lot(
-            equity=100.00,
-            balance=100.00,
-            confidence_score=8,
-            position_number=1
+        self.assertAlmostEqual(
+            size,
+            expected_size
         )
 
-        third_lot = calculate_added_position_lot(
-            equity=100.00,
-            balance=100.00,
-            confidence_score=8,
-            position_number=3
-        )
+    def test_calculate_position_size_rejects_invalid_balance(self):
+        with self.assertRaises(ValueError):
+            calculate_position_size(
+                balance=0,
+                risk_percent=1.0,
+                stop_loss_pips=20.0,
+                pip_value=0.10
+            )
 
-        self.assertEqual(first_lot, 0.04)
-        self.assertEqual(third_lot, 0.05)
+    def test_calculate_position_size_rejects_invalid_stop_loss(self):
+        with self.assertRaises(ValueError):
+            calculate_position_size(
+                balance=1000.00,
+                risk_percent=1.0,
+                stop_loss_pips=0,
+                pip_value=0.10
+            )
 
-    def test_buy_stop_loss_is_below_entry(self):
-        result = calculate_dynamic_tp_sl(
+    def test_calculate_stop_loss_for_buy(self):
+        stop_loss = calculate_stop_loss(
             direction="BUY",
             entry_price=2300.00,
-            current_spread_pips=10.0,
-            confidence_score=8,
-            position_number=1,
-            recent_price_movement=0.10
-        )
-
-        self.assertLess(
-            result["stop_loss"],
-            2300.00
-        )
-
-        self.assertGreater(
-            result["take_profit"],
-            2300.00
-        )
-
-    def test_sell_stop_loss_is_above_entry(self):
-        result = calculate_dynamic_tp_sl(
-            direction="SELL",
-            entry_price=2300.00,
-            current_spread_pips=10.0,
-            confidence_score=8,
-            position_number=1,
-            recent_price_movement=0.10
-        )
-
-        self.assertGreater(
-            result["stop_loss"],
-            2300.00
-        )
-
-        self.assertLess(
-            result["take_profit"],
-            2300.00
-        )
-
-    def test_take_profit_is_never_below_stop_loss(self):
-        result = calculate_dynamic_tp_sl(
-            direction="BUY",
-            entry_price=2300.00,
-            current_spread_pips=MAX_ALLOWED_SPREAD_PIPS,
-            confidence_score=1,
-            position_number=10,
-            recent_price_movement=0.10
-        )
-
-        self.assertGreaterEqual(
-            result["take_profit_distance"],
-            result["stop_loss_distance"]
-        )
-
-    def test_reward_risk_ratio_is_calculated(self):
-        result = calculate_dynamic_tp_sl(
-            direction="BUY",
-            entry_price=2300.00,
-            current_spread_pips=10.0,
-            confidence_score=8,
-            position_number=1,
-            recent_price_movement=0.10
-        )
-
-        expected_ratio = round(
-            result["take_profit_distance"]
-            / result["stop_loss_distance"],
-            2
+            stop_loss_pips=20.0,
+            pip_size=0.01
         )
 
         self.assertEqual(
-            result["reward_risk_ratio"],
-            expected_ratio
+            stop_loss,
+            2299.80
         )
+
+    def test_calculate_stop_loss_for_sell(self):
+        stop_loss = calculate_stop_loss(
+            direction="SELL",
+            entry_price=2300.00,
+            stop_loss_pips=20.0,
+            pip_size=0.01
+        )
+
+        self.assertEqual(
+            stop_loss,
+            2300.20
+        )
+
+    def test_calculate_take_profit_for_buy(self):
+        take_profit = calculate_take_profit(
+            direction="BUY",
+            entry_price=2300.00,
+            take_profit_pips=40.0,
+            pip_size=0.01
+        )
+
+        self.assertEqual(
+            take_profit,
+            2300.40
+        )
+
+    def test_calculate_take_profit_for_sell(self):
+        take_profit = calculate_take_profit(
+            direction="SELL",
+            entry_price=2300.00,
+            take_profit_pips=40.0,
+            pip_size=0.01
+        )
+
+        self.assertEqual(
+            take_profit,
+            2299.60
+        )
+
+    def test_is_risk_within_limits_returns_true(self):
+        result = is_risk_within_limits(
+            open_positions=1,
+            max_positions=3,
+            current_risk_percent=1.0,
+            max_risk_percent=2.0,
+            daily_loss_percent=1.0,
+            max_daily_loss_percent=3.0
+        )
+
+        self.assertTrue(result)
+
+    def test_is_risk_within_limits_rejects_too_many_positions(self):
+        result = is_risk_within_limits(
+            open_positions=4,
+            max_positions=3,
+            current_risk_percent=1.0,
+            max_risk_percent=2.0,
+            daily_loss_percent=1.0,
+            max_daily_loss_percent=3.0
+        )
+
+        self.assertFalse(result)
+
+    def test_is_risk_within_limits_rejects_high_risk(self):
+        result = is_risk_within_limits(
+            open_positions=1,
+            max_positions=3,
+            current_risk_percent=3.0,
+            max_risk_percent=2.0,
+            daily_loss_percent=1.0,
+            max_daily_loss_percent=3.0
+        )
+
+        self.assertFalse(result)
+
+    def test_is_risk_within_limits_rejects_daily_loss_limit(self):
+        result = is_risk_within_limits(
+            open_positions=1,
+            max_positions=3,
+            current_risk_percent=1.0,
+            max_risk_percent=2.0,
+            daily_loss_percent=4.0,
+            max_daily_loss_percent=3.0
+        )
+
+        self.assertFalse(result)
+
+    def test_should_block_new_trade_when_daily_loss_exceeded(self):
+        result = should_block_new_trade(
+            daily_loss_percent=4.0,
+            max_daily_loss_percent=3.0
+        )
+
+        self.assertTrue(result)
+
+    def test_should_not_block_new_trade_within_daily_loss_limit(self):
+        result = should_block_new_trade(
+            daily_loss_percent=2.0,
+            max_daily_loss_percent=3.0
+        )
+
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":
