@@ -1,114 +1,172 @@
-import os
-import unittest
-from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
-from core.license_manager import (
-    get_allowed_licenses,
-    is_recognized_license,
-    normalize_license_key,
-    validate_license,
-    LicenseConfigurationError
-)
+import pytest
+
+from core.license_manager import LicenseManager
 
 
-class TestLicenseManager(unittest.TestCase):
-    def test_all_supported_licenses_are_recognized_by_default(self):
-        with patch.dict(
-            os.environ,
-            {},
-            clear=False
-        ):
-            os.environ.pop("ALLOWED_LICENSES", None)
-
-            allowed = get_allowed_licenses()
-
-            self.assertIn("BOSSMODE99", allowed)
-            self.assertIn("BOSSMODE98", allowed)
-            self.assertIn("BOSSMODE30D", allowed)
-            self.assertIn("BOSSMODE01D", allowed)
-
-    def test_license_key_is_normalized(self):
-        self.assertEqual(
-            normalize_license_key("  BOSSMODE99  "),
-            "BOSSMODE99"
-        )
-
-    def test_recognized_license_returns_true(self):
-        with patch.dict(
-            os.environ,
-            {
-                "ALLOWED_LICENSES": "BOSSMODE99,BOSSMODE98"
-            }
-        ):
-            self.assertTrue(
-                is_recognized_license("BOSSMODE99")
-            )
-
-    def test_unrecognized_license_returns_false(self):
-        with patch.dict(
-            os.environ,
-            {
-                "ALLOWED_LICENSES": "BOSSMODE99,BOSSMODE98"
-            }
-        ):
-            self.assertFalse(
-                is_recognized_license("BOSSMODE01D")
-            )
-
-    def test_empty_license_key_returns_false(self):
-        self.assertFalse(
-            is_recognized_license("")
-        )
-
-    def test_validate_license_recognizes_supported_key(self):
-        with patch.dict(
-            os.environ,
-            {
-                "ALLOWED_LICENSES": "BOSSMODE99,BOSSMODE98,BOSSMODE30D,BOSSMODE01D"
-            }
-        ):
-            result = validate_license("BOSSMODE30D")
-
-            self.assertTrue(result["recognized"])
-            self.assertFalse(result["authorized"])
-            self.assertEqual(
-                result["reason"],
-                "SERVER_SIDE_ENTITLEMENT_CHECK_REQUIRED"
-            )
-
-    def test_validate_license_rejects_unknown_key(self):
-        result = validate_license("INVALID_KEY")
-
-        self.assertFalse(result["recognized"])
-        self.assertFalse(result["authorized"])
-        self.assertEqual(
-            result["reason"],
-            "LICENSE_KEY_NOT_ALLOWED"
-        )
-
-    def test_empty_configuration_disables_all_keys(self):
-        with patch.dict(
-            os.environ,
-            {
-                "ALLOWED_LICENSES": ""
-            }
-        ):
-            self.assertFalse(
-                is_recognized_license("BOSSMODE99")
-            )
-
-    def test_unsupported_configuration_raises_error(self):
-        with patch.dict(
-            os.environ,
-            {
-                "ALLOWED_LICENSES": "BOSSMODE99,FAKE_KEY"
-            }
-        ):
-            with self.assertRaises(
-                LicenseConfigurationError
-            ):
-                get_allowed_licenses()
+@pytest.fixture
+def database():
+    return MagicMock()
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.fixture
+def license_manager(database):
+    return LicenseManager(database=database)
+
+
+def test_recognizes_bossmode99(license_manager):
+    result = license_manager.check_license("BOSSMODE99")
+
+    assert result.recognized is True
+    assert result.license_key == "BOSSMODE99"
+
+
+def test_recognizes_bossmode98(license_manager):
+    result = license_manager.check_license("BOSSMODE98")
+
+    assert result.recognized is True
+    assert result.license_key == "BOSSMODE98"
+
+
+def test_recognizes_bossmode30d(license_manager):
+    result = license_manager.check_license("BOSSMODE30D")
+
+    assert result.recognized is True
+    assert result.license_key == "BOSSMODE30D"
+
+
+def test_recognizes_bossmode01d(license_manager):
+    result = license_manager.check_license("BOSSMODE01D")
+
+    assert result.recognized is True
+    assert result.license_key == "BOSSMODE01D"
+
+
+def test_rejects_unknown_license_key(license_manager):
+    result = license_manager.check_license("WRONGKEY")
+
+    assert result.recognized is False
+    assert result.trading_authorized is False
+    assert result.license_key == "WRONGKEY"
+
+
+def test_rejects_missing_license_key(license_manager):
+    result = license_manager.check_license("")
+
+    assert result.recognized is False
+    assert result.trading_authorized is False
+
+
+def test_license_recognition_does_not_authorize_live_trading(
+    license_manager,
+    database,
+):
+    database.get_license_entitlement.return_value = None
+
+    result = license_manager.check_license("BOSSMODE99")
+
+    assert result.recognized is True
+    assert result.trading_authorized is False
+    assert "no verified" in result.reason.lower()
+
+
+def test_unverified_payment_blocks_live_trading(
+    license_manager,
+    database,
+):
+    database.get_license_entitlement.return_value = {
+        "payment_verified": False,
+        "active": True,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(days=30)
+        ).isoformat(),
+    }
+
+    result = license_manager.check_license("BOSSMODE99")
+
+    assert result.recognized is True
+    assert result.trading_authorized is False
+    assert "payment" in result.reason.lower()
+
+
+def test_inactive_entitlement_blocks_live_trading(
+    license_manager,
+    database,
+):
+    database.get_license_entitlement.return_value = {
+        "payment_verified": True,
+        "active": False,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(days=30)
+        ).isoformat(),
+    }
+
+    result = license_manager.check_license("BOSSMODE99")
+
+    assert result.recognized is True
+    assert result.trading_authorized is False
+    assert "not active" in result.reason.lower()
+
+
+def test_expired_entitlement_blocks_live_trading(
+    license_manager,
+    database,
+):
+    database.get_license_entitlement.return_value = {
+        "payment_verified": True,
+        "active": True,
+        "expires_at": (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).isoformat(),
+    }
+
+    result = license_manager.check_license("BOSSMODE99")
+
+    assert result.recognized is True
+    assert result.trading_authorized is False
+    assert "expired" in result.reason.lower()
+
+
+def test_live_trading_disabled_blocks_authorization(
+    license_manager,
+    database,
+    monkeypatch,
+):
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "false")
+
+    database.get_license_entitlement.return_value = {
+        "payment_verified": True,
+        "active": True,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(days=30)
+        ).isoformat(),
+    }
+
+    result = license_manager.check_license("BOSSMODE99")
+
+    assert result.recognized is True
+    assert result.trading_authorized is False
+    assert "live trading is disabled" in result.reason.lower()
+
+
+def test_valid_entitlement_and_live_trading_enabled_authorizes(
+    license_manager,
+    database,
+    monkeypatch,
+):
+    monkeypatch.setenv("ENABLE_LIVE_TRADING", "true")
+
+    database.get_license_entitlement.return_value = {
+        "payment_verified": True,
+        "active": True,
+        "expires_at": (
+            datetime.now(timezone.utc) + timedelta(days=30)
+        ).isoformat(),
+    }
+
+    result = license_manager.check_license("BOSSMODE99")
+
+    assert result.recognized is True
+    assert result.trading_authorized is True
