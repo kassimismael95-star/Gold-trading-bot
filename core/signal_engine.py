@@ -1,1 +1,2 @@
 
+# Gold Scalper signal engine
