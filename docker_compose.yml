@@ -1,0 +1,36 @@
+version: "3.9"
+
+services:
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gold-scalper-control-plane
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      SECRET_KEY: ${SECRET_KEY}
+      DATABASE_URL: ${DATABASE_URL}
+      ENABLE_LIVE_TRADING: ${ENABLE_LIVE_TRADING}
+      LIVE_TRADING_AUTHORIZED: ${LIVE_TRADING_AUTHORIZED}
+      WORKER_SHARED_SECRET: ${WORKER_SHARED_SECRET}
+    depends_on:
+      - database
+    command: gunicorn app:app --bind 0.0.0.0:8080
+
+  database:
+    image: postgres:16
+    container_name: gold-scalper-database
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
