@@ -1,60 +1,109 @@
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 
 @dataclass
-class MarketSnapshot:
-    bid: float
-    ask: float
-    tick_count: int
-    last_tick_at: datetime | None
-    candle_direction: str
+class MarketTick:
+    price: float
+    timestamp: datetime
 
 
 @dataclass
 class SignalResult:
-    signal: str
-    reason: str
+    direction: str
+    confidence: int
+    recent_movement: float
 
 
-class SignalEngine:
-    TICK_WINDOW = 30
-    MAX_TICK_AGE_SECONDS = 10
+class MicroMomentumTracker:
+    """
+    Exact original Gold Scalper momentum logic.
 
-    def evaluate(self, snapshot: MarketSnapshot) -> SignalResult:
-        if snapshot is None:
-            return SignalResult(signal="HOLD", reason="No market snapshot available.")
+    Preserves:
+    - 20-tick rolling window
+    - Short-term 3-tick movement
+    - Full-window movement
+    - Current one-minute candle-open movement
+    - Confidence range from -10 to +10
+    - BUY when confidence is 0 or higher
+    - SELL when confidence is below 0
+    """
 
-        if snapshot.bid <= 0 or snapshot.ask <= 0:
-            return SignalResult(signal="HOLD", reason="Invalid market prices.")
+    def __init__(self, capacity: int = 20):
+        self.ticks: deque[float] = deque(maxlen=capacity)
+        self.candle_open: float | None = None
+        self.last_minute: int | None = None
 
-        if snapshot.ask <= snapshot.bid:
-            return SignalResult(signal="HOLD", reason="Invalid bid/ask relationship.")
+    def record_tick(self, price: float) -> None:
+        if price is None or price <= 0:
+            return
 
-        if snapshot.tick_count <= 0:
-            return SignalResult(signal="HOLD", reason="No recent market ticks.")
+        current_minute = datetime.now(timezone.utc).minute
 
-        if snapshot.last_tick_at is None:
-            return SignalResult(signal="HOLD", reason="Market tick time is missing.")
+        if self.last_minute != current_minute or self.candle_open is None:
+            self.candle_open = price
+            self.last_minute = current_minute
 
-        age_seconds = (datetime.now(timezone.utc) - snapshot.last_tick_at).total_seconds()
+        self.ticks.append(float(price))
 
-        if age_seconds > self.MAX_TICK_AGE_SECONDS:
+    def evaluate(self) -> SignalResult:
+        if len(self.ticks) < 3:
             return SignalResult(
-                signal="HOLD",
-                reason=f"Market data is stale by {age_seconds:.1f} seconds.",
+                direction="BUY",
+                confidence=6,
+                recent_movement=0.0,
             )
 
-        if snapshot.tick_count < self.TICK_WINDOW:
-            return SignalResult(
-                signal="HOLD",
-                reason=f"Waiting for {self.TICK_WINDOW - snapshot.tick_count} more ticks.",
-            )
+        latest = self.ticks[-1]
+        score = 0
 
-        if snapshot.candle_direction == "up":
-            return SignalResult(signal="BUY", reason="One-minute candle direction is up.")
+        short_delta = latest - self.ticks[-3]
 
-        if snapshot.candle_direction == "down":
-            return SignalResult(signal="SELL", reason="One-minute candle direction is down.")
+        if short_delta > 0.05:
+            score += 4
+        elif short_delta < -0.05:
+            score -= 4
+        elif short_delta > 0:
+            score += 2
+        elif short_delta < 0:
+            score -= 2
 
-        return SignalResult(signal="HOLD", reason="Candle direction is uncertain.")
+        full_delta = latest - self.ticks[0]
+
+        if full_delta > 0.15:
+            score += 3
+        elif full_delta < -0.15:
+            score -= 3
+        elif full_delta > 0:
+            score += 1
+        elif full_delta < 0:
+            score -= 1
+
+        if self.candle_open is not None:
+            candle_delta = latest - self.candle_open
+
+            if candle_delta > 0.10:
+                score += 3
+            elif candle_delta < -0.10:
+                score -= 3
+            elif candle_delta > 0:
+                score += 1
+            elif candle_delta < 0:
+                score -= 1
+
+        score = max(-10, min(10, score))
+
+        direction = "BUY" if score >= 0 else "SELL"
+
+        return SignalResult(
+            direction=direction,
+            confidence=score,
+            recent_movement=self.recent_movement(),
+        )
+
+    def recent_movement(self) -> float:
+        if len(self.ticks) < 3:
+            return 0.0
+
+        return abs(self.ticks[-1] - self.ticks[-3])
