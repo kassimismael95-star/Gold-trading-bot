@@ -1,150 +1,182 @@
-import logging
-from typing import Any, Dict, List, Optional
+import time
+from dataclasses import dataclass
+from typing import Any
 
 import MetaTrader5 as mt5
 
-from worker.config import (
-    MT5_LOGIN,
-    MT5_PASSWORD,
-    MT5_SERVER,
-    MT5_TERMINAL_PATH
-)
 
-logger = logging.getLogger(__name__)
+@dataclass
+class MT5ConnectionResult:
+    connected: bool
+    message: str
+    account_info: dict[str, Any] | None = None
 
 
 class MT5Client:
+    """
+    Connects to one isolated Windows MT5 terminal.
+
+    Preserves the original Gold Scalper execution style:
+    - XAUUSD symbol resolution
+    - Market BUY and SELL execution
+    - SL/TP submission
+    - Position closing
+    - Bot signature comments
+    """
+
+    SYMBOL_CANDIDATES = [
+        "XAUUSDm",
+        "XAUUSD",
+        "XAUUSDc",
+        "XAUUSDr",
+        "GOLD",
+    ]
+
     def __init__(self):
         self.initialized = False
-        self.logged_in = False
+        self.connected = False
+        self.active_symbol: str | None = None
 
-    def initialize(self) -> bool:
-        if self.initialized:
-            return True
-
-        initialize_kwargs = {}
-
-        if MT5_TERMINAL_PATH:
-            initialize_kwargs["path"] = MT5_TERMINAL_PATH
-
-        if not mt5.initialize(**initialize_kwargs):
-            logger.error(
-                "MT5 initialization failed: %s",
-                mt5.last_error()
+    def initialize(self) -> MT5ConnectionResult:
+        if not mt5.initialize():
+            return MT5ConnectionResult(
+                connected=False,
+                message=(
+                    f"MT5 initialization failed: "
+                    f"{mt5.last_error()}"
+                ),
             )
-
-            return False
 
         self.initialized = True
 
-        return True
+        return MT5ConnectionResult(
+            connected=True,
+            message="MT5 terminal initialized.",
+        )
 
-    def login(self) -> bool:
-        if self.logged_in:
-            return True
-
-        if not self.initialize():
-            return False
-
-        if not mt5.login(
-            login=int(MT5_LOGIN),
-            password=MT5_PASSWORD,
-            server=MT5_SERVER
-        ):
-            logger.error(
-                "MT5 login failed: %s",
-                mt5.last_error()
-            )
-
-            return False
-
-        self.logged_in = True
-
-        return True
-
-    def shutdown(self) -> None:
-        if self.initialized:
-            mt5.shutdown()
-
-            self.initialized = False
-            self.logged_in = False
-
-    def get_symbol_info(
+    def login(
         self,
-        symbol: str
-    ) -> Optional[Dict[str, Any]]:
-        if not self.login():
-            return None
+        login: str,
+        password: str,
+        server: str,
+    ) -> MT5ConnectionResult:
+        if not self.initialized:
+            init_result = self.initialize()
 
-        symbol_info = mt5.symbol_info(symbol)
+            if not init_result.connected:
+                return init_result
 
-        if symbol_info is None:
-            logger.error(
-                "Symbol not found: %s",
-                symbol
+        login_value = int(str(login).strip())
+
+        connected = mt5.login(
+            login=login_value,
+            password=password,
+            server=server,
+        )
+
+        if not connected:
+            return MT5ConnectionResult(
+                connected=False,
+                message=(
+                    f"MT5 login failed for account {login}: "
+                    f"{mt5.last_error()}"
+                ),
             )
 
-            return None
+        account_info = mt5.account_info()
 
-        if not mt5.symbol_select(symbol, True):
-            logger.error(
-                "Could not select symbol: %s",
-                symbol
+        if account_info is None:
+            return MT5ConnectionResult(
+                connected=False,
+                message="MT5 account information is unavailable.",
             )
 
-            return None
+        self.connected = True
 
-        return {
-            "symbol": symbol_info.name,
-            "digits": symbol_info.digits,
-            "point": symbol_info.point,
-            "volume_min": symbol_info.volume_min,
-            "volume_max": symbol_info.volume_max,
-            "volume_step": symbol_info.volume_step
-        }
+        return MT5ConnectionResult(
+            connected=True,
+            message="MT5 account connected.",
+            account_info={
+                "login": account_info.login,
+                "server": account_info.server,
+                "balance": account_info.balance,
+                "equity": account_info.equity,
+                "free_margin": account_info.margin_free,
+                "margin_level": account_info.margin_level,
+            },
+        )
 
-    def get_quote(
+    def resolve_gold_symbol(
         self,
-        symbol: str
-    ) -> Optional[Dict[str, Any]]:
-        if not self.login():
-            return None
+        requested_symbol: str,
+    ) -> str:
+        candidates = [requested_symbol]
 
+        for candidate in self.SYMBOL_CANDIDATES:
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        for symbol in candidates:
+            if not symbol:
+                continue
+
+            symbol_info = mt5.symbol_info(symbol)
+
+            if symbol_info is None:
+                continue
+
+            if not symbol_info.visible:
+                mt5.symbol_select(symbol, True)
+
+            tick = mt5.symbol_info_tick(symbol)
+
+            if tick and (tick.bid > 0 or tick.ask > 0):
+                self.active_symbol = symbol
+
+                return symbol
+
+        self.active_symbol = requested_symbol
+
+        return requested_symbol
+
+    def get_symbol_tick(self, symbol: str) -> dict[str, float] | None:
         tick = mt5.symbol_info_tick(symbol)
 
-        if tick is None:
-            logger.error(
-                "No quote available for symbol: %s",
-                symbol
-            )
+        if not tick:
+            return None
 
+        if tick.bid <= 0 or tick.ask <= 0:
             return None
 
         return {
-            "symbol": symbol,
-            "bid": tick.bid,
-            "ask": tick.ask,
-            "time": tick.time
+            "bid": float(tick.bid),
+            "ask": float(tick.ask),
         }
 
-    def get_open_positions(
-        self,
-        symbol: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        if not self.login():
+    def get_account_state(self) -> dict[str, Any] | None:
+        account_info = mt5.account_info()
+
+        if not account_info:
+            return None
+
+        return {
+            "login": account_info.login,
+            "balance": float(account_info.balance),
+            "equity": float(account_info.equity),
+            "free_margin": float(account_info.margin_free),
+            "margin_level": float(account_info.margin_level),
+        }
+
+    def get_open_positions(self, symbol: str) -> list[dict[str, Any]]:
+        positions = mt5.positions_get(symbol=symbol)
+
+        if not positions:
             return []
 
-        positions = mt5.positions_get(
-            symbol=symbol
-        ) if symbol else mt5.positions_get()
-
-        if positions is None:
-            return []
-
-        normalized_positions = []
+        result = []
 
         for position in positions:
-            normalized_positions.append(
+            result.append(
                 {
                     "ticket": position.ticket,
                     "symbol": position.symbol,
@@ -153,199 +185,197 @@ class MT5Client:
                         if position.type == mt5.POSITION_TYPE_BUY
                         else "SELL"
                     ),
-                    "volume": position.volume,
-                    "price_open": position.price_open,
-                    "profit": position.profit,
-                    "comment": position.comment
+                    "volume": float(position.volume),
+                    "price_open": float(position.price_open),
+                    "profit": float(position.profit),
+                    "comment": position.comment,
                 }
             )
 
-        return normalized_positions
+        return result
 
-    def get_account_info(self) -> Optional[Dict[str, Any]]:
-        if not self.login():
-            return None
-
-        account_info = mt5.account_info()
-
-        if account_info is None:
-            logger.error(
-                "Could not get MT5 account info"
-            )
-
-            return None
-
-        return {
-            "login": account_info.login,
-            "server": account_info.server,
-            "currency": account_info.currency,
-            "balance": account_info.balance,
-            "equity": account_info.equity,
-            "margin": account_info.margin,
-            "free_margin": account_info.margin_free,
-            "margin_level": account_info.margin_level
-        }
-
-    def open_position(
+    def open_market_order(
         self,
         symbol: str,
         direction: str,
         volume: float,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        comment: str = "BossMode"
-    ) -> Dict[str, Any]:
-        if not self.login():
+        stop_loss: float,
+        take_profit: float,
+        comment: str,
+    ) -> dict[str, Any]:
+        if direction not in ["BUY", "SELL"]:
             return {
-                "status": "ERROR",
-                "reason": "MT5 login failed"
+                "success": False,
+                "message": "Direction must be BUY or SELL.",
             }
 
-        quote = self.get_quote(symbol)
+        order_type = (
+            mt5.ORDER_TYPE_BUY
+            if direction == "BUY"
+            else mt5.ORDER_TYPE_SELL
+        )
 
-        if quote is None:
+        tick = self.get_symbol_tick(symbol)
+
+        if not tick:
             return {
-                "status": "ERROR",
-                "reason": "No quote available"
+                "success": False,
+                "message": "No valid market price available.",
             }
 
-        if direction == "BUY":
-            order_type = mt5.ORDER_TYPE_BUY
-            price = quote["ask"]
-        elif direction == "SELL":
-            order_type = mt5.ORDER_TYPE_SELL
-            price = quote["bid"]
-        else:
-            return {
-                "status": "ERROR",
-                "reason": "Invalid direction"
-            }
+        price = (
+            tick["ask"]
+            if direction == "BUY"
+            else tick["bid"]
+        )
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
-            "volume": volume,
+            "volume": float(volume),
             "type": order_type,
-            "price": price,
-            "deviation": 20,
-            "magic": 991001,
+            "price": float(price),
+            "sl": float(stop_loss),
+            "tp": float(take_profit),
             "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC
+            "type_filling": mt5.ORDER_FILLING_IOC,
         }
-
-        if stop_loss is not None:
-            request["sl"] = stop_loss
-
-        if take_profit is not None:
-            request["tp"] = take_profit
 
         result = mt5.order_send(request)
 
         if result is None:
             return {
-                "status": "ERROR",
-                "reason": "MT5 order_send returned None"
+                "success": False,
+                "message": f"MT5 order send failed: {mt5.last_error()}",
             }
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             return {
-                "status": "REJECTED",
-                "reason": result.comment,
-                "retcode": result.retcode
+                "success": False,
+                "message": (
+                    f"MT5 order rejected. "
+                    f"Retcode: {result.retcode}. "
+                    f"Comment: {result.comment}"
+                ),
+                "result": result._asdict(),
             }
 
         return {
-            "status": "EXECUTED",
-            "ticket": result.order,
+            "success": True,
+            "message": (
+                f"{direction} order opened on {symbol} "
+                f"with {volume} lots."
+            ),
+            "order_ticket": result.order,
+            "deal_ticket": result.deal,
             "price": result.price,
-            "volume": volume,
-            "comment": result.comment
         }
 
-    def close_position(
-        self,
-        ticket: int,
-        volume: Optional[float] = None,
-        comment: str = "BossMode Close"
-    ) -> Dict[str, Any]:
-        if not self.login():
-            return {
-                "status": "ERROR",
-                "reason": "MT5 login failed"
-            }
-
-        positions = mt5.positions_get(
-            ticket=ticket
-        )
+    def close_position(self, ticket: int) -> dict[str, Any]:
+        positions = mt5.positions_get(ticket=ticket)
 
         if not positions:
             return {
-                "status": "ERROR",
-                "reason": "Position not found"
+                "success": False,
+                "message": f"Position {ticket} not found.",
             }
 
         position = positions[0]
 
-        symbol = position.symbol
+        tick = self.get_symbol_tick(position.symbol)
 
-        quote = self.get_quote(symbol)
-
-        if quote is None:
+        if not tick:
             return {
-                "status": "ERROR",
-                "reason": "No quote available"
+                "success": False,
+                "message": "No valid market price available.",
             }
 
         if position.type == mt5.POSITION_TYPE_BUY:
+            direction = "SELL"
+            price = tick["bid"]
             order_type = mt5.ORDER_TYPE_SELL
-            price = quote["bid"]
-        else:
-            order_type = mt5.ORDER_TYPE_BUY
-            price = quote["ask"]
 
-        close_volume = (
-            volume
-            if volume is not None
-            else position.volume
-        )
+        else:
+            direction = "BUY"
+            price = tick["ask"]
+            order_type = mt5.ORDER_TYPE_BUY
 
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "position": ticket,
-            "symbol": symbol,
-            "volume": close_volume,
+            "symbol": position.symbol,
+            "volume": float(position.volume),
             "type": order_type,
-            "price": price,
-            "deviation": 20,
-            "magic": 991001,
-            "comment": comment,
+            "position": int(position.ticket),
+            "price": float(price),
+            "comment": "BALANCED-SCALP-CLOSE",
             "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC
+            "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
         result = mt5.order_send(request)
 
         if result is None:
             return {
-                "status": "ERROR",
-                "reason": "MT5 order_send returned None"
+                "success": False,
+                "message": f"MT5 close failed: {mt5.last_error()}",
             }
 
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             return {
-                "status": "REJECTED",
-                "reason": result.comment,
-                "retcode": result.retcode
+                "success": False,
+                "message": (
+                    f"MT5 close rejected. "
+                    f"Retcode: {result.retcode}. "
+                    f"Comment: {result.comment}"
+                ),
+                "result": result._asdict(),
             }
 
         return {
-            "status": "EXECUTED",
-            "ticket": ticket,
-            "closed_volume": close_volume,
-            "price": result.price,
-            "comment": result.comment
+            "success": True,
+            "message": (
+                f"Position {ticket} closed with {direction} order."
+            ),
+            "order_ticket": result.order,
+            "deal_ticket": result.deal,
         }
 
+    def close_all_positions(self, symbol: str) -> dict[str, Any]:
+        positions = self.get_open_positions(symbol)
 
-mt5_client = MT5Client()
+        if not positions:
+            return {
+                "success": True,
+                "message": "No open positions to close.",
+                "closed_count": 0,
+            }
+
+        closed_count = 0
+        errors = []
+
+        for position in positions:
+            close_result = self.close_position(position["ticket"])
+
+            if close_result["success"]:
+                closed_count += 1
+
+            else:
+                errors.append(close_result["message"])
+
+        return {
+            "success": closed_count == len(positions),
+            "message": (
+                f"Closed {closed_count}/{len(positions)} positions."
+            ),
+            "closed_count": closed_count,
+            "errors": errors,
+        }
+
+    def shutdown(self) -> None:
+        if self.initialized:
+            mt5.shutdown()
+
+        self.initialized = False
+        self.connected = False
+        self.active_symbol = None
