@@ -5,31 +5,25 @@ services:
     plan: free
     region: oregon
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "bash start.sh"
+    startCommand: "gunicorn app:app"
     healthCheckPath: /health
     autoDeploy: true
+
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: FLASK_ENV
-        value: production
-      - key: ALLOWED_ORIGINS
-        sync: false
+
       - key: SECRET_KEY
-        generateValue: true
+        sync: false
+
       - key: DATABASE_URL
         sync: false
-      - key: ALLOWED_LICENSES
-        value: BOSSMODE99,BOSSMODE98,BOSSMODE30D,BOSSMODE01D
-      - key: WORKER_SHARED_SECRET
-        generateValue: true
+
       - key: ENABLE_LIVE_TRADING
+        value: "true"
+
+      - key: LIVE_TRADING_AUTHORIZED
         value: "false"
-      - key: MT5_EXECUTION_MODE
-        value: demo
-      - key: ORACLE_EXECUTION_ENABLED
-        value: "false"
-      - key: WEB_CONCURRENCY
-        value: "2"
-      - key: WEB_THREADS
-        value: "4"
+
+      - key: WORKER_SHARED_SECRET
+        sync: false
