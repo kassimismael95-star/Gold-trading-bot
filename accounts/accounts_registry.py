@@ -1,109 +1,121 @@
+from datetime import datetime, timezone
 
-from database.models import get_connection
-from accounts.credential_vault import encrypt_password
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from accounts.credential_vault import CredentialVault
+from database.models import TradingAccount, User
 
 
-def create_mt5_account(
-    user_id,
-    mt5_login,
-    mt5_password,
-    mt5_server,
-    mt5_symbol
-):
-    connection = get_connection()
-    cursor = connection.cursor()
+class AccountRegistry:
+    def __init__(self, session: Session, credential_vault: CredentialVault):
+        self.session = session
+        self.vault = credential_vault
 
-    encrypted_password = encrypt_password(mt5_password)
+    def create_account(
+        self,
+        user: User,
+        broker_name: str,
+        mt5_login: str,
+        mt5_password: str,
+        mt5_server: str,
+        symbol: str = "XAUUSD",
+        account_type: str = "demo",
+    ) -> TradingAccount:
+        if not user:
+            raise ValueError("User is required.")
 
-    cursor.execute("""
-        INSERT INTO mt5_accounts (
-            user_id,
-            mt5_login,
-            mt5_server,
-            mt5_symbol,
-            encrypted_password
+        if not broker_name or not broker_name.strip():
+            raise ValueError("Broker name is required.")
+
+        if not mt5_login or not mt5_login.strip():
+            raise ValueError("MT5 login is required.")
+
+        if not mt5_password:
+            raise ValueError("MT5 password is required.")
+
+        if not mt5_server or not mt5_server.strip():
+            raise ValueError("MT5 server is required.")
+
+        if account_type not in {"demo", "live"}:
+            raise ValueError("Account type must be demo or live.")
+
+        existing = self.get_account_by_login(
+            user_id=user.id,
+            mt5_login=mt5_login,
+            mt5_server=mt5_server,
         )
-        VALUES (%s, %s, %s, %s, %s)
-        RETURNING id
-    """, (
-        user_id,
-        mt5_login,
-        mt5_server,
-        mt5_symbol,
-        encrypted_password
-    ))
 
-    account_id = cursor.fetchone()["id"]
+        if existing:
+            raise ValueError("This MT5 account is already connected to your profile.")
 
-    connection.commit()
-    cursor.close()
-    connection.close()
+        account = TradingAccount(
+            user_id=user.id,
+            broker_name=broker_name.strip(),
+            mt5_login=mt5_login.strip(),
+            mt5_server=mt5_server.strip(),
+            encrypted_password=self.vault.encrypt(mt5_password),
+            symbol=symbol.strip().upper(),
+            account_type=account_type,
+            connection_status="disconnected",
+            is_active=True,
+        )
 
-    return account_id
+        self.session.add(account)
+        self.session.commit()
+        self.session.refresh(account)
 
+        return account
 
-def get_user_accounts(user_id):
-    connection = get_connection()
-    cursor = connection.cursor()
+    def get_account(self, user_id, account_id) -> TradingAccount | None:
+        statement = select(TradingAccount).where(
+            TradingAccount.id == account_id,
+            TradingAccount.user_id == user_id,
+        )
 
-    cursor.execute("""
-        SELECT
-            id,
-            mt5_login,
-            mt5_server,
-            mt5_symbol,
-            account_status
-        FROM mt5_accounts
-        WHERE user_id = %s
-        ORDER BY id DESC
-    """, (user_id,))
+        return self.session.scalar(statement)
 
-    accounts = cursor.fetchall()
+    def get_account_by_login(self, user_id, mt5_login: str, mt5_server: str) -> TradingAccount | None:
+        statement = select(TradingAccount).where(
+            TradingAccount.user_id == user_id,
+            TradingAccount.mt5_login == mt5_login.strip(),
+            TradingAccount.mt5_server == mt5_server.strip(),
+        )
 
-    cursor.close()
-    connection.close()
+        return self.session.scalar(statement)
 
-    return accounts
+    def list_accounts(self, user_id) -> list[TradingAccount]:
+        statement = (
+            select(TradingAccount)
+            .where(TradingAccount.user_id == user_id)
+            .order_by(TradingAccount.created_at.desc())
+        )
 
+        return list(self.session.scalars(statement))
 
-def get_account_by_id(account_id, user_id):
-    connection = get_connection()
-    cursor = connection.cursor()
+    def update_connection_status(self, account: TradingAccount, status: str) -> TradingAccount:
+        allowed_statuses = {"connected", "disconnected", "error", "testing"}
 
-    cursor.execute("""
-        SELECT
-            id,
-            user_id,
-            mt5_login,
-            mt5_server,
-            mt5_symbol,
-            encrypted_password,
-            account_status
-        FROM mt5_accounts
-        WHERE id = %s
-        AND user_id = %s
-    """, (account_id, user_id))
+        if status not in allowed_statuses:
+            raise ValueError("Invalid connection status.")
 
-    account = cursor.fetchone()
+        account.connection_status = status
+        account.updated_at = datetime.now(timezone.utc)
 
-    cursor.close()
-    connection.close()
+        self.session.commit()
+        self.session.refresh(account)
 
-    return account
+        return account
 
+    def deactivate_account(self, account: TradingAccount) -> TradingAccount:
+        account.is_active = False
+        account.connection_status = "disconnected"
+        account.updated_at = datetime.now(timezone.utc)
 
-def update_account_status(account_id, status):
-    connection = get_connection()
-    cursor = connection.cursor()
+        self.session.commit()
+        self.session.refresh(account)
 
-    cursor.execute("""
-        UPDATE mt5_accounts
-        SET
-            account_status = %s,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = %s
-    """, (status, account_id))
+        return account
 
-    connection.commit()
-    cursor.close()
-    connection.close()
+    def get_decrypted_password(self, account: TradingAccount) -> str:
+        return self.vault.decrypt(account.encrypted_password)
