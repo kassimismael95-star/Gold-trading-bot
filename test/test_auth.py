@@ -1,126 +1,237 @@
 import os
 import unittest
-from unittest.mock import patch, MagicMock
-from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
-from web.auth import (
-    create_session,
-    get_session,
-    require_authenticated_user,
-    sign_out
-)
+from fastapi.testclient import TestClient
+
+from main import app
 
 
 class TestAuth(unittest.TestCase):
     def setUp(self):
-        self.mock_connection = MagicMock()
-        self.mock_cursor = MagicMock()
+        self.client = TestClient(app)
 
-        self.mock_connection.cursor.return_value = (
-            self.mock_cursor
-        )
-
-    @patch("web.auth.get_connection")
-    def test_create_session_returns_token(self, mock_get_connection):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.fetchone.return_value = {
-            "id": 1
-        }
-
-        session = create_session(user_id=1)
-
-        self.assertIsNotNone(session["session_token"])
-        self.assertEqual(session["session_id"], 1)
-        self.assertGreater(
-            session["expires_at"],
-            datetime.now(timezone.utc)
-        )
-
-    @patch("web.auth.get_connection")
-    def test_get_session_returns_none_without_token(
+    @patch("web.auth.create_user")
+    @patch("web.auth.hash_password")
+    def test_register_user_returns_success(
         self,
-        mock_get_connection
+        mock_hash_password,
+        mock_create_user
     ):
-        session = get_session(None)
+        mock_hash_password.return_value = "hashed-password"
 
-        self.assertIsNone(session)
-
-    @patch("web.auth.get_connection")
-    def test_get_session_returns_session(self, mock_get_connection):
-        mock_get_connection.return_value = self.mock_connection
-
-        expires_at = datetime.now(timezone.utc) + timedelta(days=1)
-
-        self.mock_cursor.fetchone.return_value = {
-            "session_id": 1,
-            "user_id": 1,
-            "expires_at": expires_at,
+        mock_create_user.return_value = {
+            "id": 1,
             "email": "test@example.com"
         }
 
-        session = get_session("valid-token")
+        response = self.client.post(
+            "/auth/register",
+            json={
+                "email": "test@example.com",
+                "password": "TestPassword123"
+            }
+        )
 
-        self.assertEqual(session["user_id"], 1)
         self.assertEqual(
-            session["email"],
+            response.status_code,
+            200
+        )
+
+        data = response.json()
+
+        self.assertEqual(
+            data["email"],
             "test@example.com"
         )
 
-    @patch("web.auth.get_connection")
-    def test_require_authenticated_user_returns_session(
+        self.assertEqual(
+            data["id"],
+            1
+        )
+
+    @patch("web.auth.create_user")
+    @patch("web.auth.hash_password")
+    def test_register_user_rejects_duplicate_email(
         self,
-        mock_get_connection
+        mock_hash_password,
+        mock_create_user
     ):
-        mock_get_connection.return_value = self.mock_connection
+        mock_hash_password.return_value = "hashed-password"
 
-        expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+        mock_create_user.side_effect = ValueError(
+            "Email already registered"
+        )
 
-        self.mock_cursor.fetchone.return_value = {
-            "session_id": 1,
-            "user_id": 1,
-            "expires_at": expires_at,
+        response = self.client.post(
+            "/auth/register",
+            json={
+                "email": "test@example.com",
+                "password": "TestPassword123"
+            }
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400
+        )
+
+        self.assertEqual(
+            response.json()["detail"],
+            "Email already registered"
+        )
+
+    @patch("web.auth.verify_password")
+    @patch("web.auth.get_user_by_email")
+    @patch("web.auth.create_access_token")
+    def test_login_returns_access_token(
+        self,
+        mock_create_access_token,
+        mock_get_user_by_email,
+        mock_verify_password
+    ):
+        mock_get_user_by_email.return_value = {
+            "id": 1,
+            "email": "test@example.com",
+            "password_hash": "hashed-password"
+        }
+
+        mock_verify_password.return_value = True
+
+        mock_create_access_token.return_value = "test-access-token"
+
+        response = self.client.post(
+            "/auth/login",
+            json={
+                "email": "test@example.com",
+                "password": "TestPassword123"
+            }
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200
+        )
+
+        data = response.json()
+
+        self.assertEqual(
+            data["access_token"],
+            "test-access-token"
+        )
+
+        self.assertEqual(
+            data["token_type"],
+            "bearer"
+        )
+
+    @patch("web.auth.verify_password")
+    @patch("web.auth.get_user_by_email")
+    def test_login_rejects_invalid_password(
+        self,
+        mock_get_user_by_email,
+        mock_verify_password
+    ):
+        mock_get_user_by_email.return_value = {
+            "id": 1,
+            "email": "test@example.com",
+            "password_hash": "hashed-password"
+        }
+
+        mock_verify_password.return_value = False
+
+        response = self.client.post(
+            "/auth/login",
+            json={
+                "email": "test@example.com",
+                "password": "WrongPassword123"
+            }
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401
+        )
+
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid email or password"
+        )
+
+    @patch("web.auth.get_user_by_email")
+    def test_login_rejects_unknown_email(
+        self,
+        mock_get_user_by_email
+    ):
+        mock_get_user_by_email.return_value = None
+
+        response = self.client.post(
+            "/auth/login",
+            json={
+                "email": "unknown@example.com",
+                "password": "TestPassword123"
+            }
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401
+        )
+
+        self.assertEqual(
+            response.json()["detail"],
+            "Invalid email or password"
+        )
+
+    @patch("web.auth.get_current_user")
+    def test_protected_route_accepts_valid_token(
+        self,
+        mock_get_current_user
+    ):
+        mock_get_current_user.return_value = {
+            "id": 1,
             "email": "test@example.com"
         }
 
-        request = MagicMock()
-        request.cookies = {
-            "session_token": "valid-token"
-        }
+        response = self.client.get(
+            "/auth/me",
+            headers={
+                "Authorization": "Bearer test-access-token"
+            }
+        )
 
-        session = require_authenticated_user(request)
+        self.assertEqual(
+            response.status_code,
+            200
+        )
 
-        self.assertEqual(session["user_id"], 1)
+        self.assertEqual(
+            response.json()["email"],
+            "test@example.com"
+        )
 
-    @patch("web.auth.get_connection")
-    def test_require_authenticated_user_rejects_missing_token(
-        self,
-        mock_get_connection
-    ):
-        request = MagicMock()
-        request.cookies = {}
+    def test_protected_route_rejects_missing_token(self):
+        response = self.client.get(
+            "/auth/me"
+        )
 
-        with self.assertRaises(PermissionError):
-            require_authenticated_user(request)
+        self.assertEqual(
+            response.status_code,
+            401
+        )
 
-    @patch("web.auth.get_connection")
-    def test_sign_out_deletes_session(self, mock_get_connection):
-        mock_get_connection.return_value = self.mock_connection
+    def test_protected_route_rejects_invalid_token(self):
+        response = self.client.get(
+            "/auth/me",
+            headers={
+                "Authorization": "Bearer invalid-token"
+            }
+        )
 
-        self.mock_cursor.rowcount = 1
-
-        deleted = sign_out("valid-token")
-
-        self.assertTrue(deleted)
-
-    @patch("web.auth.get_connection")
-    def test_sign_out_returns_false_without_token(
-        self,
-        mock_get_connection
-    ):
-        deleted = sign_out(None)
-
-        self.assertFalse(deleted)
+        self.assertEqual(
+            response.status_code,
+            401
+        )
 
 
 if __name__ == "__main__":
