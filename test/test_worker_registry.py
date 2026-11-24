@@ -1,167 +1,208 @@
-import unittest
-from unittest.mock import patch, MagicMock
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
-from execution.worker_registry import (
-    register_worker,
-    get_best_worker,
-    update_worker_heartbeat,
-    mark_worker_offline,
-    list_workers
-)
+import pytest
+
+from worker_registry import WorkerRegistry
 
 
-class TestWorkerRegistry(unittest.TestCase):
-    def setUp(self):
-        self.mock_connection = MagicMock()
-        self.mock_cursor = MagicMock()
-
-        self.mock_connection.cursor.return_value = (
-            self.mock_cursor
-        )
-
-    @patch("execution.worker_registry.get_connection")
-    def test_register_worker_returns_worker(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.fetchone.return_value = {
-            "id": 1,
-            "worker_id": "worker-1",
-            "worker_status": "ONLINE",
-            "current_load": 0
-        }
-
-        worker = register_worker(
-            worker_id="worker-1",
-            worker_name="Primary Worker",
-            max_concurrent_commands=5
-        )
-
-        self.assertEqual(worker["worker_id"], "worker-1")
-        self.assertEqual(worker["worker_status"], "ONLINE")
-        self.assertEqual(worker["current_load"], 0)
-
-    @patch("execution.worker_registry.get_connection")
-    def test_get_best_worker_returns_least_loaded_worker(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.fetchone.return_value = {
-            "worker_id": "worker-2",
-            "worker_status": "ONLINE",
-            "current_load": 1
-        }
-
-        worker = get_best_worker()
-
-        self.assertEqual(worker["worker_id"], "worker-2")
-        self.assertEqual(worker["current_load"], 1)
-
-    @patch("execution.worker_registry.get_connection")
-    def test_get_best_worker_returns_none_when_no_workers(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.fetchone.return_value = None
-
-        worker = get_best_worker()
-
-        self.assertIsNone(worker)
-
-    @patch("execution.worker_registry.get_connection")
-    def test_update_worker_heartbeat_returns_true(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.rowcount = 1
-
-        updated = update_worker_heartbeat(
-            worker_id="worker-1",
-            current_load=2
-        )
-
-        self.assertTrue(updated)
-
-    @patch("execution.worker_registry.get_connection")
-    def test_update_worker_heartbeat_returns_false_for_unknown_worker(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.rowcount = 0
-
-        updated = update_worker_heartbeat(
-            worker_id="unknown-worker",
-            current_load=0
-        )
-
-        self.assertFalse(updated)
-
-    @patch("execution.worker_registry.get_connection")
-    def test_mark_worker_offline_returns_true(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.rowcount = 1
-
-        updated = mark_worker_offline(
-            worker_id="worker-1"
-        )
-
-        self.assertTrue(updated)
-
-    @patch("execution.worker_registry.get_connection")
-    def test_mark_worker_offline_returns_false_for_unknown_worker(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.rowcount = 0
-
-        updated = mark_worker_offline(
-            worker_id="unknown-worker"
-        )
-
-        self.assertFalse(updated)
-
-    @patch("execution.worker_registry.get_connection")
-    def test_list_workers_returns_workers(
-        self,
-        mock_get_connection
-    ):
-        mock_get_connection.return_value = self.mock_connection
-
-        self.mock_cursor.fetchall.return_value = [
-            {
-                "worker_id": "worker-1",
-                "worker_status": "ONLINE",
-                "current_load": 0
-            },
-            {
-                "worker_id": "worker-2",
-                "worker_status": "OFFLINE",
-                "current_load": 0
-            }
-        ]
-
-        workers = list_workers()
-
-        self.assertEqual(len(workers), 2)
-        self.assertEqual(workers[0]["worker_id"], "worker-1")
-        self.assertEqual(workers[1]["worker_status"], "OFFLINE")
+@pytest.fixture
+def mock_db():
+    return MagicMock()
 
 
-if __name__ == "__main__":
-    unittest.main()
+@pytest.fixture
+def worker_registry(mock_db):
+    return WorkerRegistry(db=mock_db)
+
+
+def make_worker(
+    worker_id: str,
+    account_id: str,
+    status: str = "online",
+    active_connections: int = 0,
+    last_seen: datetime | None = None,
+) -> MagicMock:
+    worker = MagicMock()
+
+    worker.id = worker_id
+    worker.account_id = account_id
+    worker.status = status
+    worker.active_connections = active_connections
+    worker.max_connections = 1
+    worker.last_seen = last_seen or datetime.now(timezone.utc)
+
+    return worker
+
+
+def test_register_worker_success(worker_registry, mock_db):
+    mock_db.get_worker_by_id.return_value = None
+    mock_db.create_worker.return_value = make_worker(
+        worker_id="worker-1",
+        account_id="account-1",
+    )
+
+    result = worker_registry.register_worker(
+        worker_id="worker-1",
+        account_id="account-1",
+        worker_url="https://worker-1.example.com",
+    )
+
+    assert result["success"] is True
+    assert result["message"] == "Worker registered successfully."
+    assert result["worker_id"] == "worker-1"
+
+
+def test_register_worker_rejects_duplicate(worker_registry, mock_db):
+    mock_db.get_worker_by_id.return_value = make_worker(
+        worker_id="worker-1",
+        account_id="account-1",
+    )
+
+    result = worker_registry.register_worker(
+        worker_id="worker-1",
+        account_id="account-2",
+        worker_url="https://worker-1.example.com",
+    )
+
+    assert result["success"] is False
+    assert "already registered" in result["message"]
+
+
+def test_assign_worker_rejects_when_no_workers(worker_registry, mock_db):
+    mock_db.get_online_workers.return_value = []
+
+    result = worker_registry.assign_worker(
+        account_id="account-1",
+    )
+
+    assert result["success"] is False
+    assert "No online workers available" in result["message"]
+
+
+def test_assign_worker_rejects_when_capacity_full(worker_registry, mock_db):
+    worker = make_worker(
+        worker_id="worker-1",
+        account_id="account-1",
+        active_connections=1,
+    )
+
+    mock_db.get_online_workers.return_value = [worker]
+
+    result = worker_registry.assign_worker(
+        account_id="account-2",
+    )
+
+    assert result["success"] is False
+    assert "No worker capacity available" in result["message"]
+
+
+def test_assign_worker_skips_same_account(worker_registry, mock_db):
+    worker = make_worker(
+        worker_id="worker-1",
+        account_id="account-1",
+        active_connections=0,
+    )
+
+    mock_db.get_online_workers.return_value = [worker]
+
+    result = worker_registry.assign_worker(
+        account_id="account-1",
+    )
+
+    assert result["success"] is False
+    assert "No worker capacity available" in result["message"]
+
+
+def test_assign_worker_success(worker_registry, mock_db):
+    worker = make_worker(
+        worker_id="worker-1",
+        account_id="account-1",
+        active_connections=0,
+    )
+
+    mock_db.get_online_workers.return_value = [worker]
+    mock_db.increment_worker_connections.return_value = True
+
+    result = worker_registry.assign_worker(
+        account_id="account-2",
+    )
+
+    assert result["success"] is True
+    assert result["worker_id"] == "worker-1"
+    assert result["worker_url"] == worker.worker_url
+
+
+def test_release_worker_success(worker_registry, mock_db):
+    mock_db.decrement_worker_connections.return_value = True
+
+    result = worker_registry.release_worker(
+        worker_id="worker-1",
+    )
+
+    assert result["success"] is True
+    assert result["message"] == "Worker connection released."
+
+
+def test_release_worker_failure(worker_registry, mock_db):
+    mock_db.decrement_worker_connections.return_value = False
+
+    result = worker_registry.release_worker(
+        worker_id="worker-1",
+    )
+
+    assert result["success"] is False
+    assert "Failed to release worker connection" in result["message"]
+
+
+def test_get_worker_status(worker_registry, mock_db):
+    worker = make_worker(
+        worker_id="worker-1",
+        account_id="account-1",
+        status="online",
+        active_connections=0,
+    )
+
+    mock_db.get_worker_by_id.return_value = worker
+
+    result = worker_registry.get_worker_status(
+        worker_id="worker-1",
+    )
+
+    assert result["success"] is True
+    assert result["worker_id"] == "worker-1"
+    assert result["status"] == "online"
+    assert result["active_connections"] == 0
+
+
+def test_get_worker_status_not_found(worker_registry, mock_db):
+    mock_db.get_worker_by_id.return_value = None
+
+    result = worker_registry.get_worker_status(
+        worker_id="worker-1",
+    )
+
+    assert result["success"] is False
+    assert "Worker not found" in result["message"]
+
+
+def test_mark_worker_offline(worker_registry, mock_db):
+    mock_db.update_worker_status.return_value = True
+
+    result = worker_registry.mark_worker_offline(
+        worker_id="worker-1",
+    )
+
+    assert result["success"] is True
+    assert result["message"] == "Worker marked offline."
+
+
+def test_mark_worker_offline_failure(worker_registry, mock_db):
+    mock_db.update_worker_status.return_value = False
+
+    result = worker_registry.mark_worker_offline(
+        worker_id="worker-1",
+    )
+
+    assert result["success"] is False
+    assert "Failed to mark worker offline" in result["message"]
