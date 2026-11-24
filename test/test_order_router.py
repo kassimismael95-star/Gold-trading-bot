@@ -1,181 +1,340 @@
-import os
-import unittest
-from unittest.mock import patch, MagicMock
+from core.bot_manager import BotManager, MarketState
+from core.risk_manager import RiskManager
+from core.signal_engine import MicroMomentumTracker
 
-from execution.order_router import (
-    get_worker_api_url,
-    send_command_to_worker,
-    route_command_to_worker
+
+risk_manager = RiskManager()
+signal_tracker = MicroMomentumTracker()
+bot_manager = BotManager(
+    risk_manager=risk_manager,
+    signal_tracker=signal_tracker,
 )
 
 
-class TestOrderRouter(unittest.TestCase):
-    def setUp(self):
-        self.worker_id = "worker-1"
-        self.command_id = "command-1"
-        self.user_id = 1
-        self.account_id = 1
-        self.bot_session_id = 1
+def make_market(
+    open_positions=None,
+    balance=100.00,
+    equity=100.00,
+    free_margin=100.00,
+    spread_pips=10.0,
+):
+    return MarketState(
+        bid=3300.00,
+        ask=3300.10,
+        spread_pips=spread_pips,
+        free_margin=free_margin,
+        balance=balance,
+        equity=equity,
+        open_positions=open_positions or [],
+    )
 
-    @patch("execution.order_router.get_connection")
-    def test_get_worker_api_url_requires_online_worker(
-        self,
-        mock_get_connection
-    ):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
 
-        mock_cursor.fetchone.return_value = {
-            "worker_id": self.worker_id
-        }
+def test_first_entry_is_buy_when_confidence_is_positive():
+    market = make_market()
 
-        with patch.dict(
-            os.environ,
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "OPEN_POSITION"
+    assert plan.direction == "BUY"
+    assert plan.volume == 0.04
+    assert plan.position_number == 1
+    assert plan.stop_loss < market.ask
+    assert plan.take_profit > market.ask
+
+
+def test_first_entry_is_sell_when_confidence_is_negative():
+    market = make_market()
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="SELL",
+        confidence=-6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "OPEN_POSITION"
+    assert plan.direction == "SELL"
+    assert plan.volume == 0.04
+    assert plan.position_number == 1
+    assert plan.stop_loss > market.bid
+    assert plan.take_profit < market.bid
+
+
+def test_first_entry_blocks_high_spread():
+    market = make_market(spread_pips=40.0)
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+    assert "Spread" in plan.reason
+
+
+def test_first_entry_blocks_during_cooldown():
+    market = make_market()
+
+    bot_manager.reset_batch()
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+    assert "cooldown" in plan.reason.lower()
+
+
+def test_basket_profit_target_closes_basket():
+    market = make_market(
+        open_positions=[
             {
-                "WORKER_API_URL": "https://worker.example.com",
-                "WORKER_SHARED_SECRET": "test-secret"
-            }
-        ):
-            worker_url = get_worker_api_url(self.worker_id)
-
-            self.assertEqual(
-                worker_url,
-                "https://worker.example.com"
-            )
-
-    @patch("execution.order_router.get_connection")
-    def test_get_worker_api_url_rejects_offline_worker(
-        self,
-        mock_get_connection
-    ):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
-
-        mock_cursor.fetchone.return_value = None
-
-        with self.assertRaises(ValueError):
-            get_worker_api_url(self.worker_id)
-
-    @patch("execution.order_router.requests.post")
-    def test_send_command_to_worker_sends_authorization(
-        self,
-        mock_post
-    ):
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "status": "EXECUTED"
-        }
-
-        mock_post.return_value = mock_response
-
-        with patch.dict(
-            os.environ,
+                "symbol": "XAUUSDm",
+                "profit": 2.50,
+            },
             {
-                "WORKER_API_URL": "https://worker.example.com",
-                "WORKER_SHARED_SECRET": "test-secret"
+                "symbol": "XAUUSDm",
+                "profit": 2.00,
+            },
+        ],
+        balance=100.00,
+        equity=104.50,
+    )
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "CLOSE_BASKET"
+    assert "Basket profit target reached" in plan.reason
+
+
+def test_35_percent_drawdown_closes_basket():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": -40.00,
+            },
+        ],
+        balance=100.00,
+        equity=60.00,
+    )
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "CLOSE_BASKET"
+    assert "35% drawdown circuit breaker" in plan.reason
+
+
+def test_add_position_when_original_conditions_are_met():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "OPEN_POSITION"
+    assert plan.direction == "BUY"
+    assert plan.position_number == 2
+    assert plan.volume == 0.05
+
+
+def test_no_add_position_when_basket_is_losing():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": -1.00,
+            },
+        ],
+        balance=100.00,
+        equity=99.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_when_price_has_not_moved_enough():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.15
+    market.bid = 3300.05
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_when_spread_is_too_high():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=100.00,
+        spread_pips=40.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_when_free_margin_is_zero():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=0.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_at_18_position_hard_limit():
+    positions = []
+
+    for position_number in range(18):
+        positions.append(
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
             }
-        ):
-            result = send_command_to_worker(
-                self.worker_id,
-                {
-                    "command_id": self.command_id
-                }
-            )
-
-            self.assertEqual(
-                result["status"],
-                "EXECUTED"
-            )
-
-        mock_post.assert_called_once()
-
-        called_args = mock_post.call_args
-
-        self.assertEqual(
-            called_args.args[0],
-            "https://worker.example.com/execute-command"
         )
 
-        self.assertEqual(
-            called_args.kwargs["headers"]["Authorization"],
-            "Bearer test-secret"
-        )
+    market = make_market(
+        open_positions=positions,
+        balance=100.00,
+        equity=118.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
 
-    @patch("execution.order_router.send_command_to_worker")
-    def test_route_command_to_worker_builds_complete_command(
-        self,
-        mock_send_command
-    ):
-        mock_send_command.return_value = {
-            "status": "EXECUTED"
-        }
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
 
-        result = route_command_to_worker(
-            worker_id=self.worker_id,
-            command_id=self.command_id,
-            user_id=self.user_id,
-            account_id=self.account_id,
-            bot_session_id=self.bot_session_id,
-            command_type="OPEN_POSITION",
-            symbol="XAUUSD",
-            direction="BUY",
-            volume=0.01,
-            stop_loss=2300.00,
-            take_profit=2302.20
-        )
+    market.ask = 3300.30
+    market.bid = 3300.20
 
-        self.assertEqual(
-            result["status"],
-            "EXECUTED"
-        )
-
-        sent_command = mock_send_command.call_args.args[1]
-
-        self.assertEqual(
-            sent_command["command_id"],
-            self.command_id
-        )
-
-        self.assertEqual(
-            sent_command["user_id"],
-            self.user_id
-        )
-
-        self.assertEqual(
-            sent_command["account_id"],
-            self.account_id
-        )
-
-        self.assertEqual(
-            sent_command["bot_session_id"],
-            self.bot_session_id
-        )
-
-        self.assertEqual(
-            sent_command["symbol"],
-            "XAUUSD"
-        )
-
-        self.assertEqual(
-            sent_command["direction"],
-            "BUY"
-        )
-
-        self.assertEqual(
-            sent_command["volume"],
-            0.01
-        )
-
-        self.assertEqual(
-            sent_command["stop_loss"],
-            2300.00
-        )
-
-        self.assertEqual(
-            sent_command["take_profit"],
-            2302.20
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+    plan = bot_manager.decide(
+        market=market,
+        direction="B
