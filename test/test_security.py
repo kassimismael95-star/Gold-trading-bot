@@ -1,158 +1,184 @@
 import os
-import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from fastapi.testclient import TestClient
+import pytest
 
-from web.auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    verify_token
-)
+os_environ = {
+    "SECRET_KEY": "test-secret-key",
+    "DATABASE_URL": "sqlite:///:memory:",
+    "ENABLE_LIVE_TRADING": "true",
+}
 
-from main import app
+with patch.dict("os.environ", os_environ):
+    from app import app
+    from security import hash_password, verify_password
 
 
-class TestSecurity(unittest.TestCase):
-    def setUp(self):
-        self.client = TestClient(app)
+@pytest.fixture
+def client():
+    app.config["TESTING"] = True
 
-    def test_hash_password_does_not_return_plain_text(self):
-        hashed = hash_password("TestPassword123")
+    with app.test_client() as client:
+        yield client
 
-        self.assertNotEqual(
-            hashed,
-            "TestPassword123"
-        )
 
-    def test_verify_password_accepts_correct_password(self):
-        hashed = hash_password("TestPassword123")
+def test_hash_password_is_not_plain_text():
+    password = "password123"
 
-        result = verify_password(
-            plain_password="TestPassword123",
-            hashed_password=hashed
-        )
+    hashed = hash_password(password)
 
-        self.assertTrue(result)
+    assert hashed != password
+    assert len(hashed) > 0
 
-    def test_verify_password_rejects_wrong_password(self):
-        hashed = hash_password("TestPassword123")
 
-        result = verify_password(
-            plain_password="WrongPassword123",
-            hashed_password=hashed
-        )
+def test_verify_password_success():
+    password = "password123"
 
-        self.assertFalse(result)
+    hashed = hash_password(password)
 
-    @patch.dict(
-        os.environ,
-        {
-            "SECRET_KEY": "test-secret-key-for-unit-tests"
-        }
+    assert verify_password(password, hashed) is True
+
+
+def test_verify_password_failure():
+    password = "password123"
+
+    hashed = hash_password(password)
+
+    assert verify_password("wrong-password", hashed) is False
+
+
+def test_password_hash_is_deterministic_for_same_password():
+    password = "password123"
+
+    hash_1 = hash_password(password)
+    hash_2 = hash_password(password)
+
+    assert hash_1 == hash_2
+
+
+def test_password_hash_differs_for_different_passwords():
+    hash_1 = hash_password("password123")
+    hash_2 = hash_password("password456")
+
+    assert hash_1 != hash_2
+
+
+def test_health_endpoint_is_public(client):
+    response = client.get("/health")
+
+    assert response.status_code == 200
+
+
+def test_accounts_require_authentication(client):
+    response = client.get("/api/accounts")
+
+    assert response.status_code == 401
+
+    data = response.get_json()
+
+    assert data["status"] == "error"
+    assert "Authentication required" in data["message"]
+
+
+def test_workers_require_authentication(client):
+    response = client.get("/api/workers")
+
+    assert response.status_code == 401
+
+    data = response.get_json()
+
+    assert data["status"] == "error"
+    assert "Authentication required" in data["message"]
+
+
+def test_commands_require_authentication(client):
+    response = client.post(
+        "/api/commands",
+        json={
+            "command_type": "BUY",
+        },
     )
-    def test_create_access_token_returns_token(self):
-        token = create_access_token(
-            user_id=1,
-            email="test@example.com"
-        )
 
-        self.assertIsInstance(token, str)
-        self.assertNotEqual(token, "")
+    assert response.status_code == 401
 
-    @patch.dict(
-        os.environ,
-        {
-            "SECRET_KEY": "test-secret-key-for-unit-tests"
-        }
+    data = response.get_json()
+
+    assert data["status"] == "error"
+    assert "Authentication required" in data["message"]
+
+
+def test_invalid_token_is_rejected(client):
+    response = client.get(
+        "/api/accounts",
+        headers={
+            "Authorization": "Bearer invalid-token",
+        },
     )
-    def test_verify_token_returns_payload(self):
-        token = create_access_token(
-            user_id=1,
-            email="test@example.com"
-        )
 
-        payload = verify_token(token)
+    assert response.status_code == 401
 
-        self.assertEqual(
-            payload["user_id"],
-            1
-        )
+    data = response.get_json()
 
-        self.assertEqual(
-            payload["email"],
-            "test@example.com"
-        )
+    assert data["status"] == "error"
+    assert "Invalid or expired token" in data["message"]
 
-    @patch.dict(
-        os.environ,
-        {
-            "SECRET_KEY": "test-secret-key-for-unit-tests"
-        }
+
+def test_missing_token_is_rejected(client):
+    response = client.get("/api/accounts")
+
+    assert response.status_code == 401
+
+    data = response.get_json()
+
+    assert data["status"] == "error"
+    assert "Authentication required" in data["message"]
+
+
+def test_sql_injection_is_rejected(client):
+    response = client.post(
+        "/api/auth/login",
+        json={
+            "email": "' OR 1=1 --",
+            "password": "password123",
+        },
     )
-    def test_verify_token_rejects_invalid_token(self):
-        with self.assertRaises(Exception):
-            verify_token("invalid-token")
 
-    @patch.dict(
-        os.environ,
-        {
-            "WORKER_SHARED_SECRET": "test-worker-secret"
-        }
+    assert response.status_code in [400, 401]
+
+    data = response.get_json()
+
+    assert data["status"] == "error"
+
+
+def test_xss_payload_is_not_executed(client):
+    response = client.post(
+        "/api/auth/register",
+        json={
+            "email": "<script>alert(1)</script>",
+            "password": "password123",
+        },
     )
-    def test_worker_endpoint_rejects_missing_secret(self):
-        response = self.client.get(
-            "/worker/commands/next"
-        )
 
-        self.assertEqual(
-            response.status_code,
-            401
-        )
+    assert response.status_code in [200, 400]
 
-    @patch.dict(
-        os.environ,
-        {
-            "WORKER_SHARED_SECRET": "test-worker-secret"
-        }
+    data = response.get_json()
+
+    assert "<script>" not in str(data)
+
+
+def test_worker_secret_is_required(client):
+    response = client.post(
+        "/workers/worker-1/commands",
+        json={
+            "command_type": "BUY",
+            "account_id": "account-1",
+            "worker_id": "worker-1",
+        },
     )
-    def test_worker_endpoint_rejects_wrong_secret(self):
-        response = self.client.get(
-            "/worker/commands/next",
-            headers={
-                "X-Worker-Secret": "wrong-secret"
-            }
-        )
 
-        self.assertEqual(
-            response.status_code,
-            401
-        )
+    assert response.status_code == 401
 
-    def test_protected_route_rejects_missing_token(self):
-        response = self.client.get(
-            "/accounts"
-        )
+    data = response.get_json()
 
-        self.assertEqual(
-            response.status_code,
-            401
-        )
-
-    def test_protected_route_rejects_invalid_token(self):
-        response = self.client.get(
-            "/accounts",
-            headers={
-                "Authorization": "Bearer invalid-token"
-            }
-        )
-
-        self.assertEqual(
-            response.status_code,
-            401
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()
+    assert data["status"] == "error"
+    assert "Unauthorized worker request" in data["message"]
