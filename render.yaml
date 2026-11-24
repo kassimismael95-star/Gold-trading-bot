@@ -5,7 +5,7 @@ services:
     plan: starter
     region: oregon
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m gunicorn app:app --workers 2 --threads 4 --bind 0.0.0.0:$PORT
+    startCommand: ./start.sh
     healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
@@ -24,10 +24,3 @@ services:
         fromDatabase:
           name: bossmode-postgres
           property: connectionString
-
-databases:
-  - name: bossmode-postgres
-    databaseName: bossmode
-    user: bossmode_user
-    plan: basic-256mb
-    region: oregon
