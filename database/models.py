@@ -1,181 +1,196 @@
-import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
-def get_connection():
-    database_url = os.environ.get("DATABASE_URL")
+def utcnow():
+    return datetime.now(timezone.utc)
 
-    if not database_url:
-        raise ValueError("DATABASE_URL is missing.")
 
-    return psycopg2.connect(
-        database_url,
-        cursor_factory=RealDictCursor
+def new_uuid():
+    return uuid.uuid4()
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), default="customer", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    licences: Mapped[list["Licence"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    accounts: Mapped[list["TradingAccount"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    bots: Mapped[list["Bot"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class Licence(Base):
+    __tablename__ = "licences"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    code: Mapped[str] = mapped_column(String(50), unique=True, nullable=False, index=True)
+    plan: Mapped[str] = mapped_column(String(30), default="standard", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    user: Mapped[User | None] = relationship(back_populates="licences")
+
+
+class TradingAccount(Base):
+    __tablename__ = "trading_accounts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    broker_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    mt5_login: Mapped[str] = mapped_column(String(50), nullable=False)
+    mt5_server: Mapped[str] = mapped_column(String(255), nullable=False)
+    encrypted_password: Mapped[str] = mapped_column(Text, nullable=False)
+    account_type: Mapped[str] = mapped_column(String(20), default="demo", nullable=False)
+    symbol: Mapped[str] = mapped_column(String(30), default="XAUUSD", nullable=False)
+    connection_status: Mapped[str] = mapped_column(String(20), default="disconnected", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "mt5_login", "mt5_server", name="uq_user_mt5_account"),
     )
 
-
-def init_database():
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            license_key TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS mt5_accounts (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            mt5_login TEXT NOT NULL,
-            mt5_server TEXT NOT NULL,
-            mt5_symbol TEXT NOT NULL DEFAULT 'XAUUSDm',
-            encrypted_password TEXT NOT NULL,
-            account_status TEXT NOT NULL DEFAULT 'disconnected',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS bot_sessions (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            account_id INTEGER NOT NULL REFERENCES mt5_accounts(id),
-            session_status TEXT NOT NULL DEFAULT 'stopped',
-            risk_profile TEXT NOT NULL DEFAULT 'BALANCED',
-            assigned_worker_id TEXT,
-            started_at TIMESTAMP,
-            stopped_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trade_commands (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            account_id INTEGER NOT NULL REFERENCES mt5_accounts(id),
-            bot_session_id INTEGER NOT NULL REFERENCES bot_sessions(id),
-            command_id TEXT UNIQUE NOT NULL,
-            idempotency_key TEXT UNIQUE NOT NULL,
-            command_type TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            direction TEXT,
-            volume NUMERIC,
-            stop_loss NUMERIC,
-            take_profit NUMERIC,
-            command_status TEXT NOT NULL DEFAULT 'pending',
-            assigned_worker_id TEXT,
-            result TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            executed_at TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trade_history (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            account_id INTEGER NOT NULL REFERENCES mt5_accounts(id),
-            bot_session_id INTEGER NOT NULL REFERENCES bot_sessions(id),
-            ticket TEXT,
-            symbol TEXT NOT NULL,
-            direction TEXT,
-            volume NUMERIC,
-            entry_price NUMERIC,
-            exit_price NUMERIC,
-            profit NUMERIC,
-            status TEXT,
-            opened_at TIMESTAMP,
-            closed_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS worker_registry (
-            id SERIAL PRIMARY KEY,
-            worker_id TEXT UNIQUE NOT NULL,
-            worker_status TEXT NOT NULL DEFAULT 'offline',
-            max_accounts INTEGER NOT NULL DEFAULT 20,
-            active_accounts INTEGER NOT NULL DEFAULT 0,
-            cpu_usage NUMERIC DEFAULT 0,
-            memory_usage NUMERIC DEFAULT 0,
-            last_heartbeat TIMESTAMP,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    connection.commit()
-    cursor.close()
-    connection.close()
+    user: Mapped[User] = relationship(back_populates="accounts")
+    bots: Mapped[list["Bot"]] = relationship(back_populates="account", cascade="all, delete-orphan")
 
 
-def create_user(email, password_hash, license_key):
-    connection = get_connection()
-    cursor = connection.cursor()
+class Bot(Base):
+    __tablename__ = "bots"
 
-    cursor.execute("""
-        INSERT INTO users (
-            email,
-            password_hash,
-            license_key
-        )
-        VALUES (%s, %s, %s)
-        RETURNING id
-    """, (
-        email,
-        password_hash,
-        license_key
-    ))
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("trading_accounts.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(100), default="Gold Scalper", nullable=False)
+    symbol: Mapped[str] = mapped_column(String(30), default="XAUUSD", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="stopped", nullable=False)
+    trading_mode: Mapped[str] = mapped_column(String(10), default="demo", nullable=False)
+    risk_per_trade_percent: Mapped[float] = mapped_column(Numeric(6, 3), default=0.5, nullable=False)
+    max_open_positions: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    daily_loss_limit_percent: Mapped[float] = mapped_column(Numeric(6, 3), default=3.0, nullable=False)
+    max_daily_trades: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    max_spread_points: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+    stop_loss_points: Mapped[int] = mapped_column(Integer, default=300, nullable=False)
+    take_profit_points: Mapped[int] = mapped_column(Integer, default=300, nullable=False)
+    emergency_stop: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
-    user_id = cursor.fetchone()["id"]
-
-    connection.commit()
-    cursor.close()
-    connection.close()
-
-    return user_id
-
-
-def get_user_by_email(email):
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT *
-        FROM users
-        WHERE email = %s
-    """, (email,))
-
-    user = cursor.fetchone()
-
-    cursor.close()
-    connection.close()
-
-    return user
+    user: Mapped[User] = relationship(back_populates="bots")
+    account: Mapped[TradingAccount] = relationship(back_populates="bots")
+    commands: Mapped[list["Command"]] = relationship(back_populates="bot", cascade="all, delete-orphan")
+    trades: Mapped[list["Trade"]] = relationship(back_populates="bot", cascade="all, delete-orphan")
 
 
-def get_user_by_id(user_id):
-    connection = get_connection()
-    cursor = connection.cursor()
+class ExecutionNode(Base):
+    __tablename__ = "execution_nodes"
 
-    cursor.execute("""
-        SELECT *
-        FROM users
-        WHERE id = %s
-    """, (user_id,))
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    region: Mapped[str] = mapped_column(String(100), default="unknown", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="offline", nullable=False)
+    max_accounts: Mapped[int] = mapped_column(Integer, default=25, nullable=False)
+    active_accounts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
-    user = cursor.fetchone()
+    workers: Mapped[list["Worker"]] = relationship(back_populates="execution_node", cascade="all, delete-orphan")
 
-    cursor.close()
-    connection.close()
 
-    return user
+class Worker(Base):
+    __tablename__ = "workers"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    execution_node_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("execution_nodes.id", ondelete="CASCADE"), nullable=False, index=True)
+    worker_key: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="offline", nullable=False)
+    assigned_account_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("trading_accounts.id", ondelete="SET NULL"))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    execution_node: Mapped[ExecutionNode] = relationship(back_populates="workers")
+
+
+class Command(Base):
+    __tablename__ = "commands"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    bot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("bots.id", ondelete="CASCADE"), nullable=False, index=True)
+    idempotency_key: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    command_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False)
+    assigned_worker_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("workers.id", ondelete="SET NULL"))
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSONB)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    bot: Mapped[Bot] = relationship(back_populates="commands")
+
+
+class Trade(Base):
+    __tablename__ = "trades"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    bot_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("bots.id", ondelete="CASCADE"), nullable=False, index=True)
+    command_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("commands.id", ondelete="SET NULL"))
+    broker_ticket: Mapped[str | None] = mapped_column(String(100), index=True)
+    symbol: Mapped[str] = mapped_column(String(30), nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    volume: Mapped[float] = mapped_column(Numeric(18, 8), nullable=False)
+    entry_price: Mapped[float | None] = mapped_column(Numeric(18, 8))
+    exit_price: Mapped[float | None] = mapped_column(Numeric(18, 8))
+    profit: Mapped[float | None] = mapped_column(Numeric(18, 8))
+    status: Mapped[str] = mapped_column(String(20), default="open", nullable=False)
+    comment: Mapped[str | None] = mapped_column(String(100))
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+    bot: Mapped[Bot] = relationship(back_populates="trades")
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), index=True)
+    action: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    entity_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    entity_id: Mapped[str | None] = mapped_column(String(100))
+    details: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
