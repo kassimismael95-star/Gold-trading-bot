@@ -1,230 +1,340 @@
-import unittest
-from unittest.mock import patch, MagicMock
+from core.bot_manager import BotManager, MarketState
+from core.risk_manager import RiskManager
+from core.signal_engine import MicroMomentumTracker
 
-from core.bot_manager import (
-    calculate_current_spread_pips,
-    calculate_basket_profit,
-    should_add_position,
-    should_close_basket,
-    create_trade_command,
-    process_bot_tick
+
+risk_manager = RiskManager()
+signal_tracker = MicroMomentumTracker()
+bot_manager = BotManager(
+    risk_manager=risk_manager,
+    signal_tracker=signal_tracker,
 )
 
 
-class TestBotManager(unittest.TestCase):
-    def test_calculate_current_spread_pips(self):
-        spread = calculate_current_spread_pips(
-            bid=2300.00,
-            ask=2300.20
-        )
+def make_market(
+    open_positions=None,
+    balance=100.00,
+    equity=100.00,
+    free_margin=100.00,
+    spread_pips=10.0,
+):
+    return MarketState(
+        bid=3300.00,
+        ask=3300.10,
+        spread_pips=spread_pips,
+        free_margin=free_margin,
+        balance=balance,
+        equity=equity,
+        open_positions=open_positions or [],
+    )
 
-        self.assertEqual(spread, 20.0)
 
-    def test_calculate_basket_profit(self):
-        open_positions = [
+def test_first_entry_is_buy_when_confidence_is_positive():
+    market = make_market()
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "OPEN_POSITION"
+    assert plan.direction == "BUY"
+    assert plan.volume == 0.04
+    assert plan.position_number == 1
+    assert plan.stop_loss < market.ask
+    assert plan.take_profit > market.ask
+
+
+def test_first_entry_is_sell_when_confidence_is_negative():
+    market = make_market()
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="SELL",
+        confidence=-6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "OPEN_POSITION"
+    assert plan.direction == "SELL"
+    assert plan.volume == 0.04
+    assert plan.position_number == 1
+    assert plan.stop_loss > market.bid
+    assert plan.take_profit < market.bid
+
+
+def test_first_entry_blocks_high_spread():
+    market = make_market(spread_pips=40.0)
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+    assert "Spread" in plan.reason
+
+
+def test_first_entry_blocks_during_cooldown():
+    market = make_market()
+
+    bot_manager.reset_batch()
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+    assert "cooldown" in plan.reason.lower()
+
+
+def test_basket_profit_target_closes_basket():
+    market = make_market(
+        open_positions=[
             {
-                "profit": 1.00
+                "symbol": "XAUUSDm",
+                "profit": 2.50,
             },
             {
-                "profit": -0.30
+                "symbol": "XAUUSDm",
+                "profit": 2.00,
             },
+        ],
+        balance=100.00,
+        equity=104.50,
+    )
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "CLOSE_BASKET"
+    assert "Basket profit target reached" in plan.reason
+
+
+def test_35_percent_drawdown_closes_basket():
+    market = make_market(
+        open_positions=[
             {
-                "profit": 0.50
+                "symbol": "XAUUSDm",
+                "profit": -40.00,
+            },
+        ],
+        balance=100.00,
+        equity=60.00,
+    )
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "CLOSE_BASKET"
+    assert "35% drawdown circuit breaker" in plan.reason
+
+
+def test_add_position_when_original_conditions_are_met():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "OPEN_POSITION"
+    assert plan.direction == "BUY"
+    assert plan.position_number == 2
+    assert plan.volume == 0.05
+
+
+def test_no_add_position_when_basket_is_losing():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": -1.00,
+            },
+        ],
+        balance=100.00,
+        equity=99.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_when_price_has_not_moved_enough():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.15
+    market.bid = 3300.05
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_when_spread_is_too_high():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=100.00,
+        spread_pips=40.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_when_free_margin_is_zero():
+    market = make_market(
+        open_positions=[
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
+            },
+        ],
+        balance=100.00,
+        equity=101.00,
+        free_margin=0.00,
+        spread_pips=10.0,
+    )
+
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
+
+    market.ask = 3300.30
+    market.bid = 3300.20
+
+    plan = bot_manager.decide(
+        market=market,
+        direction="BUY",
+        confidence=6,
+        recent_price_movement=0.20,
+    )
+
+    assert plan.action == "HOLD"
+
+
+def test_no_add_position_at_18_position_hard_limit():
+    positions = []
+
+    for position_number in range(18):
+        positions.append(
+            {
+                "symbol": "XAUUSDm",
+                "profit": 1.00,
             }
-        ]
-
-        profit = calculate_basket_profit(open_positions)
-
-        self.assertEqual(profit, 1.20)
-
-    def test_should_add_position_when_price_moves_against_buy(self):
-        should_add = should_add_position(
-            open_positions=[
-                {
-                    "direction": "BUY",
-                    "entry_price": 2300.00
-                }
-            ],
-            max_positions=5,
-            direction="BUY",
-            current_direction="BUY",
-            current_price=2299.70,
-            last_entry_price=2300.00
         )
 
-        self.assertTrue(should_add)
+    market = make_market(
+        open_positions=positions,
+        balance=100.00,
+        equity=118.00,
+        free_margin=100.00,
+        spread_pips=10.0,
+    )
 
-    def test_should_not_add_position_when_price_moves_in_favor(self):
-        should_add = should_add_position(
-            open_positions=[
-                {
-                    "direction": "BUY",
-                    "entry_price": 2300.00
-                }
-            ],
-            max_positions=5,
-            direction="BUY",
-            current_direction="BUY",
-            current_price=2300.30,
-            last_entry_price=2300.00
-        )
+    bot_manager.register_first_entry(
+        direction="BUY",
+        market=market,
+    )
 
-        self.assertFalse(should_add)
+    market.ask = 3300.30
+    market.bid = 3300.20
 
-    def test_should_not_add_position_when_direction_changes(self):
-        should_add = should_add_position(
-            open_positions=[
-                {
-                    "direction": "BUY",
-                    "entry_price": 2300.00
-                }
-            ],
-            max_positions=5,
-            direction="BUY",
-            current_direction="SELL",
-            current_price=2299.70,
-            last_entry_price=2300.00
-        )
-
-        self.assertFalse(should_add)
-
-    def test_should_not_add_position_when_max_reached(self):
-        open_positions = [
-            {
-                "direction": "BUY",
-                "entry_price": 2300.00
-            },
-            {
-                "direction": "BUY",
-                "entry_price": 2299.80
-            }
-        ]
-
-        should_add = should_add_position(
-            open_positions=open_positions,
-            max_positions=2,
-            direction="BUY",
-            current_direction="BUY",
-            current_price=2299.70,
-            last_entry_price=2299.80
-        )
-
-        self.assertFalse(should_add)
-
-    def test_should_close_basket_when_target_reached(self):
-        open_positions = [
-            {
-                "profit": 0.20
-            },
-            {
-                "profit": 0.15
-            }
-        ]
-
-        should_close = should_close_basket(
-            open_positions=open_positions,
-            basket_target=0.35
-        )
-
-        self.assertTrue(should_close)
-
-    def test_should_not_close_basket_below_target(self):
-        open_positions = [
-            {
-                "profit": 0.20
-            },
-            {
-                "profit": 0.10
-            }
-        ]
-
-        should_close = should_close_basket(
-            open_positions=open_positions,
-            basket_target=0.35
-        )
-
-        self.assertFalse(should_close)
-
-    @patch("core.bot_manager.create_command")
-    def test_create_trade_command(self, mock_create_command):
-        mock_create_command.return_value = {
-            "id": "command-1",
-            "status": "PENDING"
-        }
-
-        command = create_trade_command(
-            user_id=1,
-            account_id=1,
-            bot_session_id=1,
-            command_type="OPEN_POSITION",
-            symbol="XAUUSD",
-            direction="BUY",
-            volume=0.01,
-            stop_loss=2300.00,
-            take_profit=2302.20
-        )
-
-        self.assertEqual(command["id"], "command-1")
-        self.assertEqual(command["status"], "PENDING")
-
-    @patch("core.bot_manager.get_open_positions_for_session")
-    @patch("core.bot_manager.send_trade_command")
-    def test_process_bot_tick_waits_on_high_spread(
-        self,
-        mock_send_trade_command,
-        mock_get_positions
-    ):
-        mock_get_positions.return_value = []
-
-        result = process_bot_tick(
-            user_id=1,
-            account_id=1,
-            bot_session_id=1,
-            symbol="XAUUSD",
-            current_price=2300.00,
-            bid=2299.00,
-            ask=2301.00,
-            equity=10.00,
-            balance=10.00
-        )
-
-        self.assertEqual(result["action"], "WAIT")
-        self.assertEqual(
-            result["reason"],
-            "SPREAD_TOO_HIGH"
-        )
-
-        mock_send_trade_command.assert_not_called()
-
-    @patch("core.bot_manager.get_open_positions_for_session")
-    @patch("core.bot_manager.send_trade_command")
-    def test_process_bot_tick_waits_on_low_confidence(
-        self,
-        mock_send_trade_command,
-        mock_get_positions
-    ):
-        mock_get_positions.return_value = []
-
-        result = process_bot_tick(
-            user_id=1,
-            account_id=1,
-            bot_session_id=1,
-            symbol="XAUUSD",
-            current_price=2300.00,
-            bid=2299.90,
-            ask=2300.10,
-            equity=10.00,
-            balance=10.00
-        )
-
-        self.assertEqual(result["action"], "WAIT")
-        self.assertEqual(
-            result["reason"],
-            "LOW_CONFIDENCE"
-        )
-
-        mock_send_trade_command.assert_not_called()
-
-
-if __name__ == "__main__":
-    unittest.main()
+    plan = bot_manager.decide(
+        market=market,
+        direction="B
