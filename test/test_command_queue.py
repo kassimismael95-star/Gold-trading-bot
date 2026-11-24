@@ -1,64 +1,86 @@
-import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from execution.command_queue import (
     create_command,
     claim_next_command,
-    mark_command_executing,
-    mark_command_executed,
-    mark_command_failed,
-    get_command_status
+    complete_command,
+    fail_command
 )
 
 
 class TestCommandQueue(unittest.TestCase):
     def setUp(self):
-        self.test_user_id = 1
-        self.test_account_id = 1
-        self.test_bot_session_id = 1
+        self.mock_connection = MagicMock()
+        self.mock_cursor = MagicMock()
+
+        self.mock_connection.cursor.return_value = (
+            self.mock_cursor
+        )
 
     @patch("execution.command_queue.get_connection")
-    def test_create_command_returns_command(self, mock_get_connection):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
+    def test_create_command_returns_pending_command(
+        self,
+        mock_get_connection
+    ):
+        mock_get_connection.return_value = self.mock_connection
 
-        mock_cursor.fetchone.return_value = {
-            "id": "test-command-id",
+        self.mock_cursor.fetchone.return_value = {
+            "id": "command-1",
+            "user_id": 1,
+            "account_id": 1,
+            "bot_session_id": 1,
+            "worker_id": "worker-1",
+            "command_type": "OPEN_POSITION",
             "status": "PENDING"
         }
 
         command = create_command(
-            user_id=self.test_user_id,
-            account_id=self.test_account_id,
-            bot_session_id=self.test_bot_session_id,
+            user_id=1,
+            account_id=1,
+            bot_session_id=1,
+            worker_id="worker-1",
             command_type="OPEN_POSITION",
-            symbol="XAUUSD",
-            direction="BUY",
-            volume=0.01,
-            stop_loss=2300.00,
-            take_profit=2302.20
+            payload={
+                "symbol": "XAUUSD",
+                "direction": "BUY",
+                "volume": 0.01
+            }
         )
 
-        self.assertEqual(
-            command["id"],
-            "test-command-id"
+        self.assertEqual(command["id"], "command-1")
+        self.assertEqual(command["status"], "PENDING")
+        self.assertEqual(command["worker_id"], "worker-1")
+
+    @patch("execution.command_queue.get_connection")
+    def test_claim_next_command_returns_pending_command(
+        self,
+        mock_get_connection
+    ):
+        mock_get_connection.return_value = self.mock_connection
+
+        self.mock_cursor.fetchone.return_value = {
+            "id": "command-1",
+            "worker_id": "worker-1",
+            "command_type": "OPEN_POSITION",
+            "status": "PROCESSING"
+        }
+
+        command = claim_next_command(
+            worker_id="worker-1"
         )
 
-        self.assertEqual(
-            command["status"],
-            "PENDING"
-        )
+        self.assertEqual(command["id"], "command-1")
+        self.assertEqual(command["status"], "PROCESSING")
 
     @patch("execution.command_queue.get_connection")
     def test_claim_next_command_returns_none_when_empty(
         self,
         mock_get_connection
     ):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
+        mock_get_connection.return_value = self.mock_connection
 
-        mock_cursor.fetchone.return_value = None
+        self.mock_cursor.fetchone.return_value = None
 
         command = claim_next_command(
             worker_id="worker-1"
@@ -67,66 +89,71 @@ class TestCommandQueue(unittest.TestCase):
         self.assertIsNone(command)
 
     @patch("execution.command_queue.get_connection")
-    def test_mark_command_executing(self, mock_get_connection):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
+    def test_complete_command_returns_true(
+        self,
+        mock_get_connection
+    ):
+        mock_get_connection.return_value = self.mock_connection
 
-        mock_cursor.rowcount = 1
+        self.mock_cursor.rowcount = 1
 
-        updated = mark_command_executing(
-            command_id="test-command-id",
-            worker_id="worker-1"
+        completed = complete_command(
+            command_id="command-1",
+            result={
+                "ticket": 123456,
+                "status": "EXECUTED"
+            }
         )
 
-        self.assertTrue(updated)
+        self.assertTrue(completed)
 
     @patch("execution.command_queue.get_connection")
-    def test_mark_command_executed(self, mock_get_connection):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
+    def test_complete_command_returns_false_for_unknown_command(
+        self,
+        mock_get_connection
+    ):
+        mock_get_connection.return_value = self.mock_connection
 
-        mock_cursor.rowcount = 1
+        self.mock_cursor.rowcount = 0
 
-        updated = mark_command_executed(
-            command_id="test-command-id",
-            result={"ticket": 123456}
+        completed = complete_command(
+            command_id="unknown-command",
+            result={}
         )
 
-        self.assertTrue(updated)
+        self.assertFalse(completed)
 
     @patch("execution.command_queue.get_connection")
-    def test_mark_command_failed(self, mock_get_connection):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
+    def test_fail_command_returns_true(
+        self,
+        mock_get_connection
+    ):
+        mock_get_connection.return_value = self.mock_connection
 
-        mock_cursor.rowcount = 1
+        self.mock_cursor.rowcount = 1
 
-        updated = mark_command_failed(
-            command_id="test-command-id",
+        failed = fail_command(
+            command_id="command-1",
             error_message="MT5 order rejected"
         )
 
-        self.assertTrue(updated)
+        self.assertTrue(failed)
 
     @patch("execution.command_queue.get_connection")
-    def test_get_command_status(self, mock_get_connection):
-        mock_connection = mock_get_connection.return_value
-        mock_cursor = mock_connection.cursor.return_value
+    def test_fail_command_returns_false_for_unknown_command(
+        self,
+        mock_get_connection
+    ):
+        mock_get_connection.return_value = self.mock_connection
 
-        mock_cursor.fetchone.return_value = {
-            "id": "test-command-id",
-            "status": "EXECUTED"
-        }
+        self.mock_cursor.rowcount = 0
 
-        command = get_command_status(
-            user_id=self.test_user_id,
-            command_id="test-command-id"
+        failed = fail_command(
+            command_id="unknown-command",
+            error_message="MT5 order rejected"
         )
 
-        self.assertEqual(
-            command["status"],
-            "EXECUTED"
-        )
+        self.assertFalse(failed)
 
 
 if __name__ == "__main__":
