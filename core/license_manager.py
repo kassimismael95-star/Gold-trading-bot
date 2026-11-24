@@ -1,142 +1,143 @@
 import os
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from database.models import Licence, User
+@dataclass
+class LicenseCheckResult:
+    recognized: bool
+    trading_authorized: bool
+    reason: str
+    license_key: str | None = None
 
 
 class LicenseManager:
-    def __init__(self, session: Session):
-        self.session = session
+    """
+    Recognizes the original BossMode license keys.
 
-    def get_allowed_licence_codes(self) -> list[str]:
-        raw_codes = os.getenv("ALLOWED_LICENSES", "")
+    Important:
+    Recognizing a license key does NOT authorize live trading.
 
-        return [code.strip() for code in raw_codes.split(",") if code.strip()]
+    Live trading requires:
+    - A valid verified entitlement from Bolt
+    - A connected MT5 account
+    - An active isolated MT5 worker
+    - Explicit live-trading authorization
+    """
 
-    def is_code_allowed(self, code: str) -> bool:
-        return code.strip().upper() in self.get_allowed_licence_codes()
+    KNOWN_LICENSE_KEYS = {
+        "BOSSMODE99",
+        "BOSSMODE98",
+        "BOSSMODE30D",
+        "BOSSMODE01D",
+    }
 
-    def get_licence_by_code(self, code: str) -> Licence | None:
-        statement = select(Licence).where(
-            Licence.code == code.strip().upper()
-        )
+    def __init__(self, database):
+        self.database = database
 
-        return self.session.scalar(statement)
+    def normalize_license_key(self, license_key: str | None) -> str:
+        return str(license_key or "").strip().upper()
 
-    def activate_licence(
+    def is_known_license_key(self, license_key: str | None) -> bool:
+        normalized = self.normalize_license_key(license_key)
+
+        return normalized in self.KNOWN_LICENSE_KEYS
+
+    def check_license(
         self,
-        code: str,
-        user: User,
-        plan: str = "standard",
-        valid_days: int | None = None,
-    ) -> Licence:
-        code = code.strip().upper()
+        license_key: str | None,
+    ) -> LicenseCheckResult:
+        normalized = self.normalize_license_key(license_key)
 
-        if not self.is_code_allowed(code):
-            raise ValueError("This licence code is not recognized.")
-
-        licence = self.get_licence_by_code(code)
-
-        if not licence:
-            licence = Licence(
-                code=code,
-                plan=plan,
-                status="active",
-                user_id=user.id,
-                activated_at=datetime.now(timezone.utc),
+        if not normalized:
+            return LicenseCheckResult(
+                recognized=False,
+                trading_authorized=False,
+                reason="License key is missing.",
             )
 
-            if valid_days:
-                licence.expires_at = datetime.now(timezone.utc) + timedelta(days=valid_days)
+        if not self.is_known_license_key(normalized):
+            return LicenseCheckResult(
+                recognized=False,
+                trading_authorized=False,
+                reason="License key is not recognized.",
+                license_key=normalized,
+            )
 
-            self.session.add(licence)
-            self.session.commit()
-            self.session.refresh(licence)
+        entitlement = self.database.get_license_entitlement(normalized)
 
-            return licence
+        if not entitlement:
+            return LicenseCheckResult(
+                recognized=True,
+                trading_authorized=False,
+                reason=(
+                    "License key is recognized, but no verified "
+                    "Bolt entitlement was found."
+                ),
+                license_key=normalized,
+            )
 
-        if licence.status == "revoked":
-            raise ValueError("This licence code has been revoked.")
+        if not entitlement.get("payment_verified", False):
+            return LicenseCheckResult(
+                recognized=True,
+                trading_authorized=False,
+                reason="Bolt payment has not been verified.",
+                license_key=normalized,
+            )
 
-        if licence.user_id and licence.user_id != user.id:
-            raise ValueError("This licence code is already assigned to another user.")
+        if not entitlement.get("active", False):
+            return LicenseCheckResult(
+                recognized=True,
+                trading_authorized=False,
+                reason="License entitlement is not active.",
+                license_key=normalized,
+            )
 
-        licence.user_id = user.id
-        licence.status = "active"
-        licence.plan = plan
-        licence.activated_at = datetime.now(timezone.utc)
+        expires_at = entitlement.get("expires_at")
 
-        if valid_days:
-            licence.expires_at = datetime.now(timezone.utc) + timedelta(days=valid_days)
+        if expires_at:
+            if isinstance(expires_at, str):
+                try:
+                    expires_at = datetime.fromisoformat(
+                        expires_at.replace("Z", "+00:00")
+                    )
 
-        self.session.commit()
-        self.session.refresh(licence)
+                except Exception:
+                    return LicenseCheckResult(
+                        recognized=True,
+                        trading_authorized=False,
+                        reason="License expiry date is invalid.",
+                        license_key=normalized,
+                    )
 
-        return licence
+            if expires_at <= datetime.now(timezone.utc):
+                return LicenseCheckResult(
+                    recognized=True,
+                    trading_authorized=False,
+                    reason="License entitlement has expired.",
+                    license_key=normalized,
+                )
 
-    def validate_user_licence(self, user: User) -> Licence:
-        statement = select(Licence).where(
-            Licence.user_id == user.id,
-            Licence.status == "active",
+        if not self._live_trading_enabled():
+            return LicenseCheckResult(
+                recognized=True,
+                trading_authorized=False,
+                reason=(
+                    "License is valid, but live trading is disabled "
+                    "until safety and execution tests are complete."
+                ),
+                license_key=normalized,
+            )
+
+        return LicenseCheckResult(
+            recognized=True,
+            trading_authorized=True,
+            reason="License is recognized and live trading is authorized.",
+            license_key=normalized,
         )
 
-        licence = self.session.scalar(statement)
-
-        if not licence:
-            raise ValueError("No active licence found for this user.")
-
-        if licence.expires_at and licence.expires_at < datetime.now(timezone.utc):
-            licence.status = "expired"
-            self.session.commit()
-            raise ValueError("This licence has expired.")
-
-        return licence
-
-    def suspend_licence(self, code: str) -> Licence:
-        licence = self.get_licence_by_code(code)
-
-        if not licence:
-            raise ValueError("Licence not found.")
-
-        licence.status = "suspended"
-        self.session.commit()
-        self.session.refresh(licence)
-
-        return licence
-
-    def revoke_licence(self, code: str) -> Licence:
-        licence = self.get_licence_by_code(code)
-
-        if not licence:
-            raise ValueError("Licence not found.")
-
-        licence.status = "revoked"
-        licence.user_id = None
-        licence.activated_at = None
-        licence.expires_at = None
-
-        self.session.commit()
-        self.session.refresh(licence)
-
-        return licence
-
-    def reactivate_licence(self, code: str, user: User) -> Licence:
-        licence = self.get_licence_by_code(code)
-
-        if not licence:
-            raise ValueError("Licence not found.")
-
-        if not self.is_code_allowed(licence.code):
-            raise ValueError("This licence code is not recognized.")
-
-        licence.status = "active"
-        licence.user_id = user.id
-        licence.activated_at = datetime.now(timezone.utc)
-
-        self.session.commit()
-        self.session.refresh(licence)
-
-        return licence
+    def _live_trading_enabled(self) -> bool:
+        return os.environ.get(
+            "ENABLE_LIVE_TRADING",
+            "false",
+        ).strip().lower() == "true"
