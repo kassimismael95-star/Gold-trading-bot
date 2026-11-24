@@ -1,73 +1,60 @@
-from collections import deque
-import datetime
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 
-class MicroMomentumTracker:
-    def __init__(self, capacity=20):
-        self.ticks = deque(maxlen=capacity)
-        self.candle_open = None
-        self.last_minute = None
+@dataclass
+class MarketSnapshot:
+    bid: float
+    ask: float
+    tick_count: int
+    last_tick_at: datetime | None
+    candle_direction: str
 
-    def record_tick(self, price):
-        current_minute = datetime.datetime.now(
-            datetime.timezone.utc
-        ).minute
 
-        if self.last_minute != current_minute or self.candle_open is None:
-            self.candle_open = price
-            self.last_minute = current_minute
+@dataclass
+class SignalResult:
+    signal: str
+    reason: str
 
-        self.ticks.append(price)
 
-    def evaluate(self):
-        if len(self.ticks) < 3:
-            return "BUY", 6
+class SignalEngine:
+    TICK_WINDOW = 30
+    MAX_TICK_AGE_SECONDS = 10
 
-        score = 0
-        latest = self.ticks[-1]
+    def evaluate(self, snapshot: MarketSnapshot) -> SignalResult:
+        if snapshot is None:
+            return SignalResult(signal="HOLD", reason="No market snapshot available.")
 
-        short_delta = latest - self.ticks[-3]
+        if snapshot.bid <= 0 or snapshot.ask <= 0:
+            return SignalResult(signal="HOLD", reason="Invalid market prices.")
 
-        if short_delta > 0.05:
-            score += 4
-        elif short_delta < -0.05:
-            score -= 4
-        elif short_delta > 0:
-            score += 2
-        elif short_delta < 0:
-            score -= 2
+        if snapshot.ask <= snapshot.bid:
+            return SignalResult(signal="HOLD", reason="Invalid bid/ask relationship.")
 
-        full_delta = latest - self.ticks[0]
+        if snapshot.tick_count <= 0:
+            return SignalResult(signal="HOLD", reason="No recent market ticks.")
 
-        if full_delta > 0.15:
-            score += 3
-        elif full_delta < -0.15:
-            score -= 3
-        elif full_delta > 0:
-            score += 1
-        elif full_delta < 0:
-            score -= 1
+        if snapshot.last_tick_at is None:
+            return SignalResult(signal="HOLD", reason="Market tick time is missing.")
 
-        if self.candle_open is not None:
-            candle_delta = latest - self.candle_open
+        age_seconds = (datetime.now(timezone.utc) - snapshot.last_tick_at).total_seconds()
 
-            if candle_delta > 0.10:
-                score += 3
-            elif candle_delta < -0.10:
-                score -= 3
-            elif candle_delta > 0:
-                score += 1
-            elif candle_delta < 0:
-                score -= 1
+        if age_seconds > self.MAX_TICK_AGE_SECONDS:
+            return SignalResult(
+                signal="HOLD",
+                reason=f"Market data is stale by {age_seconds:.1f} seconds.",
+            )
 
-        score = max(-10, min(10, score))
+        if snapshot.tick_count < self.TICK_WINDOW:
+            return SignalResult(
+                signal="HOLD",
+                reason=f"Waiting for {self.TICK_WINDOW - snapshot.tick_count} more ticks.",
+            )
 
-        direction = "BUY" if score >= 0 else "SELL"
+        if snapshot.candle_direction == "up":
+            return SignalResult(signal="BUY", reason="One-minute candle direction is up.")
 
-        return direction, score
+        if snapshot.candle_direction == "down":
+            return SignalResult(signal="SELL", reason="One-minute candle direction is down.")
 
-    def recent_movement(self):
-        if len(self.ticks) < 3:
-            return 0.0
-
-        return abs(self.ticks[-1] - self.ticks[-3])
+        return SignalResult(signal="HOLD", reason="Candle direction is uncertain.")
