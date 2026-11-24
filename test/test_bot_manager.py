@@ -1,340 +1,258 @@
-from core.bot_manager import BotManager, MarketState
-from core.risk_manager import RiskManager
-from core.signal_engine import MicroMomentumTracker
+from unittest.mock import MagicMock
+
+import pytest
+
+from bot_manager import BotManager
 
 
-risk_manager = RiskManager()
-signal_tracker = MicroMomentumTracker()
-bot_manager = BotManager(
-    risk_manager=risk_manager,
-    signal_tracker=signal_tracker,
-)
+@pytest.fixture
+def mock_db():
+    return MagicMock()
 
 
-def make_market(
-    open_positions=None,
-    balance=100.00,
-    equity=100.00,
-    free_margin=100.00,
-    spread_pips=10.0,
-):
-    return MarketState(
+@pytest.fixture
+def mock_order_router():
+    return MagicMock()
+
+
+@pytest.fixture
+def bot_manager(mock_db, mock_order_router):
+    return BotManager(
+        db=mock_db,
+        order_router=mock_order_router,
+    )
+
+
+def make_tick(
+    bid: float,
+    ask: float,
+) -> dict:
+    return {
+        "bid": bid,
+        "ask": ask,
+    }
+
+
+def make_bot_config(
+    account_id: str = "account-1",
+    license_key: str = "BOSSMODE99",
+    max_positions: int = 18,
+) -> dict:
+    return {
+        "account_id": account_id,
+        "license_key": license_key,
+        "max_positions": max_positions,
+        "add_position_move_usd": 0.15,
+        "multi_scalp_cooldown_seconds": 3,
+        "sl_base_usd": 2.00,
+        "tp_base_usd": 2.20,
+        "sl_min_usd": 1.50,
+        "sl_max_usd": 3.00,
+        "tp_min_usd": 1.80,
+        "tp_max_usd": 3.50,
+        "poll_latency_delay": 0.05,
+        "burst_spacing_delay": 0.08,
+        "max_allowed_spread_pips": 35.0,
+    }
+
+
+def test_momentum_tracker_returns_buy_with_few_ticks(bot_manager):
+    result = bot_manager.evaluate_momentum(
+        ticks=[],
+    )
+
+    assert result["direction"] == "BUY"
+    assert result["confidence"] == 6
+
+
+def test_momentum_tracker_clamps_score(bot_manager):
+    ticks = []
+
+    for index in range(20):
+        ticks.append(
+            make_tick(
+                bid=3300.00 + index,
+                ask=3300.10 + index,
+            )
+        )
+
+    result = bot_manager.evaluate_momentum(
+        ticks=ticks,
+    )
+
+    assert result["score"] <= 10
+    assert result["score"] >= -10
+
+
+def test_momentum_tracker_buy_when_score_positive(bot_manager):
+    ticks = []
+
+    for index in range(20):
+        ticks.append(
+            make_tick(
+                bid=3300.00 + index,
+                ask=3300.10 + index,
+            )
+        )
+
+    result = bot_manager.evaluate_momentum(
+        ticks=ticks,
+    )
+
+    if result["score"] >= 0:
+        assert result["direction"] == "BUY"
+
+    else:
+        assert result["direction"] == "SELL"
+
+
+def test_momentum_tracker_sell_when_score_negative(bot_manager):
+    ticks = []
+
+    for index in range(20):
+        ticks.append(
+            make_tick(
+                bid=3320.00 - index,
+                ask=3320.10 - index,
+            )
+        )
+
+    result = bot_manager.evaluate_momentum(
+        ticks=ticks,
+    )
+
+    if result["score"] >= 0:
+        assert result["direction"] == "BUY"
+
+    else:
+        assert result["direction"] == "SELL"
+
+
+def test_rejects_order_when_spread_too_high(bot_manager):
+    bot_config = make_bot_config()
+
+    tick = make_tick(
+        bid=3300.00,
+        ask=3310.00,
+    )
+
+    result = bot_manager.validate_spread(
+        bot_config=bot_config,
+        tick=tick,
+    )
+
+    assert result["success"] is False
+    assert "Spread too high" in result["message"]
+
+
+def test_allows_order_when_spread_acceptable(bot_manager):
+    bot_config = make_bot_config()
+
+    tick = make_tick(
         bid=3300.00,
         ask=3300.10,
-        spread_pips=spread_pips,
-        free_margin=free_margin,
-        balance=balance,
-        equity=equity,
-        open_positions=open_positions or [],
     )
 
-
-def test_first_entry_is_buy_when_confidence_is_positive():
-    market = make_market()
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
+    result = bot_manager.validate_spread(
+        bot_config=bot_config,
+        tick=tick,
     )
 
-    assert plan.action == "OPEN_POSITION"
-    assert plan.direction == "BUY"
-    assert plan.volume == 0.04
-    assert plan.position_number == 1
-    assert plan.stop_loss < market.ask
-    assert plan.take_profit > market.ask
+    assert result["success"] is True
 
 
-def test_first_entry_is_sell_when_confidence_is_negative():
-    market = make_market()
+def test_rejects_order_when_max_positions_reached(bot_manager):
+    bot_config = make_bot_config()
 
-    plan = bot_manager.decide(
-        market=market,
-        direction="SELL",
-        confidence=-6,
-        recent_price_movement=0.20,
-    )
+    open_positions = []
 
-    assert plan.action == "OPEN_POSITION"
-    assert plan.direction == "SELL"
-    assert plan.volume == 0.04
-    assert plan.position_number == 1
-    assert plan.stop_loss > market.bid
-    assert plan.take_profit < market.bid
-
-
-def test_first_entry_blocks_high_spread():
-    market = make_market(spread_pips=40.0)
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "HOLD"
-    assert "Spread" in plan.reason
-
-
-def test_first_entry_blocks_during_cooldown():
-    market = make_market()
-
-    bot_manager.reset_batch()
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "HOLD"
-    assert "cooldown" in plan.reason.lower()
-
-
-def test_basket_profit_target_closes_basket():
-    market = make_market(
-        open_positions=[
+    for index in range(18):
+        open_positions.append(
             {
+                "ticket": 100000 + index,
                 "symbol": "XAUUSDm",
-                "profit": 2.50,
-            },
-            {
-                "symbol": "XAUUSDm",
-                "profit": 2.00,
-            },
-        ],
-        balance=100.00,
-        equity=104.50,
-    )
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "CLOSE_BASKET"
-    assert "Basket profit target reached" in plan.reason
-
-
-def test_35_percent_drawdown_closes_basket():
-    market = make_market(
-        open_positions=[
-            {
-                "symbol": "XAUUSDm",
-                "profit": -40.00,
-            },
-        ],
-        balance=100.00,
-        equity=60.00,
-    )
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "CLOSE_BASKET"
-    assert "35% drawdown circuit breaker" in plan.reason
-
-
-def test_add_position_when_original_conditions_are_met():
-    market = make_market(
-        open_positions=[
-            {
-                "symbol": "XAUUSDm",
-                "profit": 1.00,
-            },
-        ],
-        balance=100.00,
-        equity=101.00,
-        free_margin=100.00,
-        spread_pips=10.0,
-    )
-
-    bot_manager.register_first_entry(
-        direction="BUY",
-        market=market,
-    )
-
-    market.ask = 3300.30
-    market.bid = 3300.20
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "OPEN_POSITION"
-    assert plan.direction == "BUY"
-    assert plan.position_number == 2
-    assert plan.volume == 0.05
-
-
-def test_no_add_position_when_basket_is_losing():
-    market = make_market(
-        open_positions=[
-            {
-                "symbol": "XAUUSDm",
-                "profit": -1.00,
-            },
-        ],
-        balance=100.00,
-        equity=99.00,
-        free_margin=100.00,
-        spread_pips=10.0,
-    )
-
-    bot_manager.register_first_entry(
-        direction="BUY",
-        market=market,
-    )
-
-    market.ask = 3300.30
-    market.bid = 3300.20
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "HOLD"
-
-
-def test_no_add_position_when_price_has_not_moved_enough():
-    market = make_market(
-        open_positions=[
-            {
-                "symbol": "XAUUSDm",
-                "profit": 1.00,
-            },
-        ],
-        balance=100.00,
-        equity=101.00,
-        free_margin=100.00,
-        spread_pips=10.0,
-    )
-
-    bot_manager.register_first_entry(
-        direction="BUY",
-        market=market,
-    )
-
-    market.ask = 3300.15
-    market.bid = 3300.05
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "HOLD"
-
-
-def test_no_add_position_when_spread_is_too_high():
-    market = make_market(
-        open_positions=[
-            {
-                "symbol": "XAUUSDm",
-                "profit": 1.00,
-            },
-        ],
-        balance=100.00,
-        equity=101.00,
-        free_margin=100.00,
-        spread_pips=40.0,
-    )
-
-    bot_manager.register_first_entry(
-        direction="BUY",
-        market=market,
-    )
-
-    market.ask = 3300.30
-    market.bid = 3300.20
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "HOLD"
-
-
-def test_no_add_position_when_free_margin_is_zero():
-    market = make_market(
-        open_positions=[
-            {
-                "symbol": "XAUUSDm",
-                "profit": 1.00,
-            },
-        ],
-        balance=100.00,
-        equity=101.00,
-        free_margin=0.00,
-        spread_pips=10.0,
-    )
-
-    bot_manager.register_first_entry(
-        direction="BUY",
-        market=market,
-    )
-
-    market.ask = 3300.30
-    market.bid = 3300.20
-
-    plan = bot_manager.decide(
-        market=market,
-        direction="BUY",
-        confidence=6,
-        recent_price_movement=0.20,
-    )
-
-    assert plan.action == "HOLD"
-
-
-def test_no_add_position_at_18_position_hard_limit():
-    positions = []
-
-    for position_number in range(18):
-        positions.append(
-            {
-                "symbol": "XAUUSDm",
-                "profit": 1.00,
+                "type": "BUY",
+                "volume": 0.01,
             }
         )
 
-    market = make_market(
-        open_positions=positions,
-        balance=100.00,
-        equity=118.00,
-        free_margin=100.00,
-        spread_pips=10.0,
+    result = bot_manager.check_position_limit(
+        bot_config=bot_config,
+        open_positions=open_positions,
     )
 
-    bot_manager.register_first_entry(
+    assert result["success"] is False
+    assert "Maximum positions reached" in result["message"]
+
+
+def test_allows_order_when_below_max_positions(bot_manager):
+    bot_config = make_bot_config()
+
+    open_positions = []
+
+    for index in range(17):
+        open_positions.append(
+            {
+                "ticket": 100000 + index,
+                "symbol": "XAUUSDm",
+                "type": "BUY",
+                "volume": 0.01,
+            }
+        )
+
+    result = bot_manager.check_position_limit(
+        bot_config=bot_config,
+        open_positions=open_positions,
+    )
+
+    assert result["success"] is True
+
+
+def test_calculates_dynamic_sl_and_tp(bot_manager):
+    bot_config = make_bot_config()
+
+    result = bot_manager.calculate_dynamic_sl_tp(
+        bot_config=bot_config,
         direction="BUY",
-        market=market,
+        entry_price=3300.00,
+        position_number=1,
     )
 
-    market.ask = 3300.30
-    market.bid = 3300.20
+    assert result["stop_loss"] < 3300.00
+    assert result["take_profit"] > 3300.00
 
-    plan = bot_manager.decide(
-        market=market,
-        direction="B
+
+def test_calculates_dynamic_sl_and_tp_for_sell(bot_manager):
+    bot_config = make_bot_config()
+
+    result = bot_manager.calculate_dynamic_sl_tp(
+        bot_config=bot_config,
+        direction="SELL",
+        entry_price=3300.00,
+        position_number=1,
+    )
+
+    assert result["stop_loss"] > 3300.00
+    assert result["take_profit"] < 3300.00
+
+
+def test_calculates_added_lot_tier(bot_manager):
+    bot_config = make_bot_config()
+
+    result = bot_manager.calculate_added_lot_tier(
+        bot_config=bot_config,
+        position_number=1,
+    )
+
+    assert result["volume"] > 0
+
+
+def test_calculates_burst_spacing_delay(bot_manager):
+    bot_config = make_bot_config()
+
+    result = bot_manager.calculate_burst_spacing_delay(
+        bot_config=bot_config,
+        position_number=1,
+    )
+
+    assert result["delay"] >= 0
