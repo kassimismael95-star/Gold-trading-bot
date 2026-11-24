@@ -20,37 +20,70 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environment
+# Virtual environments
 venv/
 env/
 ENV/
 .venv/
+env.bak/
+venv.bak/
 
-# Environment secrets
+# Environment variables
 .env
 .env.*
 !.env.example
 
-# Database files
+# Secrets
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+secrets.json
+credentials.json
+
+# Database
 *.db
 *.sqlite
 *.sqlite3
+*.sql
 
 # Logs
 *.log
 logs/
+log/
 
-# Operating system files
-.DS_Store
-Thumbs.db
+# Test coverage
+.coverage
+.coverage.*
+htmlcov/
+.coverage.xml
+coverage.xml
+.noseids
+.tox/
+.pytest_cache/
 
-# IDE files
+# IDE
 .vscode/
 .idea/
 *.swp
+*.swo
+*.swn
 
-# Local worker files
-mt5/*.ini
-mt5/*.log
-mt5/*.exe
-mt5/*.dll
+# OS
+.DS_Store
+Thumbs.db
+
+# MT5 worker
+worker/*.log
+worker/mt5_*.log
+worker/terminal_*.log
+worker/*.ini
+worker/*.cfg
+worker/*.config
+
+# MetaTrader 5
+MetaTrader5/
+metaeditor64.exe
+terminal64.exe
