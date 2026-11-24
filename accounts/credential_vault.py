@@ -1,38 +1,45 @@
-import os
 import base64
-from cryptography.fernet import Fernet
+import os
+
+from cryptography.fernet import Fernet, InvalidToken
 
 
-def get_encryption_key():
-    secret_key = os.environ.get("SECRET_KEY")
+class CredentialVault:
+    def __init__(self, secret_key: str | None = None):
+        self.secret_key = secret_key or os.getenv("SECRET_KEY", "")
 
-    if not secret_key:
-        raise ValueError("SECRET_KEY is missing.")
+        if not self.secret_key:
+            raise RuntimeError("SECRET_KEY is required for credential encryption.")
 
-    key_material = secret_key.encode("utf-8")
+        self._fernet = Fernet(self._derive_key(self.secret_key))
 
-    key = base64.urlsafe_b64encode(
-        key_material.ljust(32, b"0")[:32]
-    )
+    @staticmethod
+    def _derive_key(secret_key: str) -> bytes:
+        digest = __import__("hashlib").sha256(secret_key.encode("utf-8")).digest()
+        return base64.urlsafe_b64encode(digest)
 
-    return key
+    def encrypt(self, plaintext: str) -> str:
+        if not plaintext:
+            raise ValueError("Credential value cannot be empty.")
 
+        encrypted = self._fernet.encrypt(plaintext.encode("utf-8"))
+        return encrypted.decode("utf-8")
 
-def encrypt_password(password):
-    fernet = Fernet(get_encryption_key())
+    def decrypt(self, encrypted_value: str) -> str:
+        if not encrypted_value:
+            raise ValueError("Encrypted credential value cannot be empty.")
 
-    encrypted_password = fernet.encrypt(
-        password.encode("utf-8")
-    )
+        try:
+            decrypted = self._fernet.decrypt(encrypted_value.encode("utf-8"))
+            return decrypted.decode("utf-8")
+        except InvalidToken as error:
+            raise ValueError("Invalid encrypted credential or wrong SECRET_KEY.") from error
 
-    return encrypted_password.decode("utf-8")
+    def mask(self, value: str) -> str:
+        if not value:
+            return ""
 
+        if len(value) <= 4:
+            return "****"
 
-def decrypt_password(encrypted_password):
-    fernet = Fernet(get_encryption_key())
-
-    decrypted_password = fernet.decrypt(
-        encrypted_password.encode("utf-8")
-    )
-
-    return decrypted_password.decode("utf-8")
+        return f"****{value[-4:]}"
