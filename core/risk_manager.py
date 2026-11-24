@@ -195,4 +195,4 @@ def calculate_dynamic_tp_sl(
             take_profit_distance / stop_loss_distance,
             2
         )
-      )
+    }
