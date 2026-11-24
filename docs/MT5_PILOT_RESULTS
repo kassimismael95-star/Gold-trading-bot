@@ -1,0 +1,16 @@
+# MT5 Pilot Results
+
+This document records the actual MT5 pilot test results before scaling.
+
+Do not add more MT5 accounts until all required tests pass and the results are recorded here.
+
+## Pilot rule
+
+Start with:
+
+```text
+1 demo MT5 account
+1 Oracle x86 micro VM
+1 Wine prefix
+1 MT5 terminal
+1 EA instance
