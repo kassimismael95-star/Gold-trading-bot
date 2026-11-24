@@ -1,47 +1,51 @@
-"""
-Render control-plane entry point.
-
-This app manages users, MT5 account credentials, bot sessions,
-commands, workers, and API routes. It does not execute trades
-directly; execution workers do that in isolated MT5 sessions.
-"""
-
 import os
 
 from flask import Flask, jsonify
 from flask_cors import CORS
 
-from database.models import initialize_database
 from database.migrations import run_migrations
-from web.routes import api
+from web.routes import register_routes
 
 
-def create_app():
+def create_app() -> Flask:
     app = Flask(__name__)
 
-    CORS(
-        app,
-        supports_credentials=True,
-        origins=os.environ.get(
-            "ALLOWED_ORIGINS",
-            "*"
-        ).split(",")
-    )
+    app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "")
+    app.config["JSON_SORT_KEYS"] = False
 
-    app.register_blueprint(api)
+    allowed_origins = os.getenv("ALLOWED_ORIGINS", "")
 
-    @app.route("/")
-    def home():
-        return jsonify({
-            "service": "BOSSMODE Control Plane",
-            "status": "running"
-        })
+    if allowed_origins:
+        origins = [origin.strip() for origin in allowed_origins.split(",") if origin.strip()]
+        CORS(
+            app,
+            origins=origins,
+            supports_credentials=True,
+            allow_headers=["Content-Type", "Authorization"],
+            methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        )
+    else:
+        CORS(app)
 
-    @app.route("/health", methods=["GET"])
+    register_routes(app)
+
+    @app.get("/health")
     def health():
-        return jsonify({
-            "status": "ok"
-        })
+        return jsonify(
+            {
+                "status": "ok",
+                "service": "Gold Scalper AI - Matrix Control",
+                "live_trading_enabled": os.getenv("ENABLE_LIVE_TRADING", "false").lower() == "true",
+            }
+        )
+
+    @app.errorhandler(404)
+    def not_found(_error):
+        return jsonify({"error": "Not found"}), 404
+
+    @app.errorhandler(500)
+    def internal_error(_error):
+        return jsonify({"error": "Internal server error"}), 500
 
     return app
 
@@ -49,19 +53,6 @@ def create_app():
 app = create_app()
 
 
-def initialize():
-    initialize_database()
-    run_migrations()
-
-
 if __name__ == "__main__":
-    initialize()
-
-    port = int(
-        os.environ.get("PORT", 5000)
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    run_migrations()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
