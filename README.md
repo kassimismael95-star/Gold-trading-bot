@@ -1,45 +1,19 @@
-# BOSSMODE Control Plane
+# Gold Balanced Multi-Position Scalper Control Plane
 
-BOSSMODE is a trading-bot control plane built for Render. It manages users, encrypted MT5 account credentials, bot sessions, durable trade commands, worker selection, and command history.
+This project preserves the original **Gold Balanced Multi-Position Scalper** trading style while adding a durable cloud control plane, isolated Windows MT5 workers, secure credentials, worker capacity limits, and execution reconciliation.
 
-It does **not** execute trades directly. A separate Windows MT5 worker receives approved commands and executes them in MetaTrader 5.
+The original strategy, execution rules, lot sizing, stop-loss/take-profit formula, basket behavior, and bot signature remain unchanged.
 
-## Current status
+## Original Trading Style
 
-This repository is under construction.
+The system preserves the original balanced multi-position scalping style.
 
-The control-plane files are designed to support:
-
-- User accounts and secure sessions
-- Encrypted MT5 credentials
-- Durable PostgreSQL command queue
-- Worker registry and least-loaded worker selection
-- Secure worker command routing
-- Micro-momentum signal engine
-- Risk and basket-position logic
-- Reconciliation after reconnects
-- Basic automated tests
-
-## Not ready for live trading
-
-Do **not** connect a real trading account or enable live orders yet.
-
-Before live trading, the project still needs:
-
-- Server-side license entitlement verification
-- Command ownership verification in the worker
-- Correct basket-close command handling
-- Persistent momentum tracking across ticks
-- Worker command-result updates in the database
-- End-to-end tests using a demo MT5 account
-- Security review of credentials, sessions, and worker access
-
-## Architecture
+### Core settings
 
 ```text
-Bolt website
-→ Render control plane
-→ PostgreSQL command queue
-→ Windows MT5 worker
-→ MetaTrader 5
-→ Broker
+MAX_ALLOWED_SPREAD_PIPS = 35.0
+POLL_LATENCY_DELAY = 0.05
+BURST_SPACING_DELAY = 0.08
+ADD_POSITION_MOVE_USD = 0.15
+MULTI_SCALP_COOLDOWN_SECONDS = 3
+MAX_POSITIONS_HARD_LIMIT = 18
