@@ -1,245 +1,232 @@
-import asyncio
-from datetime import datetime, timedelta, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
-from execution.reconciliation import ReconciliationService
+from reconciliation import ReconciliationService
 
 
 @pytest.fixture
-def database():
-    database = MagicMock()
-
-    database.get_account.return_value = {
-        "id": "account-1",
-        "worker_id": "worker-1",
-        "last_position_update_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    database.get_pending_commands.return_value = []
-
-    return database
+def mock_db():
+    return MagicMock()
 
 
 @pytest.fixture
-def worker_registry():
-    worker_registry = MagicMock()
-
-    worker_registry.get_worker.return_value = {
-        "id": "worker-1",
-        "status": "ACTIVE",
-    }
-
-    return worker_registry
+def mock_worker_registry():
+    return MagicMock()
 
 
 @pytest.fixture
-def reconciliation(database, worker_registry):
+def reconciliation_service(mock_db, mock_worker_registry):
     return ReconciliationService(
-        database=database,
-        worker_registry=worker_registry,
+        db=mock_db,
+        worker_registry=mock_worker_registry,
     )
 
 
-def test_account_not_found(reconciliation, database):
-    database.get_account.return_value = None
+def make_worker(
+    worker_id: str = "worker-1",
+    account_id: str = "account-1",
+    worker_url: str = "https://worker-1.example.com",
+) -> MagicMock:
+    worker = MagicMock()
 
-    result = asyncio.run(
-        reconciliation.reconcile_account("missing-account")
-    )
+    worker.id = worker_id
+    worker.account_id = account_id
+    worker.worker_url = worker_url
 
-    assert result.action_taken == "ACCOUNT_NOT_FOUND"
-    assert result.worker_online is False
-    assert result.mt5_connected is False
+    return worker
 
 
-def test_account_without_worker(reconciliation, database):
-    database.get_account.return_value = {
-        "id": "account-1",
-        "worker_id": None,
+def make_open_position(
+    ticket: int = 123456,
+    symbol: str = "XAUUSDm",
+    direction: str = "BUY",
+    volume: float = 0.01,
+    comment: str = "BALANCED-SCALP-1 [BOSSMODE99]",
+) -> dict:
+    return {
+        "ticket": ticket,
+        "symbol": symbol,
+        "type": direction,
+        "volume": volume,
+        "price_open": 3300.00,
+        "profit": 0.00,
+        "comment": comment,
     }
 
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
+
+def test_reconcile_no_open_positions(reconciliation_service, mock_db):
+    worker = make_worker()
+
+    mock_db.get_worker_by_account.return_value = worker
+
+    mock_db.get_open_orders_for_account.return_value = []
+
+    reconciliation_service.worker_client.get_open_positions = MagicMock(
+        return_value=[]
     )
 
-    assert result.action_taken == "NO_WORKER_ASSIGNED"
-    assert result.worker_online is False
-    assert result.mt5_connected is False
-
-
-def test_worker_offline(reconciliation, worker_registry):
-    worker_registry.get_worker.return_value = {
-        "id": "worker-1",
-        "status": "OFFLINE",
-    }
-
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
+    result = reconciliation_service.reconcile_account(
+        account_id="account-1",
     )
 
-    assert result.worker_online is False
-    assert result.mt5_connected is False
-    assert result.action_taken == "WORKER_OFFLINE"
+    assert result["success"] is True
+    assert result["open_positions"] == []
+    assert result["orphaned_orders"] == []
+    assert result["missing_orders"] == []
 
 
-def test_mt5_disconnected(reconciliation, monkeypatch):
-    monkeypatch.setattr(
-        reconciliation,
-        "_check_worker_mt5_connection",
-        AsyncMock(return_value=False),
-    )
-
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
-    )
-
-    assert result.worker_online is True
-    assert result.mt5_connected is False
-    assert result.action_taken == "MT5_DISCONNECTED"
-
-
-def test_pending_commands_are_detected(reconciliation, database, monkeypatch):
-    database.get_pending_commands.return_value = [
-        {
-            "id": "command-1",
-            "command_type": "BUY",
-            "account_id": "account-1",
-            "symbol": "XAUUSDm",
-            "volume": 0.04,
-            "stop_loss": 3297.00,
-            "take_profit": 3303.00,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-    ]
-
-    monkeypatch.setattr(
-        reconciliation,
-        "_check_worker_mt5_connection",
-        AsyncMock(return_value=True),
-    )
-
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
-    )
-
-    assert result.pending_commands == 1
-    assert result.action_taken == "PENDING_COMMANDS_WAITING"
-
-
-def test_missing_fill_is_detected(reconciliation, database, monkeypatch):
-    old_time = datetime.now(timezone.utc) - timedelta(seconds=60)
-
-    database.get_pending_commands.return_value = [
-        {
-            "id": "command-1",
-            "command_type": "BUY",
-            "account_id": "account-1",
-            "symbol": "XAUUSDm",
-            "volume": 0.04,
-            "stop_loss": 3297.00,
-            "take_profit": 3303.00,
-            "created_at": old_time.isoformat(),
-        }
-    ]
-
-    monkeypatch.setattr(
-        reconciliation,
-        "_check_worker_mt5_connection",
-        AsyncMock(return_value=True),
-    )
-
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
-    )
-
-    assert result.missing_fill_detected is True
-    assert result.action_taken == "MISSING_FILL_DETECTED"
-
-
-def test_duplicate_order_risk_is_detected(
-    reconciliation,
-    database,
-    monkeypatch,
+def test_reconcile_detects_orphaned_position(
+    reconciliation_service,
+    mock_db,
 ):
-    command_time = datetime.now(timezone.utc)
+    worker = make_worker()
 
-    database.get_pending_commands.return_value = [
+    mock_db.get_worker_by_account.return_value = worker
+
+    mock_db.get_open_orders_for_account.return_value = []
+
+    reconciliation_service.worker_client.get_open_positions = MagicMock(
+        return_value=[
+            make_open_position(
+                ticket=123456,
+            )
+        ]
+    )
+
+    result = reconciliation_service.reconcile_account(
+        account_id="account-1",
+    )
+
+    assert result["success"] is True
+    assert len(result["orphaned_orders"]) == 1
+    assert result["orphaned_orders"][0]["ticket"] == 123456
+
+
+def test_reconcile_detects_missing_position(
+    reconciliation_service,
+    mock_db,
+):
+    worker = make_worker()
+
+    mock_db.get_worker_by_account.return_value = worker
+
+    mock_db.get_open_orders_for_account.return_value = [
         {
-            "id": "command-1",
-            "command_type": "BUY",
-            "account_id": "account-1",
+            "ticket": 123456,
             "symbol": "XAUUSDm",
-            "volume": 0.04,
-            "stop_loss": 3297.00,
-            "take_profit": 3303.00,
-            "created_at": command_time.isoformat(),
-        },
-        {
-            "id": "command-2",
-            "command_type": "BUY",
-            "account_id": "account-1",
-            "symbol": "XAUUSDm",
-            "volume": 0.04,
-            "stop_loss": 3297.00,
-            "take_profit": 3303.00,
-            "created_at": command_time.isoformat(),
-        },
+            "direction": "BUY",
+            "volume": 0.01,
+            "comment": "BALANCED-SCALP-1 [BOSSMODE99]",
+        }
     ]
 
-    monkeypatch.setattr(
-        reconciliation,
-        "_check_worker_mt5_connection",
-        AsyncMock(return_value=True),
+    reconciliation_service.worker_client.get_open_positions = MagicMock(
+        return_value=[]
     )
 
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
+    result = reconciliation_service.reconcile_account(
+        account_id="account-1",
     )
 
-    assert result.duplicate_risk_detected is True
-    assert result.action_taken == "DUPLICATE_RISK_DETECTED"
+    assert result["success"] is True
+    assert len(result["missing_orders"]) == 1
+    assert result["missing_orders"][0]["ticket"] == 123456
 
 
-def test_stale_position_is_detected(reconciliation, database, monkeypatch):
-    old_time = datetime.now(timezone.utc) - timedelta(seconds=180)
+def test_reconcile_matches_open_position(
+    reconciliation_service,
+    mock_db,
+):
+    worker = make_worker()
 
-    database.get_account.return_value = {
-        "id": "account-1",
-        "worker_id": "worker-1",
-        "last_position_update_at": old_time.isoformat(),
-    }
+    mock_db.get_worker_by_account.return_value = worker
 
-    monkeypatch.setattr(
-        reconciliation,
-        "_check_worker_mt5_connection",
-        AsyncMock(return_value=True),
+    mock_db.get_open_orders_for_account.return_value = [
+        {
+            "ticket": 123456,
+            "symbol": "XAUUSDm",
+            "direction": "BUY",
+            "volume": 0.01,
+            "comment": "BALANCED-SCALP-1 [BOSSMODE99]",
+        }
+    ]
+
+    reconciliation_service.worker_client.get_open_positions = MagicMock(
+        return_value=[
+            make_open_position(
+                ticket=123456,
+            )
+        ]
     )
 
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
+    result = reconciliation_service.reconcile_account(
+        account_id="account-1",
     )
 
-    assert result.stale_position_detected is True
-    assert result.action_taken == "STALE_POSITION_DETECTED"
+    assert result["success"] is True
+    assert result["open_positions"] == [
+        {
+            "ticket": 123456,
+            "symbol": "XAUUSDm",
+            "type": "BUY",
+            "volume": 0.01,
+            "price_open": 3300.00,
+            "profit": 0.00,
+            "comment": "BALANCED-SCALP-1 [BOSSMODE99]",
+        }
+    ]
+    assert result["orphaned_orders"] == []
+    assert result["missing_orders"] == []
 
 
-def test_healthy_account_has_no_action(reconciliation, monkeypatch):
-    monkeypatch.setattr(
-        reconciliation,
-        "_check_worker_mt5_connection",
-        AsyncMock(return_value=True),
+def test_close_orphaned_positions(
+    reconciliation_service,
+    mock_db,
+):
+    worker = make_worker()
+
+    mock_db.get_worker_by_account.return_value = worker
+
+    reconciliation_service.worker_client.close_position = MagicMock(
+        return_value={
+            "success": True,
+            "message": "Position 123456 closed with SELL order.",
+        }
     )
 
-    result = asyncio.run(
-        reconciliation.reconcile_account("account-1")
+    result = reconciliation_service.close_orphaned_position(
+        account_id="account-1",
+        ticket=123456,
     )
 
-    assert result.worker_online is True
-    assert result.mt5_connected is True
-    assert result.pending_commands == 0
-    assert result.duplicate_risk_detected is False
-    assert result.missing_fill_detected is False
-    assert result.stale_position_detected is False
-    assert result.action_taken == "NO_ACTION"
+    assert result["success"] is True
+    assert result["message"] == "Position 123456 closed with SELL order."
+
+    reconciliation_service.worker_client.close_position.assert_called_once_with(
+        123456
+    )
+
+
+def test_close_orphaned_position_failure(
+    reconciliation_service,
+    mock_db,
+):
+    worker = make_worker()
+
+    mock_db.get_worker_by_account.return_value = worker
+
+    reconciliation_service.worker_client.close_position = MagicMock(
+        return_value={
+            "success": False,
+            "message": "MT5 close rejected.",
+        }
+    )
+
+    result = reconciliation_service.close_orphaned_position(
+        account_id="account-1",
+        ticket=123456,
+    )
+
+    assert result["success"] is False
+    assert result["message"] == "MT5 close rejected."
