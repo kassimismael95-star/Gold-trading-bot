@@ -1,4 +1,7 @@
-app.py
-render.yaml
-.env.example
-.gitignore
+Flask
+flask-cors
+gunicorn
+psycopg[binary]
+requests
+cryptography
+werkzeug
