@@ -1,7 +1,10 @@
-Flask
-flask-cors
-gunicorn
-psycopg[binary]
-requests
-cryptography
-werkzeug
+Flask==3.0.3
+Flask-Cors==4.0.1
+python-dotenv==1.0.1
+psycopg[binary]==3.2.3
+SQLAlchemy==2.0.36
+alembic==1.14.0
+cryptography==43.0.3
+requests==2.32.3
+gunicorn==23.0.0
+pytest==8.3.4
