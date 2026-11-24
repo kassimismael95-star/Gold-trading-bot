@@ -1,326 +1,252 @@
-from core.signal_engine import MicroMomentumTracker
-from core.risk_manager import (
-    calculate_video_dynamic_burst,
-    calculate_added_position_lot,
-    calculate_dynamic_tp_sl,
-    MAX_ALLOWED_SPREAD_PIPS
-)
-from execution.command_queue import create_command
-from execution.worker_registry import get_best_worker
-from execution.order_router import route_command_to_worker
-from accounts.account_registry import get_account
-from database.models import get_connection
+import time
+from dataclasses import dataclass, field
 
 
-def calculate_pip_value(
-    symbol,
-    volume
-):
-    if symbol == "XAUUSD":
-        return 0.10 * volume
-
-    return 0.10 * volume
+@dataclass
+class BotRuntimeState:
+    last_batch_entry_price: float = 0.0
+    last_batch_close_time: float = 0.0
+    last_batch_direction: str | None = None
 
 
-def calculate_current_spread_pips(
-    bid,
-    ask
-):
-    return abs(ask - bid) / 0.01
+@dataclass
+class MarketState:
+    bid: float
+    ask: float
+    spread_pips: float
+    free_margin: float
+    balance: float
+    equity: float
+    open_positions: list[dict] = field(default_factory=list)
 
 
-def get_open_positions_for_session(
-    bot_session_id
-):
-    connection = get_connection()
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        SELECT *
-        FROM trade_history
-        WHERE bot_session_id = %s
-        AND status = 'OPEN'
-        ORDER BY created_at ASC
-    """, (bot_session_id,))
-
-    positions = cursor.fetchall()
-
-    cursor.close()
-    connection.close()
-
-    return positions
+@dataclass
+class ExecutionPlan:
+    action: str
+    direction: str | None = None
+    volume: float = 0.0
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    position_number: int = 0
+    reason: str = ""
 
 
-def calculate_basket_profit(
-    open_positions
-):
-    total_profit = 0.0
+class BotManager:
+    """
+    Exact original Gold Scalper balanced multi-position engine.
 
-    for position in open_positions:
-        total_profit += position.get("profit", 0)
+    Preserves:
+    - First-entry behavior
+    - Add-position behavior
+    - Basket profit-target close
+    - 35% drawdown circuit breaker
+    - Original polling and burst delays
+    """
 
-    return total_profit
+    POLL_LATENCY_DELAY = 0.05
+    BURST_SPACING_DELAY = 0.08
+    MULTI_SCALP_COOLDOWN_SECONDS = 3
 
+    def __init__(self, risk_manager, signal_tracker):
+        self.risk_manager = risk_manager
+        self.signal_tracker = signal_tracker
+        self.state = BotRuntimeState()
 
-def should_add_position(
-    open_positions,
-    max_positions,
-    direction,
-    current_direction,
-    current_price,
-    last_entry_price
-):
-    if len(open_positions) >= max_positions:
-        return False
+    def reset_batch(self) -> None:
+        self.state.last_batch_entry_price = 0.0
+        self.state.last_batch_close_time = time.time()
+        self.state.last_batch_direction = None
 
-    if current_direction != direction:
-        return False
+    def can_start_new_batch(self) -> bool:
+        seconds_since_close = time.time() - self.state.last_batch_close_time
 
-    if not last_entry_price:
-        return False
+        return seconds_since_close >= self.MULTI_SCALP_COOLDOWN_SECONDS
 
-    price_change = current_price - last_entry_price
+    def decide(
+        self,
+        market: MarketState,
+        direction: str,
+        confidence: int,
+        recent_price_movement: float,
+    ) -> ExecutionPlan:
+        basket_positions = [
+            position
+            for position in market.open_positions
+            if position.get("symbol") == market.symbol
+        ]
 
-    if direction == "BUY":
-        return price_change <= -0.20
+        open_position_count = len(basket_positions)
 
-    if direction == "SELL":
-        return price_change >= 0.20
+        basket_profit = 0.0
 
-    return False
+        for position in basket_positions:
+            basket_profit += float(position.get("profit", 0) or 0)
 
+        basket_profit = round(basket_profit, 2)
 
-def should_close_basket(
-    open_positions,
-    basket_target
-):
-    if not open_positions:
-        return False
+        net_floating_profit = market.equity - market.balance
 
-    basket_profit = calculate_basket_profit(
-        open_positions
-    )
+        if open_position_count > 0:
+            if self.risk_manager.should_close_basket_by_profit(
+                basket_profit,
+                market.equity,
+                market.balance,
+                confidence,
+            ):
+                return ExecutionPlan(
+                    action="CLOSE_BASKET",
+                    reason=(
+                        f"Basket profit target reached: "
+                        f"+{basket_profit:.2f} USD."
+                    ),
+                )
 
-    return basket_profit >= basket_target
+            if self.risk_manager.should_trigger_drawdown_circuit_breaker(
+                market.balance,
+                net_floating_profit,
+            ):
+                return ExecutionPlan(
+                    action="CLOSE_BASKET",
+                    reason=(
+                        f"35% drawdown circuit breaker reached: "
+                        f"-{abs(net_floating_profit):.2f} USD."
+                    ),
+                )
 
+            if self.risk_manager.can_add_position(
+                basket_profit=basket_profit,
+                price_progress=self.calculate_price_progress(market),
+                current_spread_pips=market.spread_pips,
+                free_margin=market.free_margin,
+                open_position_count=open_position_count,
+                equity=market.equity,
+                balance=market.balance,
+                confidence_score=confidence,
+            ):
+                basket_plan = self.risk_manager.calculate_video_dynamic_burst(
+                    market.equity,
+                    market.balance,
+                    confidence,
+                )
 
-def create_trade_command(
-    user_id,
-    account_id,
-    bot_session_id,
-    command_type,
-    symbol,
-    direction,
-    volume,
-    stop_loss,
-    take_profit
-):
-    return create_command(
-        user_id=user_id,
-        account_id=account_id,
-        bot_session_id=bot_session_id,
-        command_type=command_type,
-        symbol=symbol,
-        direction=direction,
-        volume=volume,
-        stop_loss=stop_loss,
-        take_profit=take_profit
-    )
+                added_lot = self.risk_manager.calculate_added_position_lot(
+                    market.equity,
+                    market.balance,
+                    confidence,
+                    open_position_count + 1,
+                )
 
+                entry_price = (
+                    market.ask
+                    if self.state.last_batch_direction == "BUY"
+                    else market.bid
+                )
 
-def send_trade_command(
-    user_id,
-    account_id,
-    bot_session_id,
-    command_type,
-    symbol,
-    direction,
-    volume,
-    stop_loss,
-    take_profit
-):
-    account = get_account(
-        user_id,
-        account_id
-    )
+                risk_plan = self.risk_manager.calculate_dynamic_tp_sl(
+                    direction=self.state.last_batch_direction,
+                    entry_price=entry_price,
+                    current_spread_pips=market.spread_pips,
+                    confidence_score=confidence,
+                    position_number=open_position_count + 1,
+                    recent_price_movement=recent_price_movement,
+                )
 
-    if not account:
-        raise ValueError("MT5 account not found.")
+                return ExecutionPlan(
+                    action="OPEN_POSITION",
+                    direction=self.state.last_batch_direction,
+                    volume=added_lot,
+                    stop_loss=risk_plan.stop_loss,
+                    take_profit=risk_plan.take_profit,
+                    position_number=open_position_count + 1,
+                    reason=(
+                        f"Adding balanced position #{open_position_count + 1}; "
+                        f"basket profit +{basket_profit:.2f} USD; "
+                        f"max positions {basket_plan.max_positions}."
+                    ),
+                )
 
-    worker = get_best_worker()
-
-    if not worker:
-        raise ValueError("No online worker available.")
-
-    command = create_trade_command(
-        user_id,
-        account_id,
-        bot_session_id,
-        command_type,
-        symbol,
-        direction,
-        volume,
-        stop_loss,
-        take_profit
-    )
-
-    command_id = command["id"]
-
-    route_command_to_worker(
-        worker["worker_id"],
-        command_id,
-        user_id,
-        account_id,
-        bot_session_id,
-        command_type,
-        symbol,
-        direction,
-        volume,
-        stop_loss,
-        take_profit
-    )
-
-    return command
-
-
-def process_bot_tick(
-    user_id,
-    account_id,
-    bot_session_id,
-    symbol,
-    current_price,
-    bid,
-    ask,
-    equity,
-    balance
-):
-    tracker = MicroMomentumTracker()
-
-    tracker.record_tick(current_price)
-
-    direction, confidence_score = tracker.evaluate()
-
-    spread_pips = calculate_current_spread_pips(
-        bid,
-        ask
-    )
-
-    if spread_pips > MAX_ALLOWED_SPREAD_PIPS:
-        return {
-            "action": "WAIT",
-            "reason": "SPREAD_TOO_HIGH",
-            "spread_pips": spread_pips
-        }
-
-    open_positions = get_open_positions_for_session(
-        bot_session_id
-    )
-
-    first_lot, max_positions, basket_target = (
-        calculate_video_dynamic_burst(
-            equity,
-            balance,
-            confidence_score
-        )
-    )
-
-    if should_close_basket(
-        open_positions,
-        basket_target
-    ):
-        return {
-            "action": "CLOSE_BASKET",
-            "basket_profit": calculate_basket_profit(
-                open_positions
+            return ExecutionPlan(
+                action="HOLD",
+                reason=(
+                    "Existing basket is active; waiting for basket profit, "
+                    "price progress, spread, margin, or position-limit conditions."
+                ),
             )
-        }
 
-    if not open_positions:
-        if abs(confidence_score) < 6:
-            return {
-                "action": "WAIT",
-                "reason": "LOW_CONFIDENCE"
-            }
+        if not self.can_start_new_batch():
+            return ExecutionPlan(
+                action="HOLD",
+                reason="Multi-scalp cooldown is still active.",
+            )
 
-        tp_sl = calculate_dynamic_tp_sl(
-            direction,
-            current_price,
-            spread_pips,
-            confidence_score,
-            1,
-            tracker.recent_movement()
+        if market.spread_pips > self.risk_manager.MAX_ALLOWED_SPREAD_PIPS:
+            return ExecutionPlan(
+                action="HOLD",
+                reason=(
+                    f"Spread {market.spread_pips:.2f} pips exceeds "
+                    f"{self.risk_manager.MAX_ALLOWED_SPREAD_PIPS:.2f} pips."
+                ),
+            )
+
+        if direction not in ["BUY", "SELL"]:
+            return ExecutionPlan(
+                action="HOLD",
+                reason="Momentum direction is not actionable.",
+            )
+
+        basket_plan = self.risk_manager.calculate_video_dynamic_burst(
+            market.equity,
+            market.balance,
+            confidence,
         )
 
-        command = send_trade_command(
-            user_id,
-            account_id,
-            bot_session_id,
-            "OPEN_POSITION",
-            symbol,
-            direction,
-            first_lot,
-            tp_sl["stop_loss"],
-            tp_sl["take_profit"]
+        entry_price = (
+            market.ask if direction == "BUY" else market.bid
         )
 
-        return {
-            "action": "OPEN_FIRST_POSITION",
-            "command_id": command["id"],
-            "direction": direction,
-            "lot": first_lot,
-            "stop_loss": tp_sl["stop_loss"],
-            "take_profit": tp_sl["take_profit"]
-        }
-
-    last_position = open_positions[-1]
-
-    if should_add_position(
-        open_positions,
-        max_positions,
-        last_position["direction"],
-        direction,
-        current_price,
-        last_position["entry_price"]
-    ):
-        added_lot = calculate_added_position_lot(
-            equity,
-            balance,
-            confidence_score,
-            len(open_positions) + 1
+        risk_plan = self.risk_manager.calculate_dynamic_tp_sl(
+            direction=direction,
+            entry_price=entry_price,
+            current_spread_pips=market.spread_pips,
+            confidence_score=confidence,
+            position_number=1,
+            recent_price_movement=recent_price_movement,
         )
 
-        tp_sl = calculate_dynamic_tp_sl(
-            direction,
-            current_price,
-            spread_pips,
-            confidence_score,
-            len(open_positions) + 1,
-            tracker.recent_movement()
+        return ExecutionPlan(
+            action="OPEN_POSITION",
+            direction=direction,
+            volume=basket_plan.first_lot,
+            stop_loss=risk_plan.stop_loss,
+            take_profit=risk_plan.take_profit,
+            position_number=1,
+            reason=(
+                f"First balanced entry; confidence {confidence}; "
+                f"lot {basket_plan.first_lot}; "
+                f"max positions {basket_plan.max_positions}; "
+                f"basket target {basket_plan.basket_profit_target:.2f} USD."
+            ),
         )
 
-        command = send_trade_command(
-            user_id,
-            account_id,
-            bot_session_id,
-            "OPEN_POSITION",
-            symbol,
-            direction,
-            added_lot,
-            tp_sl["stop_loss"],
-            tp_sl["take_profit"]
-        )
+    def calculate_price_progress(self, market: MarketState) -> float:
+        current_price = (market.ask + market.bid) / 2.0
 
-        return {
-            "action": "OPEN_ADDED_POSITION",
-            "command_id": command["id"],
-            "position_number": len(open_positions) + 1,
-            "direction": direction,
-            "lot": added_lot,
-            "stop_loss": tp_sl["stop_loss"],
-            "take_profit": tp_sl["take_profit"]
-        }
+        if self.state.last_batch_direction == "BUY":
+            return current_price - self.state.last_batch_entry_price
 
-    return {
-        "action": "WAIT",
-        "reason": "NO_ADDITIONAL_ENTRY"
-    }
+        if self.state.last_batch_direction == "SELL":
+            return self.state.last_batch_entry_price - current_price
+
+        return 0.0
+
+    def register_first_entry(self, direction: str, market: MarketState) -> None:
+        current_price = (market.ask + market.bid) / 2.0
+
+        self.state.last_batch_entry_price = current_price
+        self.state.last_batch_direction = direction
+        self.state.last_batch_close_time = time.time()
+
+    def register_added_entry(self, market: MarketState) -> None:
+        current_price = (market.ask + market.bid) / 2.0
+
+        self.state.last_batch_entry_price = current_price
