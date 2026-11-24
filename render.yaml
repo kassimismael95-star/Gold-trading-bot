@@ -1,26 +1,35 @@
 services:
   - type: web
-    name: bossmode-control-plane
+    name: gold-scalper-control-plane
     runtime: python
-    plan: starter
+    plan: free
     region: oregon
-    buildCommand: pip install -r requirements.txt
-    startCommand: ./start.sh
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "bash start.sh"
     healthCheckPath: /health
+    autoDeploy: true
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: SECRET_KEY
-        sync: false
-      - key: WORKER_SHARED_SECRET
-        sync: false
+      - key: FLASK_ENV
+        value: production
       - key: ALLOWED_ORIGINS
         sync: false
-      - key: ALLOWED_LICENSES
-        sync: false
-      - key: WORKER_API_URL
-        sync: false
+      - key: SECRET_KEY
+        generateValue: true
       - key: DATABASE_URL
-        fromDatabase:
-          name: bossmode-postgres
-          property: connectionString
+        sync: false
+      - key: ALLOWED_LICENSES
+        value: BOSSMODE99,BOSSMODE98,BOSSMODE30D,BOSSMODE01D
+      - key: WORKER_SHARED_SECRET
+        generateValue: true
+      - key: ENABLE_LIVE_TRADING
+        value: "false"
+      - key: MT5_EXECUTION_MODE
+        value: demo
+      - key: ORACLE_EXECUTION_ENABLED
+        value: "false"
+      - key: WEB_CONCURRENCY
+        value: "2"
+      - key: WEB_THREADS
+        value: "4"
