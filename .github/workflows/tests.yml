@@ -1,4 +1,4 @@
-name: Run tests
+name: Gold Scalper Tests
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -26,9 +26,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run tests
+      - name: Run Gold Scalper tests
         env:
-          SECRET_KEY: test-secret-key
-          WORKER_SHARED_SECRET: test-worker-secret
+          SECRET_KEY: test-secret-key-for-ci-only
+          WORKER_SHARED_SECRET: test-worker-secret-for-ci-only
+          WORKER_API_URL: https://worker.example.com
+          ENABLE_LIVE_TRADING: "false"
         run: |
-          python -m unittest discover tests
+          pytest -v
