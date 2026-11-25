@@ -1,0 +1,6 @@
+{
+  "BOSSMODE98": {"type":"vip_lifetime","admin_assignment_required":true},
+  "BOSSMODE99": {"type":"vip_lifetime","admin_assignment_required":true},
+  "BOSSMODE01D": {"type":"first_trial","duration_hours":24,"cooldown_hours":96,"second_trial_requires_admin":true},
+  "BOSSMODE30D": {"type":"paid_entitlement","payment_verification_required":true}
+}

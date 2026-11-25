@@ -1,0 +1,27 @@
+{
+  "currency": "USD",
+  "drawdown_emergency_percent": 35,
+  "tiers": [
+    {"equity_below":4,"base_lot":0.01,"max_positions":2,"basket_target":0.35},
+    {"equity_below":10,"base_lot":0.01,"max_positions":3,"basket_target":0.50},
+    {"equity_below":25,"base_lot":0.02,"max_positions":5,"basket_target":1},
+    {"equity_below":50,"base_lot":0.03,"max_positions":7,"basket_target":2},
+    {"equity_below":100,"base_lot":0.04,"max_positions":9,"basket_target":4},
+    {"equity_below":250,"base_lot":0.06,"max_positions":12,"basket_target":8},
+    {"equity_below":500,"base_lot":0.10,"max_positions":14,"basket_target":15},
+    {"equity_below":1000,"base_lot":0.20,"max_positions":16,"basket_target":30},
+    {"equity_below":2000,"base_lot":0.35,"max_positions":18,"basket_target":60},
+    {"equity_below":5000,"base_lot":0.60,"max_positions":18,"basket_target":120},
+    {"equity_below":10000,"base_lot":1.00,"max_positions":18,"basket_target":250},
+    {"equity_below":25000,"base_lot":2.00,"max_positions":18,"basket_target":600},
+    {"equity_below":null,"base_lot":4.00,"max_positions":18,"basket_target":1500}
+  ],
+  "position_lot_increment": 0.01,
+  "base_sl_usd": 2.00,
+  "base_tp_usd": 2.20,
+  "sl_min_usd": 1.50,
+  "sl_max_usd": 3.00,
+  "tp_min_usd": 1.80,
+  "tp_max_usd": 3.50,
+  "tp_must_not_be_below_sl": true
+}

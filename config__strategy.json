@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "symbol_candidates": ["XAUUSD", "XAUUSDm", "XAUUSDc", "XAUUSDr", "GOLD"],
+  "minimum_observations": 5,
+  "momentum_short_ticks": 3,
+  "momentum_window": 20,
+  "confidence_minimum": 4,
+  "require_trend_confirmation": true,
+  "entry_cost_reward_ratio_max": 0.30,
+  "fixed_spread_pip_limit": null,
+  "scan_on_every_tick": true,
+  "manage_positions_while_entries_paused": true
+}

@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: gold-trading-bot-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    healthCheckPath: /api/health/live
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_SECRET_KEY
+        sync: false
+      - key: JWT_SECRET_KEY
+        sync: false
+      - key: FLW_SECRET_KEY
+        sync: false
+      - key: FLW_WEBHOOK_HASH
+        sync: false
+      - key: CREDENTIAL_ENCRYPTION_KEY
+        sync: false

@@ -1,0 +1,5 @@
+{
+  "PLAN_15D":{"amount":25,"currency":"USD","duration_days":15},
+  "PLAN_33D":{"amount":50,"currency":"USD","duration_days":33},
+  "PLAN_70D":{"amount":100,"currency":"USD","duration_days":70}
+}
