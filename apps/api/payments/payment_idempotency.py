@@ -1,5 +1,5 @@
 
-"""Database-backed idempotency helpers for payment webhooks."""
+"""Database-backed idempotency helpers for payment webhook processing."""
 
 from hashlib import sha256
 import json
@@ -11,8 +11,7 @@ from ..extensions import db
 
 
 def payload_digest(payload):
-    """Create a stable SHA-256 digest for a webhook payload."""
-
+    """Create a stable SHA-256 digest of a webhook payload."""
     serialized = json.dumps(
         payload,
         sort_keys=True,
@@ -25,21 +24,29 @@ def payload_digest(payload):
 
 
 def record_event(event_key, event_type, payload):
-    """Record a webhook once using its unique event key.
+    """
+    Store a webhook event once.
 
     Returns:
-        (event_row, created)
-        created is True only when this call created the database record.
-    """
+        (event_record, created)
 
+    `created` is True only when this call created the event.
+    Duplicate provider deliveries return the existing record.
+    """
     event_key = str(event_key or "").strip()
-    event_type = str(event_type or "unknown").strip()[:80]
+    event_type = str(event_type or "unknown").strip()
 
     if not event_key:
         raise ValueError("event_key_required")
 
     if len(event_key) > 160:
         raise ValueError("event_key_too_long")
+
+    if not event_type:
+        event_type = "unknown"
+
+    if len(event_type) > 80:
+        event_type = event_type[:80]
 
     if not isinstance(payload, dict):
         raise ValueError("webhook_payload_must_be_object")
@@ -50,36 +57,33 @@ def record_event(event_key, event_type, payload):
         event_key=event_key
     ).first()
 
-    if existing is not None:
+    if existing:
         return existing, False
 
-    row = PaymentWebhookEvent(
+    event = PaymentWebhookEvent(
         event_key=event_key,
-        event_type=event_type or "unknown",
+        event_type=event_type,
         payload_hash=digest,
         processed=False,
     )
 
-    db.session.add(row)
+    db.session.add(event)
 
     try:
         db.session.commit()
-        return row, True
+        return event, True
 
     except IntegrityError:
-        # Another webhook request may have inserted the same key
-        # at nearly the same time. Roll back this transaction and
-        # retrieve the winning row.
+        # Another request may have inserted this event concurrently.
         db.session.rollback()
 
         existing = PaymentWebhookEvent.query.filter_by(
             event_key=event_key
         ).first()
 
-        if existing is not None:
+        if existing:
             return existing, False
 
-        # The integrity error was unrelated to a duplicate event.
         raise
 
     except Exception:
