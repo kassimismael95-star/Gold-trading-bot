@@ -2,27 +2,24 @@
 """
 Adaptive risk and position intelligence for Gold Scalper AI.
 
-This module is broker-independent. It produces risk and position-management
-decisions; the execution layer must validate broker constraints and apply
-SL/TP modifications.
+The RiskEngine evaluates entries and manages position protection.
+It does not use an independent fixed drawdown breaker.
 
-Important:
-- No fixed 35-pip spread ceiling.
-- Each account should use its own RiskEngine instance and settings.
-- Existing RiskEngine.allow_entry(...) interface is preserved.
-- Protective stops are never moved in the direction of greater risk.
+The intelligence layer remains responsible for trading decisions.
+Broker execution constraints can still reject an order or modification.
+
+Each account should have its own RiskEngine instance.
+
+Existing RiskEngine.allow_entry(...) interface is preserved.
+Protective stops are never moved in a greater-risk direction.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from math import isfinite
+from math import inf, isfinite
 from typing import Optional
-
-from .drawdown_monitor import breaker_triggered
-from .execution_cost import cost_ratio
-from .account_limits import can_open_new_position
 
 
 class PositionAction(str, Enum):
@@ -33,40 +30,14 @@ class PositionAction(str, Enum):
 
 @dataclass(frozen=True)
 class MarketState:
-    """
-    Normalized market intelligence supplied by the market-analysis layer.
-
-    momentum:
-        Signed score from -10 to +10.
-        Positive = bullish, negative = bearish.
-
-    reversal_strength:
-        0.0 to 1.0. Higher values mean stronger evidence of reversal
-        against the current position.
-
-    continuation_strength:
-        0.0 to 1.0. Higher values mean stronger evidence that the
-        current directional move is continuing.
-
-    expected_move_usd:
-        Estimated remaining favorable price movement, expressed in
-        account-currency profit for the position volume.
-
-    execution_cost_usd:
-        Estimated spread + commission + slippage for the position.
-
-    volatility_usd:
-        Current market movement estimate expressed in account currency.
-    """
-
     momentum: float
     reversal_strength: float
     continuation_strength: float
     expected_move_usd: float
     execution_cost_usd: float
-    volatility_usd: float = 0.0
+    volatility_usd: float
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         values = (
             self.momentum,
             self.reversal_strength,
@@ -75,60 +46,47 @@ class MarketState:
             self.execution_cost_usd,
             self.volatility_usd,
         )
+
         if not all(isfinite(float(value)) for value in values):
-            raise ValueError("market_state_values_must_be_finite")
+            raise ValueError("MarketState values must be finite.")
 
         if not -10.0 <= self.momentum <= 10.0:
-            raise ValueError("momentum_must_be_between_minus_10_and_10")
+            raise ValueError("momentum must be between -10 and 10.")
 
         if not 0.0 <= self.reversal_strength <= 1.0:
-            raise ValueError("reversal_strength_must_be_between_0_and_1")
+            raise ValueError("reversal_strength must be between 0 and 1.")
 
         if not 0.0 <= self.continuation_strength <= 1.0:
-            raise ValueError("continuation_strength_must_be_between_0_and_1")
+            raise ValueError("continuation_strength must be between 0 and 1.")
 
-        if self.expected_move_usd < 0:
-            raise ValueError("expected_move_usd_cannot_be_negative")
+        if self.expected_move_usd < 0.0:
+            raise ValueError("expected_move_usd cannot be negative.")
 
-        if self.execution_cost_usd < 0:
-            raise ValueError("execution_cost_usd_cannot_be_negative")
+        if self.execution_cost_usd < 0.0:
+            raise ValueError("execution_cost_usd cannot be negative.")
 
-        if self.volatility_usd < 0:
-            raise ValueError("volatility_usd_cannot_be_negative")
+        if self.volatility_usd < 0.0:
+            raise ValueError("volatility_usd cannot be negative.")
 
 
 @dataclass(frozen=True)
 class PositionState:
-    """
-    Live position data required for adaptive management.
-
-    usd_per_price_unit_per_lot must come from the broker's symbol
-    specification or a broker-calculated contract-value function.
-
-    Example:
-        If a 1.00 price-unit move on 1.00 lot is worth $100,
-        usd_per_price_unit_per_lot = 100.0.
-
-    Do not assume this value is identical across brokers or symbols.
-    """
-
-    position_id: str
+    position_id: int
     direction: str
     volume: float
     entry_price: float
     current_price: float
     profit_usd: float
     peak_profit_usd: float
-    current_sl_price: Optional[float]
-    current_tp_price: Optional[float]
+    stop_loss: Optional[float]
+    take_profit: Optional[float]
     usd_per_price_unit_per_lot: float
 
-    def __post_init__(self):
-        if self.direction.upper() not in {"BUY", "SELL"}:
-            raise ValueError("direction_must_be_BUY_or_SELL")
+    def __post_init__(self) -> None:
+        direction = str(self.direction).upper()
 
-        if not self.position_id:
-            raise ValueError("position_id_required")
+        if direction not in ("BUY", "SELL"):
+            raise ValueError("direction must be BUY or SELL.")
 
         numeric_values = (
             self.volume,
@@ -140,34 +98,42 @@ class PositionState:
         )
 
         if not all(isfinite(float(value)) for value in numeric_values):
-            raise ValueError("position_values_must_be_finite")
+            raise ValueError("PositionState values must be finite.")
 
-        if self.volume <= 0:
-            raise ValueError("volume_must_be_positive")
+        if self.stop_loss is not None and not isfinite(float(self.stop_loss)):
+            raise ValueError("stop_loss must be finite or None.")
 
-        if self.usd_per_price_unit_per_lot <= 0:
-            raise ValueError("broker_contract_value_must_be_positive")
+        if self.take_profit is not None and not isfinite(float(self.take_profit)):
+            raise ValueError("take_profit must be finite or None.")
+
+        if self.volume <= 0.0:
+            raise ValueError("volume must be greater than zero.")
+
+        if self.entry_price <= 0.0 or self.current_price <= 0.0:
+            raise ValueError("Prices must be greater than zero.")
+
+        if self.usd_per_price_unit_per_lot <= 0.0:
+            raise ValueError(
+                "usd_per_price_unit_per_lot must be greater than zero."
+            )
 
 
 @dataclass(frozen=True)
 class PositionDecision:
     action: PositionAction
     reason: str
-    desired_sl_price: Optional[float]
-    desired_tp_price: Optional[float]
+    desired_stop_loss: Optional[float]
+    desired_take_profit: Optional[float]
     lock_profit_usd: float
     estimated_remaining_reward_usd: float
 
 
 class RiskEngine:
     """
-    Account-specific adaptive risk policy.
+    Adaptive entry and position-management engine.
 
-    Create one instance per trading account. Do not share adaptive state
-    between different users or accounts.
-
-    The engine does not send orders itself. It returns decisions for the
-    execution layer to validate and apply.
+    drawdown_limit is retained for compatibility with existing callers.
+    It is intentionally not used as an independent trading breaker.
     """
 
     def __init__(
@@ -177,15 +143,15 @@ class RiskEngine:
         max_cost_ratio: float = 0.30,
         base_stop_loss_usd: float = 2.00,
         base_take_profit_usd: float = 2.20,
-        minimum_stop_loss_usd: float = 1.50,
-        maximum_stop_loss_usd: float = 3.00,
-        minimum_take_profit_usd: float = 1.80,
-        maximum_take_profit_usd: float = 3.50,
+        min_stop_loss_usd: float = 1.50,
+        max_stop_loss_usd: float = 3.00,
+        min_take_profit_usd: float = 1.80,
+        max_take_profit_usd: float = 3.50,
         reversal_close_strength: float = 0.85,
         profit_lock_start_usd: float = 0.50,
         profit_lock_fraction: float = 0.60,
         minimum_reward_cost_ratio: float = 1.0,
-    ):
+    ) -> None:
         self.drawdown_limit = float(drawdown_limit)
         self.max_positions = int(max_positions)
         self.max_cost_ratio = float(max_cost_ratio)
@@ -193,11 +159,11 @@ class RiskEngine:
         self.base_stop_loss_usd = float(base_stop_loss_usd)
         self.base_take_profit_usd = float(base_take_profit_usd)
 
-        self.minimum_stop_loss_usd = float(minimum_stop_loss_usd)
-        self.maximum_stop_loss_usd = float(maximum_stop_loss_usd)
+        self.min_stop_loss_usd = float(min_stop_loss_usd)
+        self.max_stop_loss_usd = float(max_stop_loss_usd)
 
-        self.minimum_take_profit_usd = float(minimum_take_profit_usd)
-        self.maximum_take_profit_usd = float(maximum_take_profit_usd)
+        self.min_take_profit_usd = float(min_take_profit_usd)
+        self.max_take_profit_usd = float(max_take_profit_usd)
 
         self.reversal_close_strength = float(reversal_close_strength)
         self.profit_lock_start_usd = float(profit_lock_start_usd)
@@ -206,127 +172,178 @@ class RiskEngine:
 
         self._validate_configuration()
 
-    def _validate_configuration(self):
-        if not 0 < self.drawdown_limit <= 100:
-            raise ValueError("drawdown_limit_must_be_between_0_and_100")
+    def _validate_configuration(self) -> None:
+        numeric_settings = (
+            self.drawdown_limit,
+            self.max_cost_ratio,
+            self.base_stop_loss_usd,
+            self.base_take_profit_usd,
+            self.min_stop_loss_usd,
+            self.max_stop_loss_usd,
+            self.min_take_profit_usd,
+            self.max_take_profit_usd,
+            self.reversal_close_strength,
+            self.profit_lock_start_usd,
+            self.profit_lock_fraction,
+            self.minimum_reward_cost_ratio,
+        )
+
+        if not all(isfinite(value) for value in numeric_settings):
+            raise ValueError("RiskEngine configuration must be finite.")
 
         if self.max_positions < 1:
-            raise ValueError("max_positions_must_be_at_least_1")
+            raise ValueError("max_positions must be at least 1.")
 
-        if not 0 < self.max_cost_ratio <= 1:
-            raise ValueError("max_cost_ratio_must_be_between_0_and_1")
+        if self.max_cost_ratio < 0.0:
+            raise ValueError("max_cost_ratio cannot be negative.")
 
-        if self.base_stop_loss_usd <= 0:
-            raise ValueError("base_stop_loss_must_be_positive")
+        if self.min_stop_loss_usd <= 0.0:
+            raise ValueError("min_stop_loss_usd must be positive.")
 
-        if self.base_take_profit_usd <= 0:
-            raise ValueError("base_take_profit_must_be_positive")
+        if self.max_stop_loss_usd < self.min_stop_loss_usd:
+            raise ValueError("Invalid stop-loss range.")
 
-        if self.minimum_stop_loss_usd <= 0:
-            raise ValueError("minimum_stop_loss_must_be_positive")
+        if self.min_take_profit_usd <= 0.0:
+            raise ValueError("min_take_profit_usd must be positive.")
 
-        if self.maximum_stop_loss_usd < self.minimum_stop_loss_usd:
-            raise ValueError("maximum_stop_loss_below_minimum")
+        if self.max_take_profit_usd < self.min_take_profit_usd:
+            raise ValueError("Invalid take-profit range.")
 
-        if self.minimum_take_profit_usd <= 0:
-            raise ValueError("minimum_take_profit_must_be_positive")
+        if not 0.0 <= self.reversal_close_strength <= 1.0:
+            raise ValueError(
+                "reversal_close_strength must be between 0 and 1."
+            )
 
-        if self.maximum_take_profit_usd < self.minimum_take_profit_usd:
-            raise ValueError("maximum_take_profit_below_minimum")
+        if self.profit_lock_start_usd < 0.0:
+            raise ValueError("profit_lock_start_usd cannot be negative.")
 
-        if not 0 < self.reversal_close_strength <= 1:
-            raise ValueError("invalid_reversal_close_strength")
+        if not 0.0 <= self.profit_lock_fraction <= 1.0:
+            raise ValueError(
+                "profit_lock_fraction must be between 0 and 1."
+            )
 
-        if not 0 < self.profit_lock_fraction <= 1:
-            raise ValueError("profit_lock_fraction_must_be_between_0_and_1")
+        if self.minimum_reward_cost_ratio < 0.0:
+            raise ValueError(
+                "minimum_reward_cost_ratio cannot be negative."
+            )
 
-        if self.profit_lock_start_usd < 0:
-            raise ValueError("profit_lock_start_cannot_be_negative")
+    @staticmethod
+    def _cost_ratio(
+        spread: float,
+        commission: float,
+        expected_move: float,
+    ) -> float:
+        """
+        Return estimated execution cost divided by expected movement.
 
-    # ------------------------------------------------------------------
-    # Existing entry-risk interface
-    # ------------------------------------------------------------------
+        Costs are treated as non-negative monetary values.
+        """
+        if expected_move <= 0.0:
+            return inf
+
+        total_cost = max(0.0, float(spread)) + max(
+            0.0, float(commission)
+        )
+
+        return total_cost / float(expected_move)
 
     def allow_entry(
         self,
-        initial_equity,
-        equity,
-        open_count,
-        free_margin,
-        required_margin,
-        spread,
-        commission,
-        expected_move,
-    ):
+        initial_equity: float,
+        equity: float,
+        open_count: int,
+        free_margin: float,
+        required_margin: float,
+        spread: float,
+        commission: float,
+        expected_move: float,
+    ) -> bool:
         """
-        Compatibility interface used by the existing trading layer.
+        Evaluate whether a new entry is acceptable.
 
-        `spread` and `commission` must use the same monetary units as
-        `expected_move`. No fixed spread-pip ceiling is applied.
+        initial_equity and equity are retained in the interface for
+        compatibility and intelligence-layer drawdown analysis.
+
+        This method does not independently trigger a 35% drawdown
+        breaker or force-close positions.
         """
-        if expected_move <= 0:
-            return False
-
-        if required_margin < 0 or free_margin < 0:
-            return False
-
-        if breaker_triggered(
+        values = (
             initial_equity,
-            equity,
-            self.drawdown_limit,
-        ):
-            return False
-
-        if not can_open_new_position(
-            open_count,
-            self.max_positions,
             equity,
             free_margin,
             required_margin,
-        ):
-            return False
-
-        return cost_ratio(
             spread,
             commission,
             expected_move,
-        ) <= self.max_cost_ratio
+        )
 
-    # ------------------------------------------------------------------
-    # Adaptive per-position management
-    # ------------------------------------------------------------------
+        if not all(isfinite(float(value)) for value in values):
+            return False
+
+        if int(open_count) < 0:
+            return False
+
+        if expected_move <= 0.0:
+            return False
+
+        if required_margin < 0.0 or free_margin < 0.0:
+            return False
+
+        # Internal entry capacity check.
+        if int(open_count) >= self.max_positions:
+            return False
+
+        # Required margin must be available before sending the order.
+        if required_margin > free_margin:
+            return False
+
+        # Adaptive cost check: no fixed spread-in-pips ceiling.
+        ratio = self._cost_ratio(
+            spread=spread,
+            commission=commission,
+            expected_move=expected_move,
+        )
+
+        if ratio > self.max_cost_ratio:
+            return False
+
+        return True
 
     @staticmethod
     def _money_to_price_distance(
-        money,
-        volume,
-        usd_per_price_unit_per_lot,
-    ):
-        """
-        Convert account-currency money into a price distance using the
-        broker-provided contract value.
-        """
-        denominator = volume * usd_per_price_unit_per_lot
+        money: float,
+        volume: float,
+        contract_value: float,
+    ) -> float:
+        denominator = volume * contract_value
 
-        if denominator <= 0:
-            raise ValueError("invalid_contract_value")
+        if denominator <= 0.0:
+            raise ValueError("Invalid volume or contract value.")
 
-        return max(0.0, float(money)) / denominator
+        return max(0.0, money) / denominator
 
     @staticmethod
-    def _directional_price(entry_price, direction, distance):
+    def _directional_price(
+        entry_price: float,
+        direction: str,
+        distance: float,
+    ) -> float:
+        direction = direction.upper()
+
         if direction == "BUY":
             return entry_price + distance
-        return entry_price - distance
+
+        if direction == "SELL":
+            return entry_price - distance
+
+        raise ValueError("direction must be BUY or SELL.")
 
     @staticmethod
-    def _stop_is_more_protective(direction, candidate, current):
-        """
-        True only when candidate tightens the stop.
-
-        BUY stop: higher is more protective.
-        SELL stop: lower is more protective.
-        """
+    def _stop_is_more_protective(
+        direction: str,
+        candidate: float,
+        current: Optional[float],
+    ) -> bool:
         if current is None:
             return True
 
@@ -336,10 +353,11 @@ class RiskEngine:
         return candidate < current
 
     @staticmethod
-    def _tp_is_farther_in_profit(direction, candidate, current):
-        """
-        True only when candidate extends TP in the profitable direction.
-        """
+    def _tp_is_farther_in_profit(
+        direction: str,
+        candidate: float,
+        current: Optional[float],
+    ) -> bool:
         if current is None:
             return True
 
@@ -347,6 +365,10 @@ class RiskEngine:
             return candidate > current
 
         return candidate < current
+
+    @staticmethod
+    def _clamp(value: float, minimum: float, maximum: float) -> float:
+        return max(minimum, min(maximum, value))
 
     def manage_position(
         self,
@@ -354,15 +376,11 @@ class RiskEngine:
         market: MarketState,
     ) -> PositionDecision:
         """
-        Generate an adaptive decision for one open position.
+        Evaluate a position and return an intelligence decision.
 
-        The caller should run this for every position on each relevant
-        market update, then submit modifications through the broker
-        execution layer.
-
-        Stops are monotonic: this function never loosens an existing SL.
+        The caller is responsible for submitting the returned action
+        to the broker and checking whether the broker accepted it.
         """
-
         direction = position.direction.upper()
 
         signed_momentum = (
@@ -371,60 +389,52 @@ class RiskEngine:
             else -market.momentum
         )
 
-        # Reversal evidence is interpreted relative to the position.
-        reversal_against_position = (
-            market.reversal_strength
-            if signed_momentum >= 0
-            else min(1.0, market.reversal_strength + 0.15)
+        momentum_alignment = self._clamp(
+            signed_momentum / 10.0,
+            0.0,
+            1.0,
         )
 
-        # Strong validated continuation can extend the target.
-        continuation = market.continuation_strength
-        momentum_alignment = max(0.0, min(1.0, signed_momentum / 10.0))
-        continuation_score = continuation * momentum_alignment
+        continuation_score = (
+            market.continuation_strength * momentum_alignment
+        )
 
-        # Do not extend a target when expected reward cannot reasonably
-        # cover the current estimated execution cost.
+        reversal_against_position = market.reversal_strength
+
         reward_cost_ratio = (
             market.expected_move_usd / market.execution_cost_usd
-            if market.execution_cost_usd > 0
-            else float("inf")
+            if market.execution_cost_usd > 0.0
+            else inf
         )
 
-        # Strong reversal: exit rather than waiting for the original TP.
+        # Close only when the intelligence detects a strong opposing
+        # reversal and the position currently has positive profit.
         if (
-            reversal_against_position >= self.reversal_close_strength
-            and position.profit_usd > 0
+            reversal_against_position
+            >= self.reversal_close_strength
+            and position.profit_usd > 0.0
         ):
             return PositionDecision(
                 action=PositionAction.CLOSE,
-                reason="strong_reversal_protect_profit",
-                desired_sl_price=position.current_sl_price,
-                desired_tp_price=position.current_tp_price,
-                lock_profit_usd=max(0.0, position.profit_usd),
+                reason="Strong opposing reversal while position is profitable.",
+                desired_stop_loss=position.stop_loss,
+                desired_take_profit=position.take_profit,
+                lock_profit_usd=position.profit_usd,
                 estimated_remaining_reward_usd=0.0,
             )
 
-        # Calculate a baseline monetary SL and TP using the original
-        # target ranges. This preserves the original style of small,
-        # fast gold scalping targets.
-        stop_money = max(
-            self.minimum_stop_loss_usd,
-            min(
-                self.maximum_stop_loss_usd,
-                self.base_stop_loss_usd,
-            ),
+        stop_money = self._clamp(
+            self.base_stop_loss_usd,
+            self.min_stop_loss_usd,
+            self.max_stop_loss_usd,
         )
 
-        target_money = max(
-            self.minimum_take_profit_usd,
-            min(
-                self.maximum_take_profit_usd,
-                self.base_take_profit_usd,
-            ),
+        target_money = self._clamp(
+            self.base_take_profit_usd,
+            self.min_take_profit_usd,
+            self.max_take_profit_usd,
         )
 
-        # Tighten risk when momentum weakens or reversal evidence grows.
         weakness = max(
             1.0 - continuation_score,
             reversal_against_position,
@@ -435,41 +445,50 @@ class RiskEngine:
         elif weakness >= 0.50:
             stop_money *= 0.80
 
-        stop_money = max(
-            self.minimum_stop_loss_usd,
-            min(self.maximum_stop_loss_usd, stop_money),
+        stop_money = self._clamp(
+            stop_money,
+            self.min_stop_loss_usd,
+            self.max_stop_loss_usd,
         )
 
-        # Extend TP only when direction, continuation and expected
-        # remaining reward support it.
+        # Extend the target only when continuation is strong and the
+        # expected movement justifies the execution cost.
         if (
             continuation_score >= 0.70
             and reward_cost_ratio >= self.minimum_reward_cost_ratio
             and market.expected_move_usd > target_money
         ):
-            extension = 1.0 + (continuation_score - 0.70) * 2.0
-            target_money = min(
-                self.maximum_take_profit_usd,
-                max(target_money, market.expected_move_usd * extension),
-            )
+            extension_factor = 1.0 + (
+                continuation_score - 0.70
+            ) * 2.0
 
-        # Convert target and stop distances into broker-price units.
+            target_money *= extension_factor
+
+        target_money = self._clamp(
+            target_money,
+            self.min_take_profit_usd,
+            self.max_take_profit_usd,
+        )
+
         stop_distance = self._money_to_price_distance(
-            stop_money,
-            position.volume,
-            position.usd_per_price_unit_per_lot,
+            money=stop_money,
+            volume=position.volume,
+            contract_value=position.usd_per_price_unit_per_lot,
         )
 
         target_distance = self._money_to_price_distance(
-            target_money,
-            position.volume,
-            position.usd_per_price_unit_per_lot,
+            money=target_money,
+            volume=position.volume,
+            contract_value=position.usd_per_price_unit_per_lot,
         )
 
+        # Correct stop-loss direction:
+        # BUY stop is below entry; SELL stop is above entry.
+        # Negative distance works correctly for both directions.
         candidate_sl = self._directional_price(
             position.entry_price,
             direction,
-            -stop_distance if direction == "BUY" else stop_distance,
+            -stop_distance,
         )
 
         candidate_tp = self._directional_price(
@@ -478,24 +497,21 @@ class RiskEngine:
             target_distance,
         )
 
-        # Lock part of peak profit after the position has earned enough.
-        lock_profit = 0.0
+        lock_profit_usd = 0.0
 
-        peak_profit = max(
-            position.peak_profit_usd,
-            position.profit_usd,
-        )
-
-        if peak_profit >= self.profit_lock_start_usd:
-            lock_profit = peak_profit * self.profit_lock_fraction
+        if position.profit_usd >= self.profit_lock_start_usd:
+            lock_profit_usd = max(
+                position.profit_usd,
+                position.peak_profit_usd,
+            ) * self.profit_lock_fraction
 
             lock_distance = self._money_to_price_distance(
-                lock_profit,
-                position.volume,
-                position.usd_per_price_unit_per_lot,
+                money=lock_profit_usd,
+                volume=position.volume,
+                contract_value=position.usd_per_price_unit_per_lot,
             )
 
-            locked_stop = self._directional_price(
+            lock_sl = self._directional_price(
                 position.entry_price,
                 direction,
                 lock_distance,
@@ -503,54 +519,55 @@ class RiskEngine:
 
             if self._stop_is_more_protective(
                 direction,
-                locked_stop,
+                lock_sl,
                 candidate_sl,
             ):
-                candidate_sl = locked_stop
+                candidate_sl = lock_sl
 
-        # Existing SL may only become more protective.
-        if not self._stop_is_more_protective(
-            direction,
-            candidate_sl,
-            position.current_sl_price,
-        ):
-            candidate_sl = position.current_sl_price
+        # Never move an existing protective stop in the greater-risk
+        # direction. Keep the more protective of the two values.
+        if position.stop_loss is not None:
+            if self._stop_is_more_protective(
+                direction,
+                position.stop_loss,
+                candidate_sl,
+            ):
+                candidate_sl = position.stop_loss
 
-        # Existing TP may be extended in the profitable direction,
-        # but this module does not pull it farther away when conditions
-        # weaken. The execution/exit layer may close earlier.
-        if not self._tp_is_farther_in_profit(
-            direction,
-            candidate_tp,
-            position.current_tp_price,
-        ):
-            candidate_tp = position.current_tp_price
+        # Never move an existing TP closer to the entry.
+        if position.take_profit is not None:
+            if self._tp_is_farther_in_profit(
+                direction,
+                position.take_profit,
+                candidate_tp,
+            ):
+                candidate_tp = position.take_profit
 
         sl_changed = (
-            position.current_sl_price is None
-            or candidate_sl != position.current_sl_price
+            position.stop_loss is None
+            or abs(candidate_sl - position.stop_loss) > 1e-9
         )
 
         tp_changed = (
-            position.current_tp_price is None
-            or candidate_tp != position.current_tp_price
+            position.take_profit is None
+            or abs(candidate_tp - position.take_profit) > 1e-9
         )
 
         if sl_changed or tp_changed:
-            return PositionDecision(
-                action=PositionAction.MODIFY_PROTECTION,
-                reason="adaptive_position_protection",
-                desired_sl_price=candidate_sl,
-                desired_tp_price=candidate_tp,
-                lock_profit_usd=lock_profit,
-                estimated_remaining_reward_usd=market.expected_move_usd,
+            action = PositionAction.MODIFY_PROTECTION
+            reason = (
+                "Adaptive protection updated from momentum, "
+                "continuation, reversal, and profit-lock analysis."
             )
+        else:
+            action = PositionAction.HOLD
+            reason = "Current protection remains appropriate."
 
         return PositionDecision(
-            action=PositionAction.HOLD,
-            reason="protection_already_current",
-            desired_sl_price=position.current_sl_price,
-            desired_tp_price=position.current_tp_price,
-            lock_profit_usd=lock_profit,
-            estimated_remaining_reward_usd=market.expected_move_usd,
+            action=action,
+            reason=reason,
+            desired_stop_loss=candidate_sl,
+            desired_take_profit=candidate_tp,
+            lock_profit_usd=lock_profit_usd,
+            estimated_remaining_reward_usd=target_money,
         )
