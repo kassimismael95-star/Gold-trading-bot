@@ -5,15 +5,8 @@ File: trading/account_manager.py
 
 Multi-account orchestration layer.
 
-Responsibilities:
-- Register and isolate MT5 account connections.
-- Connect/disconnect accounts.
-- Verify broker data before enabling trading.
-- Run optional reconciliation and trading callbacks.
-- Keep credentials out of status responses and logs.
-
-This module does NOT contain entry strategy, lot sizing, or trading rules.
-The original strategy engine must be injected through callbacks.
+This module coordinates account connections and the injected trading engine.
+It does not implement entry strategy, lot sizing, or trading rules.
 """
 
 from __future__ import annotations
@@ -23,13 +16,12 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Callable, Optional
 
 from trading.mt5_connector import MT5Connector
 
 
 logger = logging.getLogger(__name__)
-
 
 Callback = Callable[..., Any]
 
@@ -38,44 +30,36 @@ Callback = Callable[..., Any]
 class AccountRuntime:
     account_id: str
     symbol: str
-
     bridge_url: str
     api_key: str = field(repr=False)
-
     timeout: float = 10.0
 
     registered: bool = False
     connected: bool = False
-    trading_enabled: bool = False
     readiness_verified: bool = False
+    trading_enabled: bool = False
 
     last_check_time: Optional[float] = None
     last_error: Optional[str] = None
+    runtime_started_at: Optional[float] = None
 
     account_snapshot: Optional[dict[str, Any]] = None
     positions_snapshot: list[dict[str, Any]] = field(default_factory=list)
     price_snapshot: Optional[dict[str, Any]] = None
 
-    runtime_started_at: Optional[float] = None
-
-    # Internal lock prevents simultaneous start/stop/connect operations.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 class AccountManager:
     """
-    Coordinates account connections and trading lifecycle.
+    Coordinates MT5 account connections and engine lifecycle.
 
     Callback signatures:
         reconcile_callback(account_id, snapshot)
         start_callback(account_id, snapshot)
         stop_callback(account_id)
 
-    Callbacks may be synchronous or asynchronous.
-
-    Important:
-    This class does not create a trading loop by itself. The actual engine
-    must be supplied through start_callback.
+    Callbacks can be synchronous or asynchronous.
     """
 
     def __init__(
@@ -87,7 +71,6 @@ class AccountManager:
         stop_callback: Optional[Callback] = None,
     ) -> None:
         self.connector = connector or MT5Connector()
-
         self.reconcile_callback = reconcile_callback
         self.start_callback = start_callback
         self.stop_callback = stop_callback
@@ -95,11 +78,7 @@ class AccountManager:
         self._accounts: dict[str, AccountRuntime] = {}
         self._registry_lock = asyncio.Lock()
 
-    # ------------------------------------------------------------------
-    # Callback helper
-    # ------------------------------------------------------------------
-
-    async def _invoke_callback(
+    async def _invoke(
         self,
         callback: Optional[Callback],
         *args: Any,
@@ -108,15 +87,18 @@ class AccountManager:
             return None
 
         result = callback(*args)
-
         if inspect.isawaitable(result):
             return await result
 
         return result
 
-    # ------------------------------------------------------------------
-    # Account registration
-    # ------------------------------------------------------------------
+    def _get_runtime(self, account_id: str) -> AccountRuntime:
+        runtime = self._accounts.get(str(account_id))
+
+        if runtime is None:
+            raise KeyError(f"Account is not registered: {account_id}")
+
+        return runtime
 
     async def register_account(
         self,
@@ -127,34 +109,20 @@ class AccountManager:
         symbol: str = "XAUUSD",
         timeout: float = 10.0,
     ) -> dict[str, Any]:
-        """
-        Register one account with the MT5 connector.
-
-        The API key is kept in runtime memory and is never returned by
-        status methods.
-
-        Persistent credential storage should be handled by the project's
-        secure credential/database layer, not by this manager.
-        """
-
         account_id = str(account_id).strip()
         bridge_url = str(bridge_url).strip()
         symbol = str(symbol).strip()
 
         if not account_id:
             raise ValueError("account_id is required")
-
         if not bridge_url:
             raise ValueError("bridge_url is required")
-
         if not api_key:
             raise ValueError("api_key is required")
-
         if not symbol:
             raise ValueError("symbol is required")
-
         if timeout <= 0:
-            raise ValueError("timeout must be greater than zero")
+            raise ValueError("timeout must be positive")
 
         async with self._registry_lock:
             existing = self._accounts.get(account_id)
@@ -193,133 +161,111 @@ class AccountManager:
             "symbol": symbol,
         }
 
-    # ------------------------------------------------------------------
-    # Account lookup
-    # ------------------------------------------------------------------
-
-    def _get_runtime(self, account_id: str) -> AccountRuntime:
-        runtime = self._accounts.get(str(account_id))
-
-        if runtime is None:
-            raise KeyError(f"Account is not registered: {account_id}")
-
-        return runtime
-
-    # ------------------------------------------------------------------
-    # Connection and broker readiness
-    # ------------------------------------------------------------------
-
     async def connect_account(
         self,
         account_id: str,
         *,
         verify_price: bool = True,
     ) -> dict[str, Any]:
-        """
-        Connect to the account and verify broker snapshots.
-
-        The EA must be running and publishing account/position/price state
-        to the bridge before readiness can be confirmed.
-        """
-
         runtime = self._get_runtime(account_id)
 
         async with runtime.lock:
-            runtime.last_error = None
-            runtime.readiness_verified = False
+            return await self._connect_locked(runtime, verify_price)
 
-            try:
-                connection_result = await self.connector.connect_account(
-                    runtime.account_id
-                )
+    async def _connect_locked(
+        self,
+        runtime: AccountRuntime,
+        verify_price: bool,
+    ) -> dict[str, Any]:
+        """
+        Internal connection method.
+        Caller must already hold runtime.lock.
+        """
 
-                if isinstance(connection_result, dict):
-                    if connection_result.get("success") is False:
-                        raise RuntimeError(
-                            connection_result.get(
-                                "error",
-                                "Connector failed to connect",
-                            )
+        runtime.last_error = None
+        runtime.readiness_verified = False
+
+        try:
+            connection_result = await self.connector.connect_account(
+                runtime.account_id
+            )
+
+            if isinstance(connection_result, dict):
+                if connection_result.get("success") is False:
+                    raise RuntimeError(
+                        connection_result.get(
+                            "error",
+                            "Connector failed to connect",
                         )
-
-                client = self.connector.get_client(runtime.account_id)
-
-                if client is None:
-                    raise RuntimeError(
-                        "Connector did not provide an account client"
                     )
 
-                snapshot = await client.get_broker_snapshot(
-                    account_id=runtime.account_id,
-                    symbol=runtime.symbol,
-                )
+            client = self.connector.get_client(runtime.account_id)
 
-                if not isinstance(snapshot, dict):
-                    raise RuntimeError("Invalid broker snapshot")
+            if client is None:
+                raise RuntimeError("Account client is unavailable")
 
-                account_data = snapshot.get("account")
-                positions_data = snapshot.get("positions")
-                price_data = snapshot.get("price")
+            snapshot = await client.get_broker_snapshot(
+                account_id=runtime.account_id,
+                symbol=runtime.symbol,
+            )
 
-                if not isinstance(account_data, dict):
-                    raise RuntimeError(
-                        "Broker account snapshot is unavailable"
-                    )
+            if not isinstance(snapshot, dict):
+                raise RuntimeError("Invalid broker snapshot")
 
-                if not isinstance(positions_data, list):
-                    raise RuntimeError(
-                        "Broker positions snapshot is unavailable"
-                    )
+            account_data = snapshot.get("account")
+            positions_data = snapshot.get("positions")
+            price_data = snapshot.get("price")
 
-                if verify_price and not isinstance(price_data, dict):
-                    raise RuntimeError(
-                        "Broker price snapshot is unavailable"
-                    )
+            if not isinstance(account_data, dict):
+                raise RuntimeError("Broker account data unavailable")
 
-                runtime.account_snapshot = account_data
-                runtime.positions_snapshot = positions_data
-                runtime.price_snapshot = price_data
+            if not isinstance(positions_data, list):
+                raise RuntimeError("Broker positions data unavailable")
 
-                runtime.connected = True
-                runtime.readiness_verified = True
-                runtime.last_check_time = time.time()
+            if verify_price and not isinstance(price_data, dict):
+                raise RuntimeError("Broker price data unavailable")
 
-                return {
-                    "success": True,
-                    "account_id": runtime.account_id,
-                    "connected": True,
-                    "readiness_verified": True,
-                    "symbol": runtime.symbol,
-                    "positions_count": len(positions_data),
-                }
+            runtime.account_snapshot = account_data
+            runtime.positions_snapshot = positions_data
+            runtime.price_snapshot = price_data
 
-            except Exception as exc:
-                runtime.connected = False
-                runtime.readiness_verified = False
-                runtime.trading_enabled = False
-                runtime.last_error = str(exc)
+            runtime.connected = True
+            runtime.readiness_verified = True
+            runtime.last_check_time = time.time()
 
-                logger.warning(
-                    "Account connection/readiness failed for %s: %s",
-                    runtime.account_id,
-                    exc,
-                )
+            return {
+                "success": True,
+                "account_id": runtime.account_id,
+                "connected": True,
+                "readiness_verified": True,
+                "symbol": runtime.symbol,
+                "positions_count": len(positions_data),
+            }
 
-                return {
-                    "success": False,
-                    "account_id": runtime.account_id,
-                    "connected": False,
-                    "readiness_verified": False,
-                    "error": str(exc),
-                }
+        except Exception as exc:
+            runtime.connected = False
+            runtime.readiness_verified = False
+            runtime.trading_enabled = False
+            runtime.last_error = str(exc)
 
-    async def refresh_account(self, account_id: str) -> dict[str, Any]:
-        """
-        Refresh broker account, position, and price snapshots.
+            logger.warning(
+                "Account readiness failed for %s: %s",
+                runtime.account_id,
+                exc,
+            )
 
-        Does not change trading strategy or automatically close positions.
-        """
+            return {
+                "success": False,
+                "account_id": runtime.account_id,
+                "connected": False,
+                "readiness_verified": False,
+                "error": str(exc),
+            }
 
+    async def refresh_account(
+        self,
+        account_id: str,
+    ) -> dict[str, Any]:
         runtime = self._get_runtime(account_id)
 
         async with runtime.lock:
@@ -362,36 +308,29 @@ class AccountManager:
             except Exception as exc:
                 runtime.last_error = str(exc)
 
-                logger.warning(
-                    "Account refresh failed for %s: %s",
-                    runtime.account_id,
-                    exc,
-                )
-
                 return {
                     "success": False,
                     "account_id": runtime.account_id,
                     "error": str(exc),
                 }
 
-    # ------------------------------------------------------------------
-    # Start / stop trading
-    # ------------------------------------------------------------------
-
-    async def start_account(self, account_id: str) -> dict[str, Any]:
-        """
-        Start the injected trading engine for an account.
-
-        Required sequence:
-        1. Connect and verify broker state.
-        2. Reconcile broker positions with the engine.
-        3. Start the engine callback.
-        4. Mark trading enabled only after callback success.
-
-        No strategy is invented here.
-        """
-
+    async def start_account(
+        self,
+        account_id: str,
+    ) -> dict[str, Any]:
         runtime = self._get_runtime(account_id)
+
+        # Connect first, before acquiring the lifecycle lock.
+        # This prevents the previous nested-lock deadlock.
+        readiness = await self.connect_account(runtime.account_id)
+
+        if not readiness.get("success"):
+            return {
+                "success": False,
+                "account_id": runtime.account_id,
+                "trading_enabled": False,
+                "error": readiness.get("error", "Account not ready"),
+            }
 
         async with runtime.lock:
             if runtime.trading_enabled:
@@ -407,17 +346,7 @@ class AccountManager:
                     "success": False,
                     "account_id": runtime.account_id,
                     "trading_enabled": False,
-                    "error": "No trading engine start_callback is configured",
-                }
-
-            readiness = await self.connect_account(runtime.account_id)
-
-            if not readiness.get("success"):
-                return {
-                    "success": False,
-                    "account_id": runtime.account_id,
-                    "trading_enabled": False,
-                    "error": readiness.get("error", "Account not ready"),
+                    "error": "Trading engine start_callback is not configured",
                 }
 
             snapshot = {
@@ -428,30 +357,26 @@ class AccountManager:
             }
 
             try:
-                # Reconcile live broker positions before starting new entries.
-                await self._invoke_callback(
+                # Reconcile existing broker positions before starting entries.
+                await self._invoke(
                     self.reconcile_callback,
                     runtime.account_id,
                     snapshot,
                 )
 
-                start_result = await self._invoke_callback(
+                result = await self._invoke(
                     self.start_callback,
                     runtime.account_id,
                     snapshot,
                 )
 
-                if isinstance(start_result, dict):
-                    if start_result.get("success") is False:
-                        raise RuntimeError(
-                            start_result.get(
-                                "error",
-                                "Trading engine refused to start",
-                            )
-                        )
-
-                if start_result is False:
+                if result is False:
                     raise RuntimeError("Trading engine refused to start")
+
+                if isinstance(result, dict) and result.get("success") is False:
+                    raise RuntimeError(
+                        result.get("error", "Trading engine refused to start")
+                    )
 
                 runtime.trading_enabled = True
                 runtime.runtime_started_at = time.time()
@@ -469,7 +394,7 @@ class AccountManager:
                 runtime.last_error = str(exc)
 
                 logger.exception(
-                    "Could not start trading for account %s",
+                    "Trading start failed for account %s",
                     runtime.account_id,
                 )
 
@@ -480,19 +405,15 @@ class AccountManager:
                     "error": str(exc),
                 }
 
-    async def stop_account(self, account_id: str) -> dict[str, Any]:
-        """
-        Stop new engine activity for one account.
-
-        This does not automatically close broker positions. Existing
-        positions remain protected by their broker-side SL/TP.
-        """
-
+    async def stop_account(
+        self,
+        account_id: str,
+    ) -> dict[str, Any]:
         runtime = self._get_runtime(account_id)
 
         async with runtime.lock:
             try:
-                await self._invoke_callback(
+                await self._invoke(
                     self.stop_callback,
                     runtime.account_id,
                 )
@@ -510,21 +431,12 @@ class AccountManager:
             except Exception as exc:
                 runtime.last_error = str(exc)
 
-                logger.exception(
-                    "Could not stop trading for account %s",
-                    runtime.account_id,
-                )
-
                 return {
                     "success": False,
                     "account_id": runtime.account_id,
                     "trading_enabled": runtime.trading_enabled,
                     "error": str(exc),
                 }
-
-    # ------------------------------------------------------------------
-    # Disconnect / remove
-    # ------------------------------------------------------------------
 
     async def disconnect_account(
         self,
@@ -535,10 +447,10 @@ class AccountManager:
         runtime = self._get_runtime(account_id)
 
         if stop_trading and runtime.trading_enabled:
-            stop_result = await self.stop_account(account_id)
+            result = await self.stop_account(account_id)
 
-            if not stop_result.get("success"):
-                return stop_result
+            if not result.get("success"):
+                return result
 
         async with runtime.lock:
             try:
@@ -565,14 +477,17 @@ class AccountManager:
                     "error": str(exc),
                 }
 
-    async def remove_account(self, account_id: str) -> dict[str, Any]:
+    async def remove_account(
+        self,
+        account_id: str,
+    ) -> dict[str, Any]:
         runtime = self._get_runtime(account_id)
 
         if runtime.trading_enabled:
-            stop_result = await self.stop_account(account_id)
+            result = await self.stop_account(account_id)
 
-            if not stop_result.get("success"):
-                return stop_result
+            if not result.get("success"):
+                return result
 
         await self.disconnect_account(
             account_id,
@@ -590,11 +505,10 @@ class AccountManager:
             "removed": True,
         }
 
-    # ------------------------------------------------------------------
-    # Status
-    # ------------------------------------------------------------------
-
-    def get_account_status(self, account_id: str) -> dict[str, Any]:
+    def get_account_status(
+        self,
+        account_id: str,
+    ) -> dict[str, Any]:
         runtime = self._get_runtime(account_id)
 
         return {
@@ -617,15 +531,7 @@ class AccountManager:
         ]
 
     async def shutdown(self) -> None:
-        """
-        Gracefully stop account engines and disconnect accounts.
-
-        Does not close open broker positions.
-        """
-
-        account_ids = list(self._accounts.keys())
-
-        for account_id in account_ids:
+        for account_id in list(self._accounts.keys()):
             runtime = self._accounts.get(account_id)
 
             if runtime is None:
