@@ -11,8 +11,8 @@ public:
 
    void Init(string sym)
    {
-      // No fixed spread threshold or ATR rejection rule.
-      // The symbol is selected and validated by the main EA.
+      // No arbitrary spread ratio or confidence-based movement rule.
+      // The EA initializes and validates the broker symbol separately.
    }
 
    void Release()
@@ -23,7 +23,7 @@ public:
    {
       MqlTick tick;
 
-      // Reject only invalid market data or an invalid order direction.
+      // Validate that the broker has supplied a usable quote.
       if(!SymbolInfoTick(sym, tick))
          return false;
 
@@ -37,17 +37,15 @@ public:
          return false;
 
       /*
-         The original fixed spread/expected-move ratio has been removed.
+         Removed from the original:
+         - fixed spread-to-expected-move ratio
+         - invented ATR movement multipliers
+         - confidence-based spread rejection
 
-         This function does not reject a valid entry because of:
-         - a fixed spread-pip limit
-         - a fixed spread-to-ATR ratio
-         - an invented confidence multiplier
-         - an arbitrary spread percentage
-
-         Actual order volume, broker specifications, available margin,
-         and the strategy's own signal and risk logic are checked by
-         the existing EA before order submission.
+         This method does not impose an arbitrary spread ceiling.
+         Broker execution validity, your strategy, position sizing,
+         account risk, and broker margin requirements remain handled
+         by their existing modules.
       */
 
       return true;
