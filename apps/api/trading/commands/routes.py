@@ -15,9 +15,14 @@ bp = Blueprint("agent", __name__, url_prefix="/api/agent")
 @agent_required
 def next_command():
     data = request.get_json(silent=True) or {}
-    agent_id = str(data.get("agent_id", ""))
 
-    if agent_id != request.headers.get("X-Agent-ID", ""):
+    if not isinstance(data, dict):
+        return jsonify(error="invalid_request"), 400
+
+    agent_id = str(data.get("agent_id", "")).strip()
+    header_agent_id = request.headers.get("X-Agent-ID", "").strip()
+
+    if not agent_id or agent_id != header_agent_id:
         return jsonify(error="agent_identity_mismatch"), 403
 
     account_id = data.get("account_id")
@@ -28,8 +33,15 @@ def next_command():
         .filter(TradingAccount.agent_id == agent_id)
     )
 
-    if account_id:
-        query = query.filter(Command.account_id == int(account_id))
+    if account_id is not None:
+        try:
+            account_id = int(account_id)
+            if account_id <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            return jsonify(error="invalid_account_id"), 400
+
+        query = query.filter(Command.account_id == account_id)
 
     stale_before = datetime.now(timezone.utc) - timedelta(minutes=2)
 
@@ -38,12 +50,9 @@ def next_command():
         Command.claimed_at < stale_before
     ).all()
 
-    for command in stale_commands:
-        command.status = "PENDING"
-        command.claimed_at = None
-
-    if stale_commands:
-        db.session.flush()
+    for item in stale_commands:
+        item.status = "PENDING"
+        item.claimed_at = None
 
     command = (
         query
@@ -53,7 +62,7 @@ def next_command():
         .first()
     )
 
-    if not command:
+    if command is None:
         db.session.commit()
         return jsonify(command=None)
 
@@ -67,7 +76,7 @@ def next_command():
             "id": command.id,
             "account_id": command.account_id,
             "command": command.command,
-            "payload": command.payload
+            "payload": command.payload or {}
         }
     )
 
@@ -77,27 +86,35 @@ def next_command():
 def events():
     data = request.get_json(silent=True) or {}
 
-    account = db.session.get(
-        TradingAccount,
-        data.get("account_id")
-    )
+    if not isinstance(data, dict):
+        return jsonify(error="invalid_request"), 400
 
-    if not account:
+    try:
+        account_id = int(data.get("account_id"))
+        if account_id <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify(error="invalid_account_id"), 400
+
+    account = db.session.get(TradingAccount, account_id)
+
+    if account is None:
         return jsonify(error="account_not_found"), 404
 
-    agent_id = request.headers.get("X-Agent-ID", "")
+    agent_id = request.headers.get("X-Agent-ID", "").strip()
 
     if (
         account.agent_id != agent_id
-        or account.agent_id != data.get("agent_id")
+        or account.agent_id != str(data.get("agent_id", "")).strip()
     ):
         return jsonify(error="account_agent_mismatch"), 403
 
-    event_type = str(
-        data.get("event_type", "telemetry")
-    )[:40]
+    event_type = str(data.get("event_type", "telemetry"))[:40]
 
     payload = data.get("payload") or {}
+
+    if not isinstance(payload, dict):
+        return jsonify(error="invalid_payload"), 400
 
     row = AccountEvent(
         account_id=account.id,
