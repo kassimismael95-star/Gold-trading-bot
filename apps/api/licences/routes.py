@@ -1,6 +1,4 @@
 
-"""Customer licence activation and entitlement status routes."""
-
 from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
@@ -27,18 +25,13 @@ bp = Blueprint(
 @jwt_required()
 def activate():
     user = current_user()
-
-    data = request.get_json(silent=True)
-
-    if not isinstance(data, dict):
-        return jsonify(error="invalid_request_body"), 400
+    data = request.get_json(silent=True) or {}
 
     code = str(data.get("code", "")).strip().upper()
+    now = datetime.now(timezone.utc)
 
     if not code:
         return jsonify(error="licence_code_required"), 400
-
-    now = datetime.now(timezone.utc)
 
     existing = active_entitlement(user.id, now)
 
@@ -53,40 +46,26 @@ def activate():
             ),
         ), 409
 
-    # VIP codes are not self-issued.
-    # The customer can activate only a code that an
-    # administrator has already assigned to this account.
     if code in VIP_CODES:
-        from .activation_service import (
-            activate_vip_for_user,
-        )
+        from .activation_service import activate_vip_for_user
 
         try:
-            row = activate_vip_for_user(
-                user.id,
-                code,
-            )
+            activate_vip_for_user(user.id, code)
         except ValueError as exc:
             return jsonify(error=str(exc)), 403
 
         return jsonify(
             status="ACTIVE",
-            code=row.code,
+            code=code,
             expires_at=None,
         ), 200
 
-    # Trial activation follows the existing trial policy,
-    # including its usage limit and cooldown.
     if code == TRIAL_CODE:
-        from .activation_service import (
-            activate_trial_for_user,
-        )
+        from .activation_service import activate_trial_for_user
 
-        row, error, eligible_at = (
-            activate_trial_for_user(
-                user.id,
-                now,
-            )
+        row, error, eligible_at = activate_trial_for_user(
+            user.id,
+            now,
         )
 
         if error:
@@ -109,19 +88,12 @@ def activate():
             ),
         ), 201
 
-    # Paid entitlement must never be activated by
-    # submitting a licence string in the browser.
     if code == PAID_CODE:
         return jsonify(
-            error=(
-                "paid_entitlement_is_activated_only_"
-                "after_verified_payment"
-            )
+            error="paid_entitlement_is_activated_only_after_verified_payment"
         ), 403
 
-    return jsonify(
-        error="invalid_licence_code",
-    ), 400
+    return jsonify(error="invalid_licence_code"), 400
 
 
 @bp.get("/status")
@@ -129,12 +101,7 @@ def activate():
 def status():
     user = current_user()
 
-    now = datetime.now(timezone.utc)
-
-    row = active_entitlement(
-        user.id,
-        now,
-    )
+    row = active_entitlement(user.id)
 
     trial_uses = Entitlement.query.filter_by(
         user_id=user.id,
