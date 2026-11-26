@@ -1,178 +1,120 @@
 
-"""
-Gold Scalper AI
-Adaptive execution-cost calculations.
-
-Measures spread, commission, and estimated slippage against
-the expected price movement.
-
-This module does not impose a fixed spread ceiling or decide
-the trading strategy.
-"""
-
-from dataclasses import dataclass
-import math
+from collections import deque
+from statistics import median
 
 
-def _valid_number(value):
-    """Return a finite float, or None when invalid."""
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-    if not math.isfinite(number):
-        return None
-
-    return number
-
-
-def cost_ratio(
-    spread,
-    commission_equivalent,
-    expected_move,
-    slippage=0.0,
-):
+class ExecutionCostMonitor:
     """
-    Calculate total estimated execution cost as a fraction
-    of the expected price movement.
+    Observes changing execution costs.
 
-    All inputs must use the same price-distance units.
+    Measures spread, commission and slippage against expected
+    market movement. Maintains a rolling spread baseline.
 
-    Returns:
-        A ratio such as 0.10 for estimated costs equal to
-        10% of the expected movement.
-
-        Returns infinity when expected movement is not positive
-        or an input is invalid.
+    This monitor does not close positions, modify SL/TP,
+    or impose an arbitrary fixed spread limit.
     """
 
-    spread_value = _valid_number(spread)
-    commission_value = _valid_number(commission_equivalent)
-    expected_value = _valid_number(expected_move)
-    slippage_value = _valid_number(slippage)
+    def __init__(self, history_size=100):
+        self.spread_history = deque(maxlen=history_size)
+        self.last_assessment = None
 
-    if (
-        spread_value is None
-        or commission_value is None
-        or expected_value is None
-        or slippage_value is None
+    @staticmethod
+    def _number(value):
+        value = float(value)
+
+        if value < 0:
+            raise ValueError("Execution cost cannot be negative")
+
+        return value
+
+    def assess(
+        self,
+        spread,
+        commission_equivalent=0.0,
+        slippage=0.0,
+        expected_move=0.0
     ):
-        return float("inf")
+        spread = self._number(spread)
+        commission = self._number(commission_equivalent)
+        slippage = self._number(slippage)
+        expected_move = self._number(expected_move)
 
-    if expected_value <= 0:
-        return float("inf")
+        self.spread_history.append(spread)
 
-    total_cost = (
-        max(0.0, spread_value)
-        + max(0.0, commission_value)
-        + max(0.0, slippage_value)
-    )
+        total_cost = spread + commission + slippage
 
-    return total_cost / expected_value
-
-
-@dataclass(frozen=True)
-class ExecutionCostAssessment:
-    spread: float
-    commission: float
-    slippage: float
-    expected_move: float
-    total_cost: float
-    cost_ratio: float
-    expected_net_move: float
-
-
-def assess_execution_cost(
-    spread,
-    commission_equivalent,
-    expected_move,
-    slippage=0.0,
-):
-    """
-    Return an execution-cost assessment for the current
-    opportunity.
-
-    The assessment is informational. The strategy/risk engine
-    decides whether the opportunity is worth taking using
-    the user's intended entry logic.
-    """
-
-    spread_value = _valid_number(spread)
-    commission_value = _valid_number(commission_equivalent)
-    expected_value = _valid_number(expected_move)
-    slippage_value = _valid_number(slippage)
-
-    if (
-        spread_value is None
-        or commission_value is None
-        or expected_value is None
-        or slippage_value is None
-    ):
-        return ExecutionCostAssessment(
-            spread=float("inf"),
-            commission=float("inf"),
-            slippage=float("inf"),
-            expected_move=0.0,
-            total_cost=float("inf"),
-            cost_ratio=float("inf"),
-            expected_net_move=float("-inf"),
+        historical_baseline = (
+            median(self.spread_history)
+            if self.spread_history else spread
         )
 
-    spread_value = max(0.0, spread_value)
-    commission_value = max(0.0, commission_value)
-    slippage_value = max(0.0, slippage_value)
-    expected_value = max(0.0, expected_value)
+        spread_vs_baseline = (
+            spread / historical_baseline
+            if historical_baseline > 0 else None
+        )
 
-    total_cost = (
-        spread_value
-        + commission_value
-        + slippage_value
-    )
+        cost_ratio = (
+            total_cost / expected_move
+            if expected_move > 0 else None
+        )
 
-    ratio = (
-        total_cost / expected_value
-        if expected_value > 0
-        else float("inf")
-    )
+        assessment = {
+            "spread": spread,
+            "commission_equivalent": commission,
+            "slippage": slippage,
+            "total_execution_cost": total_cost,
+            "expected_move": expected_move,
+            "cost_to_expected_move_ratio": cost_ratio,
+            "historical_median_spread": historical_baseline,
+            "spread_vs_historical_baseline": spread_vs_baseline,
+            "history_samples": len(self.spread_history),
+            "assessment_available": expected_move > 0
+        }
 
-    expected_net_move = expected_value - total_cost
+        self.last_assessment = assessment
+        return assessment
 
-    return ExecutionCostAssessment(
-        spread=spread_value,
-        commission=commission_value,
-        slippage=slippage_value,
-        expected_move=expected_value,
-        total_cost=total_cost,
-        cost_ratio=ratio,
-        expected_net_move=expected_net_move,
-    )
+
+def cost_ratio(spread, commission_equivalent, expected_move):
+    """
+    Calculate execution cost relative to expected price movement.
+    Returns None when expected movement is unavailable.
+    """
+    spread = float(spread)
+    commission = float(commission_equivalent)
+    expected_move = float(expected_move)
+
+    if expected_move <= 0:
+        return None
+
+    total_cost = max(0.0, spread) + max(0.0, commission)
+
+    return total_cost / expected_move
 
 
 def acceptable_cost(
     spread,
     commission_equivalent,
     expected_move,
-    max_ratio,
-    slippage=0.0,
+    max_ratio=None
 ):
     """
-    Optional cost-ratio comparison.
+    Optional compatibility helper.
 
-    max_ratio must be supplied by the calling trading policy.
-    This function does not invent a default acceptance limit.
+    No default cost threshold is imposed.
+    A decision is returned only when the caller explicitly
+    supplies its own max_ratio.
     """
-
-    ratio_limit = _valid_number(max_ratio)
-
-    if ratio_limit is None or ratio_limit < 0:
-        return False
+    if max_ratio is None:
+        return None
 
     ratio = cost_ratio(
-        spread=spread,
-        commission_equivalent=commission_equivalent,
-        expected_move=expected_move,
-        slippage=slippage,
+        spread,
+        commission_equivalent,
+        expected_move
     )
 
-    return ratio <= ratio_limit
+    if ratio is None:
+        return None
+
+    return ratio <= float(max_ratio)
