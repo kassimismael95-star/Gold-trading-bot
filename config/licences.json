@@ -1,6 +1,83 @@
-{
-  "BOSSMODE98": {"type":"vip_lifetime","admin_assignment_required":true},
-  "BOSSMODE99": {"type":"vip_lifetime","admin_assignment_required":true},
-  "BOSSMODE01D": {"type":"first_trial","duration_hours":24,"cooldown_hours":96,"second_trial_requires_admin":true},
-  "BOSSMODE30D": {"type":"paid_entitlement","payment_verification_required":true}
-}
+
+"""Trial lifecycle policy.
+
+BOSSMODE01D:
+- First self-service trial: 24 hours.
+- 96-hour cooldown after the first trial expires.
+- Second trial requires administrator approval.
+- Maximum of two trial entitlements per user.
+"""
+
+from datetime import datetime, timezone, timedelta
+
+from ..extensions import db
+from ..models import Entitlement
+from .service import (
+    TRIAL_CODE,
+    TRIAL_HOURS,
+    TRIAL_COOLDOWN_HOURS,
+    MAX_TRIALS,
+)
+
+
+def _utc(value):
+    """Normalize a datetime to timezone-aware UTC."""
+    if value is None:
+        return None
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(timezone.utc)
+
+
+def activate_trial(user_id, now=None):
+    """
+    Activate the first trial for a user.
+
+    The second trial is intentionally not self-service because
+    config/licences.json requires administrator approval for it.
+
+    Returns:
+        (entitlement, error, eligible_at)
+    """
+    now = _utc(now or datetime.now(timezone.utc))
+
+    trials = (
+        Entitlement.query
+        .filter_by(user_id=user_id, code=TRIAL_CODE)
+        .order_by(Entitlement.id.asc())
+        .all()
+    )
+
+    if len(trials) >= MAX_TRIALS:
+        return None, "trial_limit_reached", None
+
+    if not trials:
+        row = Entitlement(
+            user_id=user_id,
+            code=TRIAL_CODE,
+            status="ACTIVE",
+            expires_at=now + timedelta(hours=TRIAL_HOURS),
+        )
+
+        db.session.add(row)
+        db.session.commit()
+
+        return row, None, None
+
+    previous_expiry = _utc(trials[-1].expires_at)
+
+    if previous_expiry is None:
+        return None, "trial_history_invalid", None
+
+    eligible_at = previous_expiry + timedelta(
+        hours=TRIAL_COOLDOWN_HOURS
+    )
+
+    if now < eligible_at:
+        return None, "trial_cooldown_active", eligible_at
+
+    # The configuration requires admin approval for trial number two.
+    # Do not create or activate the second entitlement here.
+    return None, "second_trial_requires_admin", eligible_at
