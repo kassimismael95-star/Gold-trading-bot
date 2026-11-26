@@ -5,26 +5,31 @@
 class CExecutionManager
 {
 public:
+
    CExecutionManager()
    {
    }
 
-   void Init(string sym)
+   void Init(string symbol)
    {
-      // No arbitrary spread ratio or confidence-based movement rule.
-      // The EA initializes and validates the broker symbol separately.
+      // Symbol validation and broker configuration are handled
+      // by BrokerSpecification.mqh.
    }
 
    void Release()
    {
    }
 
-   bool EntryCostOK(string sym, ENUM_ORDER_TYPE side, int confidence)
+   bool EntryCostOK(
+      string symbol,
+      ENUM_ORDER_TYPE side,
+      int confidence
+   )
    {
       MqlTick tick;
 
-      // Validate that the broker has supplied a usable quote.
-      if(!SymbolInfoTick(sym, tick))
+      // A valid current broker quote is required.
+      if(!SymbolInfoTick(symbol, tick))
          return false;
 
       if(tick.bid <= 0.0 || tick.ask <= 0.0)
@@ -33,20 +38,13 @@ public:
       if(tick.ask < tick.bid)
          return false;
 
-      if(side != ORDER_TYPE_BUY && side != ORDER_TYPE_SELL)
+      if(side != ORDER_TYPE_BUY &&
+         side != ORDER_TYPE_SELL)
          return false;
 
-      /*
-         Removed from the original:
-         - fixed spread-to-expected-move ratio
-         - invented ATR movement multipliers
-         - confidence-based spread rejection
-
-         This method does not impose an arbitrary spread ceiling.
-         Broker execution validity, your strategy, position sizing,
-         account risk, and broker margin requirements remain handled
-         by their existing modules.
-      */
+      // No arbitrary spread ceiling.
+      // No confidence-based spread rejection.
+      // No invented movement multiplier.
 
       return true;
    }
