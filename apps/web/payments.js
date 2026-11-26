@@ -1,7 +1,66 @@
 
 """Customer licence activation and entitlement status routes."""
 
-from datetime import datetime, timezone
+from 
+import { api } from './api-client.js';
+
+/**
+ * Initialize a Flutterwave checkout.
+ *
+ * The server creates the pending payment and returns:
+ * {
+ *   tx_ref,
+ *   checkout_url
+ * }
+ *
+ * Payment access is not activated here.
+ * The backend activates it only after provider verification.
+ */
+export async function initializeCheckout(
+  plan_code,
+  currency = 'USD'
+) {
+  if (!plan_code || typeof plan_code !== 'string') {
+    throw new Error('Please select a subscription plan.');
+  }
+
+  const result = await api(
+    '/api/payments/flutterwave/initialize',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        plan_code,
+        currency,
+      }),
+    }
+  );
+
+  if (!result || !result.checkout_url) {
+    throw new Error(
+      'The payment provider did not return a checkout link.'
+    );
+  }
+
+  return result;
+}
+
+/**
+ * Start checkout and redirect the customer to Flutterwave.
+ */
+export async function checkout(
+  plan_code,
+  currency = 'USD'
+) {
+  const result = await initializeCheckout(
+    plan_code,
+    currency
+  );
+
+  window.location.assign(result.checkout_url);
+
+  return result;
+}
+ import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
