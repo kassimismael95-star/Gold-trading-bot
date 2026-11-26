@@ -1,45 +1,43 @@
 
-"""Webhook parsing and deduplication.
+"""Parse and deduplicate verified Flutterwave webhook events.
 
-The payment route must verify Flutterwave's webhook signature before calling
-these helpers. This module does not activate payments or trust webhook status.
+The route must validate Flutterwave's webhook signature before calling
+this module. Payment activation must still use server-side transaction
+verification.
 """
 
 from .payment_idempotency import record_event
 
 
 def accept_completed_event(payload):
-    """Store a completed-payment webhook once.
-
-    Returns:
-        (event_row, created)
-
-    `created` is True only when this call successfully created the event row.
-    Repeated delivery of the same provider event returns the existing row.
-    """
     if not isinstance(payload, dict):
-        raise ValueError("webhook_payload_must_be_object")
+        raise ValueError("invalid_webhook_payload")
 
-    data = payload.get("data")
+    data = payload.get("data") or {}
+
     if not isinstance(data, dict):
-        raise ValueError("webhook_data_must_be_object")
+        raise ValueError("invalid_webhook_data")
 
     event_type = str(payload.get("event") or "unknown").strip()
-    transaction_id = str(data.get("id") or "").strip()
-    transaction_ref = str(data.get("tx_ref") or "").strip()
 
-    # Prefer Flutterwave's transaction ID. Use tx_ref only as a fallback.
-    provider_event_id = transaction_id or transaction_ref
+    # Flutterwave's transaction ID is the preferred stable event key.
+    # tx_ref is used only when the provider event has no transaction ID.
+    provider_event_id = data.get("id") or data.get("tx_ref")
+
+    if provider_event_id is None:
+        raise ValueError("webhook_event_key_missing")
+
+    provider_event_id = str(provider_event_id).strip()
+
     if not provider_event_id:
         raise ValueError("webhook_event_key_missing")
 
-    if len(provider_event_id) > 140:
-        raise ValueError("webhook_event_key_too_long")
-
     event_key = f"flutterwave:{provider_event_id}"
 
-    return record_event(
+    event, created = record_event(
         event_key=event_key,
-        event_type=event_type[:80] or "unknown",
+        event_type=event_type,
         payload=payload,
     )
+
+    return event, created
