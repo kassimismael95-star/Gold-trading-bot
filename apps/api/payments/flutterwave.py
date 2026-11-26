@@ -1,9 +1,9 @@
 
-"""Flutterwave checkout and verified subscription activation."""
-
+import json
 import uuid
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 from flask import current_app
@@ -12,28 +12,63 @@ from ..models import Payment
 from ..extensions import db
 
 
-# Keep these plan codes synchronized with the website's plan cards.
-PLANS = {
-    "PLAN_15D": (Decimal("25.00"), 15),
-    "PLAN_33D": (Decimal("50.00"), 33),
-    "PLAN_70D": (Decimal("100.00"), 70),
-}
+def load_plans():
+    """Load subscription plan definitions from the project config."""
+    project_root = Path(__file__).resolve().parents[3]
+    config_path = project_root / "config" / "subscription_plans.json"
+
+    with config_path.open("r", encoding="utf-8") as file:
+        configured = json.load(file)
+
+    plans = {}
+
+    for code, details in configured.items():
+        try:
+            amount = Decimal(str(details["amount"]))
+            currency = str(details["currency"]).upper()
+            duration_days = int(details["duration_days"])
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            raise RuntimeError(
+                f"Invalid subscription plan configuration: {code}"
+            )
+
+        if amount <= 0 or duration_days <= 0:
+            raise RuntimeError(
+                f"Invalid amount or duration for plan: {code}"
+            )
+
+        plans[code] = {
+            "amount": amount,
+            "currency": currency,
+            "duration_days": duration_days,
+        }
+
+    if not plans:
+        raise RuntimeError("No subscription plans are configured")
+
+    return plans
+
+
+def get_plan(plan_code):
+    """Return one configured plan or raise invalid_plan."""
+    plans = load_plans()
+
+    if plan_code not in plans:
+        raise ValueError("invalid_plan")
+
+    return plans[plan_code]
 
 
 def initialize_payment(user, plan_code, currency="USD"):
-    """Create a pending payment and obtain a provider checkout URL."""
+    plan = get_plan(plan_code)
 
-    plan_code = str(plan_code or "").strip()
-    currency = str(currency or "").strip().upper()
+    amount = plan["amount"]
+    configured_currency = plan["currency"]
+    currency = str(currency).upper()
 
-    if plan_code not in PLANS:
-        raise ValueError("invalid_plan")
-
-    amount, _days = PLANS[plan_code]
-
-    if currency != "USD":
+    if currency != configured_currency:
         raise ValueError(
-            "only USD is configured until merchant currency support is verified"
+            "currency_does_not_match_configured_plan"
         )
 
     secret = current_app.config.get("FLW_SECRET_KEY")
@@ -43,21 +78,9 @@ def initialize_payment(user, plan_code, currency="USD"):
             "Flutterwave secret key is not configured"
         )
 
-    redirect_url = current_app.config.get(
-        "FLW_REDIRECT_URL"
-    )
-
-    if not redirect_url:
-        raise RuntimeError(
-            "Flutterwave redirect URL is not configured"
-        )
-
-    if not getattr(user, "email", None):
-        raise ValueError("customer_email_required")
-
     tx_ref = "gold-" + uuid.uuid4().hex
 
-    payment = Payment(
+    row = Payment(
         user_id=user.id,
         tx_ref=tx_ref,
         plan_code=plan_code,
@@ -66,21 +89,8 @@ def initialize_payment(user, plan_code, currency="USD"):
         status="PENDING",
     )
 
-    db.session.add(payment)
+    db.session.add(row)
     db.session.commit()
-
-    payload = {
-        "tx_ref": tx_ref,
-        "amount": str(amount),
-        "currency": currency,
-        "redirect_url": redirect_url,
-        "customer": {
-            "email": user.email,
-        },
-        "customizations": {
-            "title": "Gold Scalper subscription",
-        },
-    }
 
     try:
         response = requests.post(
@@ -89,142 +99,136 @@ def initialize_payment(user, plan_code, currency="USD"):
                 "Authorization": f"Bearer {secret}",
                 "Content-Type": "application/json",
             },
-            json=payload,
-            timeout=(5, 20),
+            json={
+                "tx_ref": tx_ref,
+                "amount": str(amount),
+                "currency": currency,
+                "redirect_url": current_app.config.get(
+                    "FLW_REDIRECT_URL"
+                ),
+                "customer": {
+                    "email": user.email,
+                },
+                "customizations": {
+                    "title": "Gold Scalper subscription",
+                },
+            },
+            timeout=20,
         )
 
         response.raise_for_status()
-
         body = response.json()
-        data = body.get("data") or {}
 
+        data = body.get("data") or {}
         checkout_url = data.get("link")
 
-        if (
-            body.get("status") != "success"
-            or not isinstance(checkout_url, str)
-            or not checkout_url.startswith("https://")
-        ):
+        if body.get("status") != "success" or not checkout_url:
             raise RuntimeError(
                 "Flutterwave initialization failed"
             )
 
-        return payment, checkout_url
+        return row, checkout_url
 
     except Exception:
-        payment.status = "INIT_FAILED"
+        row.status = "INIT_FAILED"
         db.session.commit()
         raise
 
 
 def verify_and_activate(tx_ref, transaction_id):
-    """
-    Verify the transaction directly with Flutterwave.
-
-    Never activate a subscription from a browser redirect alone.
-    """
-
-    tx_ref = str(tx_ref or "").strip()
-    transaction_id = str(transaction_id or "").strip()
-
     if not tx_ref or not transaction_id:
         raise ValueError(
             "transaction_reference_and_id_required"
         )
 
-    if not transaction_id.isdigit():
-        raise ValueError(
-            "invalid_provider_transaction_id"
-        )
-
-    payment = (
+    row = (
         Payment.query
         .filter_by(tx_ref=tx_ref)
         .with_for_update()
         .first()
     )
 
-    if payment is None:
+    if not row:
         raise ValueError("unknown_transaction")
 
-    # Idempotent handling of an already verified payment.
-    if payment.status == "SUCCESS":
-        if str(payment.provider_id or "") != transaction_id:
+    if row.status == "SUCCESS":
+        if str(row.provider_id or "") != str(transaction_id):
             raise ValueError(
                 "payment_already_verified_with_different_transaction"
             )
 
-        from .wallet_service import post_verified_payment
+        if row.provider_id:
+            from .wallet_service import post_verified_payment
 
-        post_verified_payment(
-            payment,
-            str(payment.provider_id),
-        )
+            post_verified_payment(
+                row,
+                str(row.provider_id),
+            )
 
-        return payment
+        return row
 
-    if payment.status != "PENDING":
+    if row.status != "PENDING":
         raise ValueError("payment_not_pending")
 
-    # This service checks the provider's transaction ID,
-    # reference, status, amount, currency, customer and duplicates.
+    plan = get_plan(row.plan_code)
+
+    if row.currency != plan["currency"]:
+        raise ValueError(
+            "payment_currency_does_not_match_plan"
+        )
+
+    if Decimal(str(row.amount)) != plan["amount"]:
+        raise ValueError(
+            "payment_amount_does_not_match_plan"
+        )
+
     from .transaction_verifier import verify_transaction
 
-    verify_transaction(transaction_id, payment)
+    verify_transaction(transaction_id, row)
 
-    payment.status = "SUCCESS"
-    payment.provider_id = transaction_id
-
-    if payment.plan_code not in PLANS:
-        raise ValueError("payment_has_invalid_plan")
-
-    _amount, days = PLANS[payment.plan_code]
+    row.status = "SUCCESS"
+    row.provider_id = str(transaction_id)
 
     now = datetime.now(timezone.utc)
 
     from ..subscriptions.renewal_service import renewal_start
-    from ..subscriptions.subscription_service import (
-        create_for_payment,
-    )
-    from ..licences.subscription_sync import (
-        sync_paid_entitlement,
+    from ..subscriptions.subscription_service import create_for_payment
+    from ..licences.subscription_sync import sync_paid_entitlement
+
+    start = renewal_start(row.user_id, now)
+
+    subscription_expiry = start + timedelta(
+        days=plan["duration_days"]
     )
 
-    # Preserve any remaining active subscription time.
-    start_at = renewal_start(payment.user_id, now)
-    expires_at = start_at + timedelta(days=days)
-
-    # Synchronize paid licence entitlement and subscription history.
     sync_paid_entitlement(
-        payment.user_id,
-        expires_at,
+        row.user_id,
+        subscription_expiry,
     )
 
     create_for_payment(
-        payment,
-        start_at,
-        expires_at,
+        row,
+        start,
+        subscription_expiry,
     )
 
     db.session.commit()
 
-    # Keep the existing wallet ledger integration.
     from .wallet_service import post_verified_payment
 
     post_verified_payment(
-        payment,
-        transaction_id,
+        row,
+        str(transaction_id),
     )
 
-    # Notify the customer after verification and activation.
     from .payment_notifications import notify_payment
 
     notify_payment(
-        payment.user_id,
+        row.user_id,
         "SUCCESS",
-        payment.tx_ref,
-        payment.plan_code,
-        expires_at,
+        row.tx_ref,
+        row.plan_code,
+        subscription_expiry,
     )
 
-    return payment
+    return row
