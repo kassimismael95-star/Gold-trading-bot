@@ -25,8 +25,8 @@
     <h2>Sign in / Create account</h2>
 
     <div class="grid">
-      <input id="email" type="email" placeholder="Email" autocomplete="email">
-      <input id="password" type="password" placeholder="Password (12+ characters)" autocomplete="current-password">
+      <input id="email" type="email" placeholder="Email">
+      <input id="password" type="password" placeholder="Password (12+ characters)">
     </div>
 
     <div class="actions">
@@ -37,14 +37,18 @@
     <p id="authMsg" class="muted"></p>
 
     <div class="grid">
-      <input id="verifyCode" inputmode="numeric" autocomplete="one-time-code" placeholder="Email verification OTP">
+      <input id="verifyCode" inputmode="numeric"
+             autocomplete="one-time-code"
+             placeholder="Email verification OTP">
       <button class="secondary" onclick="verifyEmail()">Verify email</button>
       <button class="secondary" onclick="resendVerification()">Resend OTP</button>
     </div>
 
     <div class="grid">
-      <input id="resetCode" inputmode="numeric" placeholder="Password reset OTP">
-      <input id="newPassword" type="password" placeholder="New password (12+ characters)" autocomplete="new-password">
+      <input id="resetCode" inputmode="numeric"
+             placeholder="Password reset OTP">
+      <input id="newPassword" type="password"
+             placeholder="New password (12+ characters)">
       <button class="secondary" onclick="requestPasswordReset()">Request password reset</button>
       <button class="secondary" onclick="confirmPasswordReset()">Reset password</button>
     </div>
@@ -55,9 +59,11 @@
 
     <div class="grid">
       <input id="label" placeholder="Account label">
-      <input id="login" placeholder="MT5 login number" inputmode="numeric">
+      <input id="login" placeholder="MT5 login number">
       <input id="server" placeholder="Exact broker server">
-      <input id="mt5Password" type="password" autocomplete="new-password" placeholder="MT5 trading password">
+      <input id="mt5Password" type="password"
+             autocomplete="new-password"
+             placeholder="MT5 trading password">
       <input id="symbol" placeholder="Gold symbol (AUTO)">
     </div>
 
@@ -81,16 +87,12 @@
     </div>
   </section>
 
-  <section class="panel" id="licencePanel">
+  <section class="panel">
     <h2>Licence / trial</h2>
 
     <div class="grid">
-      <input
-        id="licenseCode"
-        autocomplete="off"
-        autocapitalize="characters"
-        placeholder="Enter licence code"
-      >
+      <input id="licenseCode"
+             placeholder="Enter your licence or access code">
     </div>
 
     <div class="actions">
@@ -103,27 +105,23 @@
     </p>
 
     <p class="muted">
-      BOSSMODE98 and BOSSMODE99 are VIP codes assigned by an administrator.
-      BOSSMODE01D activates the trial when eligible.
-      BOSSMODE30D opens the subscription plans.
-      Paid access activates only after the payment is verified by the server.
+      BOSSMODE98 and BOSSMODE99 — VIP lifetime access codes.
+      BOSSMODE01D — 24-hour trial code, subject to the trial cooldown.
+      BOSSMODE30D — opens the paid subscription plans.
+      Paid access requires successful payment verification.
     </p>
   </section>
 
-  <!--
-    The paid plans are hidden initially.
-    The licence/payment JavaScript should reveal this panel only after
-    BOSSMODE30D is accepted by the server.
-  -->
-  <section class="panel" id="plansPanel" hidden>
-    <h2>Choose your subscription plan</h2>
+  <section class="panel">
+    <h2>Subscription plans</h2>
 
-    <div id="plans" class="plans"></div>
+    <div id="plans" class="plans">
+      <p class="muted">Loading available plans…</p>
+    </div>
 
     <p class="muted">
-      Select a plan to continue to Flutterwave checkout.
-      Your subscription is activated only after the server verifies
-      the successful payment.
+      Choose a plan and complete checkout. Your paid entitlement
+      activates only after the payment provider confirms the payment.
     </p>
   </section>
 
@@ -180,13 +178,15 @@
     <div class="grid">
       <input id="agentIdRotate" placeholder="Oracle agent ID">
       <button onclick="adminRotateAgent()">Rotate agent secret</button>
-      <input id="agentCapacity" type="number" min="1" max="1000" value="20" placeholder="Agent capacity">
+      <input id="agentCapacity" type="number" min="1" max="1000"
+             value="20" placeholder="Agent capacity">
       <button onclick="adminSetCapacity()">Set capacity</button>
     </div>
 
     <div class="grid">
       <input id="subscriptionId" placeholder="Subscription ID">
-      <input id="subscriptionDays" type="number" min="1" max="365" value="30">
+      <input id="subscriptionDays" type="number" min="1" max="365"
+             value="30">
       <button onclick="adminExtendSubscription()">Extend subscription</button>
       <button onclick="adminRevokeSubscription()">Revoke subscription</button>
     </div>
@@ -202,7 +202,8 @@
       <button onclick="adminLoad('wallet')">Wallet summary</button>
       <button onclick="adminLoad('reconciliations')">Reconciliation reports</button>
       <button onclick="adminLoad('snapshots')">Balance snapshots</button>
-      <input id="reconciliationId" type="number" placeholder="Reconciliation ID">
+      <input id="reconciliationId" type="number"
+             placeholder="Reconciliation ID">
       <input id="reconciliationNote" placeholder="Resolution note">
       <button onclick="adminResolveReconciliation()">Resolve reconciliation</button>
       <button onclick="adminSyncWallet()">Sync merchant balance</button>
