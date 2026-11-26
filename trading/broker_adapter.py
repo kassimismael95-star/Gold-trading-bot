@@ -1,592 +1,906 @@
 
 """
-Oracle Cloud MT5 Broker Adapter.
+GOLD SCALPER AI
+File: trading/broker_adapter.py
 
-This module communicates with an MT5 Expert Advisor through
-a local HTTP bridge.
+Direct Python-to-MT5 bridge adapter.
 
 Architecture:
     Python trading controller
-        |
-        | HTTP/JSON
-        v
-    Local MT5 bridge
-        |
-        | EA polling and acknowledgements
-        v
-    MT5 Expert Advisor
-        |
-        v
-    MT5 terminal / broker
+          |
+          v
+    MT5BridgeClient
+          |
+          v
+    Oracle MT5 Bridge Server
+          |
+          v
+    GoldMasterEA.mq5
+          |
+          v
+    Broker / MT5 terminal
 
-No MetaApi connection is used here.
+No MetaApi.
+No external paid trading connector.
 
-The matching bridge server and MQL5 EA must implement the
-same HTTP protocol before this adapter can execute trades.
+IMPORTANT:
+    A command timeout is an UNKNOWN execution state.
+    Never automatically resend an order after a timeout.
+    Reconcile the broker's actual positions first.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
-import urllib.error
-import urllib.request
 
-from typing import Any, Dict, Optional
-from urllib.parse import quote
+from dataclasses import dataclass
+from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 
-class BrokerAdapterError(RuntimeError):
-    """Raised when the MT5 bridge operation fails."""
+logger = logging.getLogger("gold_scalper.broker_adapter")
 
+
+# ============================================================
+# EXCEPTIONS
+# ============================================================
+
+class BrokerAdapterError(Exception):
+    """Base exception for broker adapter failures."""
+
+
+class BrokerAuthenticationError(BrokerAdapterError):
+    """The Oracle bridge rejected authentication."""
+
+
+class BrokerConnectionError(BrokerAdapterError):
+    """The Oracle bridge could not be reached."""
+
+
+class BrokerRequestError(BrokerAdapterError):
+    """The Oracle bridge returned an unsuccessful response."""
+
+
+class BrokerCommandTimeout(BrokerAdapterError):
+    """
+    A command did not reach a verified terminal state in time.
+
+    The caller MUST reconcile broker state before considering
+    another order submission.
+    """
+
+
+class BrokerStateUnavailable(BrokerAdapterError):
+    """No usable broker snapshot is currently available."""
+
+
+# ============================================================
+# ACCOUNT CONNECTION CONFIGURATION
+# ============================================================
+
+@dataclass(frozen=True)
+class BridgeAccountConfig:
+    account_id: str
+    bridge_url: str
+    api_key: str
+    timeout: float = 10.0
+
+    def __post_init__(self):
+        if not self.account_id or not self.account_id.strip():
+            raise ValueError("account_id is required")
+
+        if not self.bridge_url or not self.bridge_url.strip():
+            raise ValueError("bridge_url is required")
+
+        if not self.api_key or not self.api_key.strip():
+            raise ValueError("api_key is required")
+
+        if self.timeout <= 0:
+            raise ValueError("timeout must be positive")
+
+
+# ============================================================
+# HTTP CLIENT
+# ============================================================
 
 class MT5BridgeClient:
     """
-    HTTP client for one Oracle-hosted MT5 bridge.
+    Authenticated HTTP client for one MT5 account.
 
-    Each trading account receives its own bridge configuration.
+    One client instance belongs to one account. Do not share
+    account credentials or account state between customers.
     """
 
     def __init__(
         self,
-        base_url: str,
-        api_key: Optional[str] = None,
-        timeout: float = 10.0
+        account_id: str,
+        bridge_url: str,
+        api_key: str,
+        timeout: float = 10.0,
     ):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.timeout = float(timeout)
+        self.config = BridgeAccountConfig(
+            account_id=account_id,
+            bridge_url=bridge_url.rstrip("/"),
+            api_key=api_key,
+            timeout=timeout,
+        )
 
-        if not self.base_url.startswith("http://") and not (
-            self.base_url.startswith("https://")
-        ):
-            raise ValueError("Bridge URL must use HTTP or HTTPS")
+        self.account_id = account_id
+        self._closed = False
 
-        if self.timeout <= 0:
-            raise ValueError("Timeout must be positive")
+    # --------------------------------------------------------
+    # INTERNAL HTTP REQUEST
+    # --------------------------------------------------------
 
     def _request_sync(
         self,
         method: str,
-        path: str,
-        payload: Optional[dict] = None
-    ):
-        url = self.base_url + path
+        endpoint: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
 
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-
-        if self.api_key:
-            headers["Authorization"] = (
-                f"Bearer {self.api_key}"
+        if self._closed:
+            raise BrokerConnectionError(
+                "Bridge client has been closed"
             )
 
-        body = None
+        url = (
+            self.config.bridge_url
+            + "/"
+            + endpoint.lstrip("/")
+        )
+
+        headers = {
+            "Authorization": (
+                "Bearer " + self.config.api_key
+            ),
+            "Accept": "application/json",
+            "Cache-Control": "no-store",
+        }
+
+        data = None
 
         if payload is not None:
-            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
 
-        request = urllib.request.Request(
+            data = json.dumps(
+                payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+
+        request = Request(
             url=url,
-            data=body,
+            data=data,
             headers=headers,
-            method=method.upper()
+            method=method.upper(),
         )
 
         try:
-            with urllib.request.urlopen(
+            with urlopen(
                 request,
-                timeout=self.timeout
+                timeout=self.config.timeout,
             ) as response:
-                raw = response.read().decode("utf-8")
+
+                raw = response.read()
 
                 if not raw:
                     return {}
 
-                result = json.loads(raw)
+                try:
+                    result = json.loads(
+                        raw.decode("utf-8")
+                    )
+                except json.JSONDecodeError as exc:
+                    raise BrokerRequestError(
+                        "Bridge returned invalid JSON"
+                    ) from exc
 
                 if not isinstance(result, dict):
-                    raise BrokerAdapterError(
-                        "Bridge returned an invalid response"
-                    )
-
-                if result.get("success") is False:
-                    raise BrokerAdapterError(
-                        result.get(
-                            "error",
-                            "Bridge operation failed"
-                        )
+                    raise BrokerRequestError(
+                        "Bridge response must be a JSON object"
                     )
 
                 return result
 
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode(
-                "utf-8",
-                errors="replace"
-            )
+        except HTTPError as exc:
 
-            raise BrokerAdapterError(
-                f"Bridge HTTP error {exc.code}: {detail}"
+            response_text = ""
+
+            try:
+                response_text = exc.read().decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            except Exception:
+                pass
+
+            if exc.code == 401:
+                raise BrokerAuthenticationError(
+                    "Oracle bridge authentication failed"
+                ) from exc
+
+            if exc.code in (502, 503, 504):
+                raise BrokerStateUnavailable(
+                    f"Bridge temporarily unavailable: {response_text}"
+                ) from exc
+
+            raise BrokerRequestError(
+                f"Bridge HTTP {exc.code}: {response_text}"
             ) from exc
 
-        except urllib.error.URLError as exc:
-            raise BrokerAdapterError(
-                f"Cannot reach MT5 bridge: {exc}"
-            ) from exc
+        except (URLError, TimeoutError, OSError) as exc:
 
-        except TimeoutError as exc:
-            raise BrokerAdapterError(
-                "MT5 bridge request timed out"
-            ) from exc
-
-        except json.JSONDecodeError as exc:
-            raise BrokerAdapterError(
-                "MT5 bridge returned invalid JSON"
+            raise BrokerConnectionError(
+                f"Could not connect to Oracle MT5 bridge: {exc}"
             ) from exc
 
     async def request(
         self,
         method: str,
-        path: str,
-        payload: Optional[dict] = None
-    ):
+        endpoint: str,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+
         return await asyncio.to_thread(
             self._request_sync,
             method,
-            path,
-            payload
+            endpoint,
+            payload,
         )
 
+    # --------------------------------------------------------
+    # ACCOUNT QUERY HELPERS
+    # --------------------------------------------------------
 
-class MetaTraderBrokerAdapter:
-    """
-    Account-isolated interface between the trading controller
-    and Oracle-hosted MT5 Expert Advisors.
+    def _account_endpoint(self, endpoint: str) -> str:
+        separator = "&" if "?" in endpoint else "?"
 
-    This adapter transports commands and reads EA-reported
-    broker state. It does not independently execute orders.
-    """
-
-    def __init__(self):
-        self.bridges: Dict[str, MT5BridgeClient] = {}
-        self.account_metadata: Dict[str, dict] = {}
-
-    def register_account(
-        self,
-        account_id: str,
-        bridge_url: str,
-        symbol: Optional[str] = None,
-        api_key: Optional[str] = None,
-        timeout: float = 10.0
-    ):
-        account_id = str(account_id)
-
-        if not account_id:
-            raise ValueError("account_id is required")
-
-        self.bridges[account_id] = MT5BridgeClient(
-            base_url=bridge_url,
-            api_key=api_key,
-            timeout=timeout
+        return (
+            endpoint
+            + separator
+            + urlencode({
+                "account_id": self.account_id
+            })
         )
 
-        self.account_metadata[account_id] = {
-            "symbol": symbol
-        }
+    # --------------------------------------------------------
+    # HEALTH
+    # --------------------------------------------------------
 
-    def unregister_account(self, account_id: str):
-        account_id = str(account_id)
+    async def health_check(self) -> dict[str, Any]:
 
-        self.bridges.pop(account_id, None)
-        self.account_metadata.pop(account_id, None)
-
-    def _bridge(self, account_id):
-        account_id = str(account_id)
-
-        bridge = self.bridges.get(account_id)
-
-        if bridge is None:
-            raise BrokerAdapterError(
-                f"No Oracle MT5 bridge registered for {account_id}"
-            )
-
-        return bridge
-
-    async def health_check(self, account_id):
-        bridge = self._bridge(account_id)
-
-        result = await bridge.request(
+        result = await self.request(
             "GET",
-            "/health"
+            "/health",
         )
 
-        if result.get("status") not in ("ok", "healthy"):
-            raise BrokerAdapterError(
-                "MT5 bridge is not reporting a healthy state"
+        if result.get("status") != "ok":
+            raise BrokerRequestError(
+                "Oracle bridge health check failed"
             )
 
         return result
 
-    async def get_positions(self, account_id):
-        bridge = self._bridge(account_id)
+    # --------------------------------------------------------
+    # ACCOUNT INFORMATION
+    # --------------------------------------------------------
 
-        result = await bridge.request(
+    async def get_account_information(self) -> dict[str, Any]:
+
+        endpoint = self._account_endpoint("/account")
+
+        result = await self.request(
             "GET",
-            "/positions"
+            endpoint,
         )
+
+        if not result.get("success"):
+            raise BrokerStateUnavailable(
+                "Account information is unavailable"
+            )
+
+        account = result.get("account")
+
+        if not isinstance(account, dict):
+            raise BrokerStateUnavailable(
+                "Invalid account snapshot"
+            )
+
+        return account
+
+    # --------------------------------------------------------
+    # OPEN POSITIONS
+    # --------------------------------------------------------
+
+    async def get_positions(self) -> list[dict[str, Any]]:
+
+        endpoint = self._account_endpoint("/positions")
+
+        result = await self.request(
+            "GET",
+            endpoint,
+        )
+
+        if not result.get("success"):
+            raise BrokerStateUnavailable(
+                "Position snapshot is unavailable"
+            )
 
         positions = result.get("positions")
 
         if not isinstance(positions, list):
-            raise BrokerAdapterError(
-                "Bridge returned an invalid positions snapshot"
+            raise BrokerStateUnavailable(
+                "Invalid position snapshot"
             )
+
+        for position in positions:
+            if not isinstance(position, dict):
+                raise BrokerStateUnavailable(
+                    "Position snapshot contains an invalid entry"
+                )
 
         return positions
 
-    async def get_account_information(self, account_id):
-        bridge = self._bridge(account_id)
-
-        result = await bridge.request(
-            "GET",
-            "/account"
-        )
-
-        information = result.get("account_information")
-
-        if not isinstance(information, dict):
-            raise BrokerAdapterError(
-                "Bridge returned invalid account information"
-            )
-
-        return information
+    # --------------------------------------------------------
+    # SYMBOL PRICE
+    # --------------------------------------------------------
 
     async def get_symbol_price(
         self,
-        account_id,
-        symbol=None
-    ):
-        bridge = self._bridge(account_id)
+        symbol: str,
+    ) -> dict[str, Any]:
 
         if not symbol:
-            symbol = self.account_metadata.get(
-                str(account_id), {}
-            ).get("symbol")
+            raise ValueError("symbol is required")
 
-        if not symbol:
-            raise ValueError("Trading symbol is required")
+        endpoint = "/price?" + urlencode({
+            "account_id": self.account_id,
+            "symbol": symbol,
+        })
 
-        result = await bridge.request(
+        result = await self.request(
             "GET",
-            "/price?symbol=" + quote(str(symbol), safe="")
+            endpoint,
         )
+
+        if not result.get("success"):
+            raise BrokerStateUnavailable(
+                f"Price unavailable for {symbol}"
+            )
 
         price = result.get("price")
 
         if not isinstance(price, dict):
-            raise BrokerAdapterError(
-                "Bridge returned invalid price information"
+            raise BrokerStateUnavailable(
+                "Invalid price snapshot"
             )
 
-        bid = float(price["bid"])
-        ask = float(price["ask"])
+        bid = price.get("bid")
+        ask = price.get("ask")
+
+        if bid is None or ask is None:
+            raise BrokerStateUnavailable(
+                "Price snapshot must contain bid and ask"
+            )
+
+        try:
+            bid = float(bid)
+            ask = float(ask)
+        except (TypeError, ValueError) as exc:
+            raise BrokerStateUnavailable(
+                "Invalid bid/ask values"
+            ) from exc
 
         if bid <= 0 or ask <= 0 or ask < bid:
-            raise BrokerAdapterError(
-                "Invalid MT5 bid/ask prices"
+            raise BrokerStateUnavailable(
+                "Broker returned invalid bid/ask prices"
             )
 
         return {
             "symbol": symbol,
             "bid": bid,
             "ask": ask,
-            "mid": (bid + ask) / 2.0,
-            "spread": ask - bid
+            "last": price.get("last"),
+            "time_msc": price.get("time_msc"),
+            "updated_at": result.get("updated_at"),
         }
 
-    async def send_command(self, account_id, command):
-        bridge = self._bridge(account_id)
+    # --------------------------------------------------------
+    # FULL BROKER SNAPSHOT
+    # --------------------------------------------------------
+
+    async def get_broker_snapshot(
+        self,
+        symbol: Optional[str] = None,
+    ) -> dict[str, Any]:
+
+        account_task = self.get_account_information()
+        positions_task = self.get_positions()
+
+        results = await asyncio.gather(
+            account_task,
+            positions_task,
+            return_exceptions=True,
+        )
+
+        account = results[0]
+        positions = results[1]
+
+        if isinstance(account, BaseException):
+            raise account
+
+        if isinstance(positions, BaseException):
+            raise positions
+
+        snapshot = {
+            "account_id": self.account_id,
+            "account": account,
+            "positions": positions,
+        }
+
+        if symbol:
+            snapshot["price"] = await self.get_symbol_price(
+                symbol
+            )
+
+        return snapshot
+
+    # --------------------------------------------------------
+    # SUBMIT COMMAND
+    # --------------------------------------------------------
+
+    async def send_command(
+        self,
+        command: dict[str, Any],
+    ) -> str:
 
         if not isinstance(command, dict):
-            raise ValueError("Command must be a dictionary")
+            raise ValueError("command must be a dictionary")
 
-        command_type = command.get("type")
-
-        if not command_type:
-            raise ValueError("Command type is required")
+        command_payload = dict(command)
 
         payload = {
-            "account_id": str(account_id),
-            "command": command,
-            "created_at": time.time()
+            "account_id": self.account_id,
+            "command": command_payload,
         }
 
-        result = await bridge.request(
+        result = await self.request(
             "POST",
             "/commands",
-            payload
+            payload,
         )
 
         command_id = result.get("command_id")
 
         if not command_id:
-            raise BrokerAdapterError(
+            raise BrokerRequestError(
                 "Bridge did not return a command ID"
             )
 
-        return {
-            "success": True,
-            "command_id": str(command_id),
-            "status": result.get("status", "queued")
-        }
+        return str(command_id)
+
+    # --------------------------------------------------------
+    # COMMAND RESULT
+    # --------------------------------------------------------
 
     async def get_command_result(
         self,
-        account_id,
-        command_id
-    ):
-        bridge = self._bridge(account_id)
+        command_id: str,
+    ) -> dict[str, Any]:
 
-        result = await bridge.request(
+        if not command_id:
+            raise ValueError("command_id is required")
+
+        result = await self.request(
             "GET",
-            "/commands/" + quote(
-                str(command_id),
-                safe=""
-            )
+            "/commands/" + command_id,
         )
+
+        if result.get("account_id") != self.account_id:
+            raise BrokerRequestError(
+                "Command account does not match this client"
+            )
 
         return result
 
+    # --------------------------------------------------------
+    # WAIT FOR COMMAND
+    # --------------------------------------------------------
+
     async def execute_and_wait(
         self,
-        account_id,
-        command,
-        timeout_seconds=30.0,
-        poll_interval=0.25
-    ):
-        """
-        Submit a command and wait for the EA's execution result.
+        command: dict[str, Any],
+        timeout: float = 30.0,
+        poll_interval: float = 0.25,
+    ) -> dict[str, Any]:
 
-        A queued command is not considered a successful trade.
-        Only a completed EA response is accepted.
-        """
-        submitted = await self.send_command(
-            account_id,
-            command
-        )
+        if timeout <= 0:
+            raise ValueError("timeout must be positive")
 
-        command_id = submitted["command_id"]
-        deadline = time.monotonic() + float(timeout_seconds)
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
+
+        command_id = await self.send_command(command)
+
+        deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
+
             result = await self.get_command_result(
-                account_id,
                 command_id
             )
 
-            status = str(
-                result.get("status", "")
-            ).lower()
+            status = result.get("status")
 
-            if status in ("completed", "executed", "success"):
-                if result.get("success") is False:
-                    raise BrokerAdapterError(
-                        result.get(
-                            "error",
-                            "MT5 execution failed"
-                        )
-                    )
+            if status == "complete":
 
-                return result
+                return {
+                    "success": True,
+                    "command_id": command_id,
+                    "status": status,
+                    "result": result.get("result"),
+                }
 
-            if status in ("failed", "rejected", "cancelled"):
-                raise BrokerAdapterError(
-                    result.get(
-                        "error",
-                        "MT5 command was not executed"
-                    )
-                )
+            if status in (
+                "failed",
+                "rejected",
+                "cancelled",
+            ):
+
+                return {
+                    "success": False,
+                    "command_id": command_id,
+                    "status": status,
+                    "error": result.get("error"),
+                    "result": result.get("result"),
+                }
 
             await asyncio.sleep(poll_interval)
 
-        raise BrokerAdapterError(
-            f"Timed out waiting for MT5 command {command_id}; "
-            "execution state must be reconciled before retrying"
+        raise BrokerCommandTimeout(
+            "Command did not reach a verified terminal state. "
+            f"Command ID: {command_id}. "
+            "Reconcile broker positions before retrying."
         )
 
-    async def modify_position(
-        self,
-        account_id,
-        position_id,
-        stop_loss=None,
-        take_profit=None
-    ):
-        if stop_loss is None and take_profit is None:
-            raise ValueError(
-                "SL or TP must be supplied"
-            )
-
-        command = {
-            "type": "modify_position",
-            "position_id": str(position_id),
-            "stop_loss": stop_loss,
-            "take_profit": take_profit
-        }
-
-        return await self.execute_and_wait(
-            account_id,
-            command
-        )
-
-    async def close_position(self, account_id, position_id):
-        command = {
-            "type": "close_position",
-            "position_id": str(position_id)
-        }
-
-        return await self.execute_and_wait(
-            account_id,
-            command
-        )
-
-    async def partially_close_position(
-        self,
-        account_id,
-        position_id,
-        volume
-    ):
-        volume = float(volume)
-
-        if volume <= 0:
-            raise ValueError(
-                "Partial close volume must be positive"
-            )
-
-        command = {
-            "type": "partial_close",
-            "position_id": str(position_id),
-            "volume": volume
-        }
-
-        return await self.execute_and_wait(
-            account_id,
-            command
-        )
+    # --------------------------------------------------------
+    # ORDER OPENING
+    # --------------------------------------------------------
 
     async def open_market_position(
         self,
-        account_id,
-        symbol,
-        direction,
-        volume,
-        stop_loss=None,
-        take_profit=None
-    ):
-        direction = str(direction).upper()
-        volume = float(volume)
+        symbol: str,
+        direction: str,
+        volume: float,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        position_number: Optional[int] = None,
+        comment: Optional[str] = None,
+    ) -> dict[str, Any]:
+
+        direction = direction.upper()
 
         if direction not in ("BUY", "SELL"):
             raise ValueError(
-                "Direction must be BUY or SELL"
+                "direction must be BUY or SELL"
             )
+
+        if not symbol:
+            raise ValueError("symbol is required")
 
         if volume <= 0:
-            raise ValueError(
-                "Volume must be positive"
-            )
+            raise ValueError("volume must be positive")
 
         command = {
-            "type": "open_market_position",
-            "symbol": str(symbol),
+            "action": "open_market_position",
+            "symbol": symbol,
             "direction": direction,
             "volume": volume,
             "stop_loss": stop_loss,
-            "take_profit": take_profit
+            "take_profit": take_profit,
+            "position_number": position_number,
+            "comment": comment,
         }
 
-        return await self.execute_and_wait(
-            account_id,
-            command
+        return await self.execute_and_wait(command)
+
+    # --------------------------------------------------------
+    # MODIFY POSITION
+    # --------------------------------------------------------
+
+    async def modify_position(
+        self,
+        position_id: int | str,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+    ) -> dict[str, Any]:
+
+        if not position_id:
+            raise ValueError("position_id is required")
+
+        command = {
+            "action": "modify_position",
+            "position_id": str(position_id),
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+        }
+
+        return await self.execute_and_wait(command)
+
+    # --------------------------------------------------------
+    # CLOSE POSITION
+    # --------------------------------------------------------
+
+    async def close_position(
+        self,
+        position_id: int | str,
+    ) -> dict[str, Any]:
+
+        if not position_id:
+            raise ValueError("position_id is required")
+
+        command = {
+            "action": "close_position",
+            "position_id": str(position_id),
+        }
+
+        return await self.execute_and_wait(command)
+
+    # --------------------------------------------------------
+    # PARTIAL CLOSE
+    # --------------------------------------------------------
+
+    async def partially_close_position(
+        self,
+        position_id: int | str,
+        volume: float,
+    ) -> dict[str, Any]:
+
+        if not position_id:
+            raise ValueError("position_id is required")
+
+        if volume <= 0:
+            raise ValueError("volume must be positive")
+
+        command = {
+            "action": "partial_close",
+            "position_id": str(position_id),
+            "volume": volume,
+        }
+
+        return await self.execute_and_wait(command)
+
+    # --------------------------------------------------------
+    # GENERIC ACTION ROUTER
+    # --------------------------------------------------------
+
+    async def execute_action(
+        self,
+        action: dict[str, Any],
+    ) -> dict[str, Any]:
+
+        if not isinstance(action, dict):
+            raise ValueError("action must be a dictionary")
+
+        action_type = (
+            action.get("action")
+            or action.get("type")
         )
 
-    async def execute_action(self, account_id, action):
-        if not isinstance(action, dict):
-            raise ValueError("Action must be a dictionary")
+        if action_type == "open_market_position":
+            return await self.open_market_position(
+                symbol=action["symbol"],
+                direction=action["direction"],
+                volume=float(action["volume"]),
+                stop_loss=action.get("stop_loss"),
+                take_profit=action.get("take_profit"),
+                position_number=action.get("position_number"),
+                comment=action.get("comment"),
+            )
 
-        action_type = str(
-            action.get("type", action.get("action", ""))
-        ).lower()
-
-        position_id = action.get("position_id")
-
-        if action_type in ("modify", "modify_position"):
+        if action_type == "modify_position":
             return await self.modify_position(
-                account_id,
-                position_id,
-                action.get("stop_loss"),
-                action.get("take_profit")
+                position_id=action["position_id"],
+                stop_loss=action.get("stop_loss"),
+                take_profit=action.get("take_profit"),
             )
 
-        if action_type in ("close", "close_position"):
+        if action_type == "close_position":
             return await self.close_position(
-                account_id,
-                position_id
+                position_id=action["position_id"],
             )
 
-        if action_type in (
-            "partial_close",
-            "partially_close_position"
-        ):
+        if action_type == "partial_close":
             return await self.partially_close_position(
-                account_id,
-                position_id,
-                action.get("volume")
-            )
-
-        if action_type in ("buy", "open_buy"):
-            return await self.open_market_position(
-                account_id,
-                action["symbol"],
-                "BUY",
-                action["volume"],
-                action.get("stop_loss"),
-                action.get("take_profit")
-            )
-
-        if action_type in ("sell", "open_sell"):
-            return await self.open_market_position(
-                account_id,
-                action["symbol"],
-                "SELL",
-                action["volume"],
-                action.get("stop_loss"),
-                action.get("take_profit")
+                position_id=action["position_id"],
+                volume=float(action["volume"]),
             )
 
         raise ValueError(
-            f"Unsupported MT5 action: {action_type}"
+            f"Unsupported broker action: {action_type}"
         )
 
-    async def get_broker_snapshot(self, account_id):
-        """
-        Retrieve both positions and account information.
+    # --------------------------------------------------------
+    # CLIENT SHUTDOWN
+    # --------------------------------------------------------
 
-        A failed request is not treated as an empty account.
-        """
-        positions, information = await asyncio.gather(
-            self.get_positions(account_id),
-            self.get_account_information(account_id)
+    async def close(self):
+        self._closed = True
+
+
+# ============================================================
+# MULTI-ACCOUNT ADAPTER REGISTRY
+# ============================================================
+
+class MetaTraderBrokerAdapter:
+    """
+    Maintains isolated bridge clients for multiple MT5 accounts.
+
+    The class name is retained for compatibility with earlier
+    controller imports. It does not use MetaApi.
+    """
+
+    def __init__(self):
+        self._clients: dict[str, MT5BridgeClient] = {}
+        self._registry_lock = asyncio.Lock()
+
+    async def register_account(
+        self,
+        account_id: str,
+        bridge_url: str,
+        api_key: str,
+        timeout: float = 10.0,
+    ) -> MT5BridgeClient:
+
+        if not account_id:
+            raise ValueError("account_id is required")
+
+        async with self._registry_lock:
+
+            existing = self._clients.get(account_id)
+
+            if existing is not None:
+                await existing.close()
+
+            client = MT5BridgeClient(
+                account_id=account_id,
+                bridge_url=bridge_url,
+                api_key=api_key,
+                timeout=timeout,
+            )
+
+            self._clients[account_id] = client
+
+            return client
+
+    async def get_account_client(
+        self,
+        account_id: str,
+    ) -> MT5BridgeClient:
+
+        client = self._clients.get(account_id)
+
+        if client is None:
+            raise BrokerConnectionError(
+                f"No MT5 bridge registered for account {account_id}"
+            )
+
+        return client
+
+    async def remove_account(
+        self,
+        account_id: str,
+    ):
+
+        async with self._registry_lock:
+
+            client = self._clients.pop(
+                account_id,
+                None
+            )
+
+            if client is not None:
+                await client.close()
+
+    async def health_check(
+        self,
+        account_id: str,
+    ):
+
+        client = await self.get_account_client(
+            account_id
         )
 
-        return {
-            "account_id": str(account_id),
-            "positions": positions,
-            "account_information": information,
-            "snapshot_valid": True
-        }
+        return await client.health_check()
+
+    async def get_positions(
+        self,
+        account_id: str,
+    ):
+
+        client = await self.get_account_client(
+            account_id
+        )
+
+        return await client.get_positions()
+
+    async def get_account_information(
+        self,
+        account_id: str,
+    ):
+
+        client = await self.get_account_client(
+            account_id
+        )
+
+        return await client.get_account_information()
+
+    async def get_symbol_price(
+        self,
+        account_id: str,
+        symbol: str,
+    ):
+
+        client = await self.get_account_client(
+            account_id
+        )
+
+        return await client.get_symbol_price(
+            symbol
+        )
+
+    async def get_broker_snapshot(
+        self,
+        account_id: str,
+        symbol: Optional[str] = None,
+    ):
+
+        client = await self.get_account_client(
+            account_id
+        )
+
+        return await client.get_broker_snapshot(
+            symbol
+        )
+
+    async def execute_action(
+        self,
+        account_id: str,
+        action: dict[str, Any],
+    ):
+
+        client = await self.get_account_client(
+            account_id
+        )
+
+        return await client.execute_action(
+            action
+        )
+
+    async def close(self):
+
+        async with self._registry_lock:
+
+            clients = list(
+                self._clients.values()
+            )
+
+            self._clients.clear()
+
+        await asyncio.gather(
+            *[
+                client.close()
+                for client in clients
+            ],
+            return_exceptions=True,
+        )
 
 
-# Compatibility alias for modules using the earlier class name.
+# Compatibility alias for existing imports.
 BrokerAdapter = MetaTraderBrokerAdapter
