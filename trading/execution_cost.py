@@ -2,15 +2,17 @@
 """
 Gold Scalper AI — Adaptive Execution Cost Assessment
 
-Purpose:
-- Estimate total trading cost.
-- Compare cost with expected opportunity.
-- Avoid entries where costs consume too much of the opportunity.
-- Avoid fixed spread-pip ceilings.
+Compatible with the repository's existing risk engine:
+    cost_ratio(spread, commission_equivalent, expected_move)
+    acceptable_cost(spread, commission_equivalent, expected_move, max_ratio)
+
+Also supports adaptive intelligence:
+    slippage estimates
+    detailed cost assessment
+    opportunity-relative cost evaluation
 
 All monetary inputs must use the same account currency.
-For example, if expected_move is USD, spread, commission and slippage
-must also be expressed in USD.
+No fixed spread-pips ceiling is used.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from math import isfinite
 
 
 @dataclass(frozen=True)
-class ExecutionCostEstimate:
+class ExecutionCostAssessment:
     spread_cost: float
     commission_cost: float
     slippage_cost: float
@@ -28,10 +30,10 @@ class ExecutionCostEstimate:
     expected_move: float
     cost_ratio: float
     net_expected_reward: float
-    worthwhile: bool
+    acceptable: bool
 
 
-def _valid_nonnegative(value: float, name: str) -> float:
+def _nonnegative(value: float, name: str) -> float:
     value = float(value)
 
     if not isfinite(value):
@@ -44,27 +46,24 @@ def _valid_nonnegative(value: float, name: str) -> float:
 
 
 def cost_ratio(
-    spread: float,
-    commission: float,
-    expected_move: float,
-    slippage: float = 0.0,
-) -> float:
+    spread,
+    commission_equivalent,
+    expected_move,
+    slippage=0.0,
+):
     """
-    Calculate total execution cost relative to expected favorable movement.
+    Calculate estimated execution cost / expected favorable movement.
 
-    Returns:
-        0.0 when costs are zero and expected move is positive.
-        A finite ratio when expected move is positive.
-        Infinity when expected move is zero or negative.
+    Returns infinity when expected_move is zero or negative.
 
-    Example:
-        Costs = $0.30
-        Expected move = $1.00
-        Ratio = 0.30, meaning costs consume 30% of expected movement.
+    Existing three-argument calls remain valid.
     """
-    spread = _valid_nonnegative(spread, "spread")
-    commission = _valid_nonnegative(commission, "commission")
-    slippage = _valid_nonnegative(slippage, "slippage")
+    spread = _nonnegative(spread, "spread")
+    commission_equivalent = _nonnegative(
+        commission_equivalent,
+        "commission_equivalent",
+    )
+    slippage = _nonnegative(slippage, "slippage")
 
     expected_move = float(expected_move)
 
@@ -74,38 +73,70 @@ def cost_ratio(
     if expected_move <= 0:
         return float("inf")
 
-    total_cost = spread + commission + slippage
+    total_cost = (
+        spread
+        + commission_equivalent
+        + slippage
+    )
 
     return total_cost / expected_move
 
 
-def estimate_execution_cost(
-    spread_cost: float,
-    commission_cost: float,
-    expected_move: float,
-    slippage_cost: float = 0.0,
-    maximum_cost_ratio: float = 0.30,
-) -> ExecutionCostEstimate:
+def acceptable_cost(
+    spread,
+    commission_equivalent,
+    expected_move,
+    max_ratio=0.30,
+    slippage=0.0,
+):
     """
-    Produce a complete cost assessment for a potential entry.
+    Compatibility function used by the existing risk engine.
 
-    maximum_cost_ratio is a configurable account/product policy.
-    It is not a spread-pips restriction.
-
-    The caller should provide a realistic expected_move estimate from
-    market intelligence and should not treat it as guaranteed profit.
+    The ratio is relative to expected opportunity, not a fixed pip limit.
     """
-    spread_cost = _valid_nonnegative(
+    max_ratio = float(max_ratio)
+
+    if (
+        not isfinite(max_ratio)
+        or max_ratio <= 0
+        or max_ratio > 1
+    ):
+        raise ValueError("max_ratio_must_be_between_0_and_1")
+
+    ratio = cost_ratio(
+        spread=spread,
+        commission_equivalent=commission_equivalent,
+        expected_move=expected_move,
+        slippage=slippage,
+    )
+
+    return ratio <= max_ratio
+
+
+def assess_execution_cost(
+    spread_cost,
+    commission_cost,
+    expected_move,
+    slippage_cost=0.0,
+    max_cost_ratio=0.30,
+):
+    """
+    Return a detailed execution-cost assessment for market intelligence.
+
+    The caller must estimate expected_move conservatively.
+    It is an estimate, not a guaranteed profit.
+    """
+    spread_cost = _nonnegative(
         spread_cost,
         "spread_cost",
     )
 
-    commission_cost = _valid_nonnegative(
+    commission_cost = _nonnegative(
         commission_cost,
         "commission_cost",
     )
 
-    slippage_cost = _valid_nonnegative(
+    slippage_cost = _nonnegative(
         slippage_cost,
         "slippage_cost",
     )
@@ -115,14 +146,14 @@ def estimate_execution_cost(
     if not isfinite(expected_move):
         raise ValueError("expected_move_must_be_finite")
 
-    maximum_cost_ratio = float(maximum_cost_ratio)
+    max_cost_ratio = float(max_cost_ratio)
 
     if (
-        not isfinite(maximum_cost_ratio)
-        or maximum_cost_ratio <= 0
-        or maximum_cost_ratio > 1
+        not isfinite(max_cost_ratio)
+        or max_cost_ratio <= 0
+        or max_cost_ratio > 1
     ):
-        raise ValueError("maximum_cost_ratio_must_be_between_0_and_1")
+        raise ValueError("max_cost_ratio_must_be_between_0_and_1")
 
     total_cost = (
         spread_cost
@@ -132,20 +163,20 @@ def estimate_execution_cost(
 
     ratio = cost_ratio(
         spread=spread_cost,
-        commission=commission_cost,
-        slippage=slippage_cost,
+        commission_equivalent=commission_cost,
         expected_move=expected_move,
+        slippage=slippage_cost,
     )
 
     net_expected_reward = expected_move - total_cost
 
-    worthwhile = (
+    acceptable = (
         expected_move > 0
-        and ratio <= maximum_cost_ratio
+        and ratio <= max_cost_ratio
         and net_expected_reward > 0
     )
 
-    return ExecutionCostEstimate(
+    return ExecutionCostAssessment(
         spread_cost=spread_cost,
         commission_cost=commission_cost,
         slippage_cost=slippage_cost,
@@ -153,29 +184,5 @@ def estimate_execution_cost(
         expected_move=expected_move,
         cost_ratio=ratio,
         net_expected_reward=net_expected_reward,
-        worthwhile=worthwhile,
+        acceptable=acceptable,
     )
-
-
-def assess_entry_cost(
-    spread_cost: float,
-    commission_cost: float,
-    expected_move: float,
-    slippage_cost: float = 0.0,
-    maximum_cost_ratio: float = 0.30,
-) -> bool:
-    """
-    Simple compatibility helper for entry filters.
-
-    Returns True only when the expected opportunity reasonably covers
-    the estimated execution costs.
-    """
-    assessment = estimate_execution_cost(
-        spread_cost=spread_cost,
-        commission_cost=commission_cost,
-        slippage_cost=slippage_cost,
-        expected_move=expected_move,
-        maximum_cost_ratio=maximum_cost_ratio,
-    )
-
-    return assessment.worthwhile
