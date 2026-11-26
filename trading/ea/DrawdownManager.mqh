@@ -1,16 +1,35 @@
+
 #ifndef GOLD_DRAWDOWN_MANAGER
 #define GOLD_DRAWDOWN_MANAGER
+
 class CDrawdownManager
 {
 public:
- bool AccountDrawdownExceeded(double equity,double balance,double limitPercent)
- {
-   if(balance<=0.0 || limitPercent<=0.0)return false;
-   return ((balance-equity)/balance*100.0)>=limitPercent;
- }
- bool BasketLossExceeded(double basketProfit,double maxLossCurrency)
- {
-   return maxLossCurrency>0.0 && basketProfit<=-maxLossCurrency;
- }
+
+   // Account percentage drawdown is not used as an automatic
+   // trading breaker in this strategy.
+   //
+   // Retained for compatibility with AccountRiskMonitor.mqh.
+   bool AccountDrawdownExceeded(
+      double equity,
+      double balance,
+      double limitPercent
+   )
+   {
+      return false;
+   }
+
+   // Keep the separately configured basket-loss protection.
+   bool BasketLossExceeded(
+      double basketProfit,
+      double maxLossCurrency
+   )
+   {
+      if(maxLossCurrency <= 0.0)
+         return false;
+
+      return basketProfit <= -maxLossCurrency;
+   }
 };
+
 #endif
