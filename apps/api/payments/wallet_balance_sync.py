@@ -1,11 +1,13 @@
-
 """Fetch and record Flutterwave v3 merchant wallet balance observations."""
+
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
+
 import requests
 from flask import current_app
+
 from ..extensions import db
-from ..models import Wallet, WalletBalanceSnapshot, WalletReconciliation
+from ..models import WalletBalanceSnapshot, WalletReconciliation
 
 
 def read_flutterwave_balances():
@@ -99,16 +101,15 @@ def record_provider_balance(
     ):
         raise ValueError("invalid_provider_balance")
 
-    wallet = Wallet.query.filter_by(
-        owner_user_id=None,
-        currency=currency,
-    ).first()
+    # Retrieve or create the merchant ledger wallet for this currency.
+    from .wallet_service import merchant_wallet
 
-    ledger = Decimal(
-        wallet.ledger_balance if wallet else 0
-    )
+    wallet = merchant_wallet(currency)
 
-    snap = WalletBalanceSnapshot(
+    ledger = Decimal(str(wallet.ledger_balance or 0))
+
+    snapshot = WalletBalanceSnapshot(
+        wallet_id=wallet.id,
         currency=currency,
         provider_balance=amount,
         available_balance=available,
@@ -117,7 +118,13 @@ def record_provider_balance(
         checked_at=datetime.now(timezone.utc),
     )
 
-    rec = WalletReconciliation(
+    db.session.add(snapshot)
+
+    # Obtain the snapshot ID before creating its reconciliation record.
+    db.session.flush()
+
+    reconciliation = WalletReconciliation(
+        snapshot_id=snapshot.id,
         currency=currency,
         provider_balance=amount,
         ledger_balance=ledger,
@@ -128,19 +135,19 @@ def record_provider_balance(
             else "UNMATCHED"
         ),
         note=(
-            "Provider ledger balance observed; settlement, "
-            "fees, refunds and transfers may explain differences."
+            "Provider ledger balance observed; settlement, fees, "
+            "refunds and transfers may explain differences."
         ),
     )
 
-    db.session.add_all([snap, rec])
+    db.session.add(reconciliation)
     db.session.commit()
 
-    return snap, rec
+    return snapshot, reconciliation
 
 
 def configured_balance_reader():
-    """Return the verified v3 reader unless a test/deployment adapter is injected."""
+    """Return the verified reader unless a test/deployment adapter is injected."""
     reader = current_app.extensions.get(
         "merchant_balance_reader"
     )
@@ -152,10 +159,22 @@ def configured_balance_reader():
 
 
 def sync_all_provider_balances():
-    balances = read_flutterwave_balances()
+    reader = configured_balance_reader()
+    balances = reader()
+
+    if not isinstance(balances, dict) or not balances:
+        raise RuntimeError(
+            "flutterwave_balance_currency_list_empty"
+        )
+
     snapshots = []
 
     for currency, values in balances.items():
+        if not isinstance(values, dict):
+            raise RuntimeError(
+                "flutterwave_balance_response_invalid"
+            )
+
         snapshots.append(
             record_provider_balance(
                 currency,
