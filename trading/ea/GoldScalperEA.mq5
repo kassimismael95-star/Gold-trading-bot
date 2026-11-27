@@ -1,6 +1,6 @@
 
 #property strict
-#property version "1.04"
+#property version "1.05"
 #property description "Gold Scalper EA - original entries; independent post-entry intelligence; demo and authorized live"
 
 #include <Trade/Trade.mqh>
@@ -29,11 +29,8 @@ input string InpAccountToken="PASTE_ACCOUNT_TOKEN_HERE";
 input string InpSymbol="AUTO";
 input long InpMagic=9924102;
 
-// The required mode prevents accidentally attaching the real
-// configuration to a demo terminal, or vice versa.
 input ENUM_ACCOUNT_TRADE_MODE InpRequiredAccountMode=ACCOUNT_TRADE_MODE_DEMO;
 
-// Both switches must be true for real-money trading.
 input bool InpAllowLiveTrading=false;
 input bool InpConfirmRealMoneyTrading=false;
 
@@ -65,7 +62,13 @@ CExitManager exitManager;
 // STATE
 //+------------------------------------------------------------------+
 
+// Effective permission to open new entries.
 bool g_enabled=false;
+
+// Explicit local/backend START intent.
+// This is deliberately separate from g_enabled.
+bool g_startRequested=false;
+
 bool g_emergency=false;
 bool g_closeAllRequested=false;
 bool g_riskLocked=false;
@@ -109,7 +112,6 @@ string AccountModeName()
 }
 
 // Local permission is independent of backend permission.
-// The backend must authorize the account as well.
 bool LocalEntryAuthorization()
 {
    ENUM_ACCOUNT_TRADE_MODE actualMode=
@@ -135,6 +137,19 @@ bool LocalEntryAuthorization()
       return false;
 
    return true;
+}
+
+// Recalculate effective entry permission without changing
+// the explicit START/STOP intent.
+void RefreshEntryPermission(bool backendAllowed)
+{
+   g_enabled=
+      g_startRequested &&
+      backendAllowed &&
+      LocalEntryAuthorization() &&
+      !g_riskLocked &&
+      !g_emergency &&
+      !g_closeAllRequested;
 }
 
 //+------------------------------------------------------------------+
@@ -259,9 +274,16 @@ int OnInit()
       g_emergency=true;
    }
 
+   // Store the requested start state separately.
+   // Backend permission will be checked by PollCommands().
+   g_startRequested=InpStartEnabled;
+
    g_enabled=
-      InpStartEnabled &&
-      LocalEntryAuthorization();
+      g_startRequested &&
+      LocalEntryAuthorization() &&
+      !g_riskLocked &&
+      !g_emergency &&
+      !g_closeAllRequested;
 
    int timerSeconds=(int)MathMax(1,InpPollSeconds);
 
@@ -287,6 +309,7 @@ int OnInit()
       " Account mode=",AccountModeName(),
       " Local live authorization=",
       (IsRealAccount() ? LocalEntryAuthorization() : false),
+      " Start requested=",g_startRequested,
       " Entries enabled=",g_enabled
    );
 
@@ -333,7 +356,6 @@ void OnTimer()
    }
 
    // Manual close-all is handled on the timer as well as on ticks.
-   // This prevents the command waiting indefinitely for a new tick.
    if(g_closeAllRequested && g_symbol!="")
    {
       exitManager.CloseAll(
@@ -345,6 +367,8 @@ void OnTimer()
       if(positionTracker.Count(g_symbol,InpMagic)==0)
       {
          g_closeAllRequested=false;
+         g_startRequested=false;
+         g_enabled=false;
 
          GlobalVariableSet(
             "GoldCloseAll_"+(string)InpAccountId,
@@ -387,6 +411,9 @@ void OnTick()
 
    // Position management is performed by OnTimer.
    // New entries are handled here only.
+
+   if(!g_enabled)
+      return;
 
    if(g_closeAllRequested)
       return;
@@ -560,8 +587,6 @@ void OnTick()
       );
    }
 
-   // An accepted order is not automatically a filled position.
-   // PLACED is deliberately not treated as a confirmed execution.
    if(confirmedFill)
    {
       if(currentBar>0)
@@ -628,9 +653,17 @@ bool EntryDealExists(
    if(!HistorySelect(now-600,now+60))
       return false;
 
+   // A direct deal-ticket match must also belong to this order
+   // when an order ticket is available.
    if(dealTicket>0)
    {
+      bool orderMatches=
+         orderTicket==0 ||
+         HistoryDealGetInteger(dealTicket,DEAL_ORDER)==
+         (long)orderTicket;
+
       if(
+         orderMatches &&
          HistoryDealGetInteger(dealTicket,DEAL_MAGIC)==InpMagic &&
          HistoryDealGetString(dealTicket,DEAL_SYMBOL)==g_symbol
       )
@@ -733,8 +766,6 @@ bool SaveConfirmedEntryContext(
       return false;
    }
 
-   // Deal fills may create more than one position identifier.
-   // Aggregate each identifier separately.
    ulong positionIds[];
    double totalVolumes[];
    double weightedPrices[];
@@ -863,8 +894,8 @@ bool SaveConfirmedEntryContext(
       double averageEntry=
          weightedPrices[n]/fillVolume;
 
-      // Never overwrite the original context of a position
-      // already being managed.
+      // Preserve the first stored context. Do not overwrite it
+      // with a later add-on deal.
       if(
          tradeRecovery.HasEntryContext(
             InpAccountId,
@@ -935,8 +966,9 @@ bool SaveConfirmedEntryContext(
          continue;
       }
 
-      // Do not create an incorrect original context when a netting
-      // position already contained older volume.
+      // On netting accounts, a new fill can merge into an older
+      // position. Never invent an original context from only the
+      // newest fill. If volumes differ, leave context unsaved.
       double volumeTolerance=
          MathMax(
             SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_STEP)*0.5,
@@ -950,7 +982,8 @@ bool SaveConfirmedEntryContext(
       {
          Print(
             "Context not saved: current net position volume differs ",
-            "from this order's confirmed fills. Position ID=",
+            "from this order's confirmed fills. Existing broker SL/TP ",
+            "remain in place. Position ID=",
             positionId
          );
 
@@ -1019,8 +1052,6 @@ bool SaveConfirmedEntryContext(
 
 string ResolveGoldSymbol(string requested)
 {
-   // An explicitly requested symbol must not silently fall back
-   // to another instrument.
    if(requested!="AUTO")
    {
       if(!SymbolSelect(requested,true))
@@ -1260,6 +1291,7 @@ void PollCommands()
 
       if(commandName=="CLOSE_ALL")
       {
+         g_startRequested=false;
          g_enabled=false;
          g_emergency=true;
          g_closeAllRequested=true;
@@ -1281,25 +1313,46 @@ void PollCommands()
       }
       else if(commandName=="START")
       {
-         if(!g_riskLocked && LocalEntryAuthorization())
+         if(
+            LocalEntryAuthorization() &&
+            !g_riskLocked &&
+            !g_closeAllRequested
+         )
          {
+            g_startRequested=true;
             g_emergency=false;
 
             GlobalVariableSet(
                "GoldEmergency_"+(string)InpAccountId,
                0.0
             );
+
+            result=
+               "{\"accepted\":true,\"start_requested\":true}";
+         }
+         else
+         {
+            g_startRequested=false;
+
+            result=
+               "{\"accepted\":false,\"reason\":\"local_authorization_or_safety_lock\"}";
          }
 
          applied=true;
       }
       else if(commandName=="STOP")
       {
+         g_startRequested=false;
          g_enabled=false;
+
+         result=
+            "{\"stopped\":true,\"new_entries_disabled\":true,\"existing_positions_still_managed\":true}";
+
          applied=true;
       }
       else if(commandName=="EMERGENCY_STOP")
       {
+         g_startRequested=false;
          g_emergency=true;
          g_enabled=false;
 
@@ -1307,6 +1360,9 @@ void PollCommands()
             "GoldEmergency_"+(string)InpAccountId,
             1.0
          );
+
+         result=
+            "{\"emergency_stop\":true,\"new_entries_disabled\":true,\"existing_positions_still_managed\":true}";
 
          applied=true;
       }
@@ -1318,6 +1374,13 @@ void PollCommands()
             "GoldRiskLock_"+(string)InpAccountId,
             0.0
          );
+
+         // Risk reset does not automatically restart entries.
+         // A separate START command is required.
+         g_enabled=false;
+
+         result=
+            "{\"risk_lock_cleared\":true,\"start_required\":true}";
 
          applied=true;
       }
@@ -1359,21 +1422,19 @@ void PollCommands()
    )
    {
       bool backendAllowed=
-         StringFind(
+         JsonBoolValue(
             permission,
-            "\"entries_allowed\":true"
-         )>=0;
+            "entries_allowed",
+            false
+         );
 
-      g_enabled=
-         backendAllowed &&
-         LocalEntryAuthorization() &&
-         !g_riskLocked &&
-         !g_emergency;
+      RefreshEntryPermission(backendAllowed);
    }
    else
    {
       // Fail closed for new entries.
-      // Open positions continue to be managed.
+      // Keep g_startRequested unchanged so a temporary backend
+      // outage does not erase the user's explicit START intent.
       g_enabled=false;
    }
 }
@@ -1406,8 +1467,6 @@ void SyncRecentDeals()
       if(deal==0)
          continue;
 
-      // HistoryDealGetTicket provides the deal ticket.
-      // Do not call HistoryDealSelect inside this indexed loop.
       if(HistoryDealGetInteger(deal,DEAL_MAGIC)!=InpMagic)
          continue;
 
