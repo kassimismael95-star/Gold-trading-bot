@@ -8,7 +8,11 @@ class CExitManager
 {
 private:
 
-   bool IsOurPosition(ulong ticket, string symbol, long magic)
+   bool IsOurPosition(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       if(ticket == 0)
          return false;
@@ -30,6 +34,15 @@ private:
       return !PositionSelectByTicket(ticket);
    }
 
+   bool IsSuccessfulRetcode(uint retcode)
+   {
+      return (
+         retcode == TRADE_RETCODE_DONE ||
+         retcode == TRADE_RETCODE_DONE_PARTIAL ||
+         retcode == TRADE_RETCODE_PLACED
+      );
+   }
+
 public:
 
    // Close one specific broker position.
@@ -40,6 +53,9 @@ public:
       long magic
    )
    {
+      if(ticket == 0)
+         return false;
+
       if(!IsOurPosition(ticket, symbol, magic))
          return IsClosed(ticket);
 
@@ -47,18 +63,29 @@ public:
 
       uint retcode = trade.ResultRetcode();
 
-      // Confirm the actual position state rather than trusting
-      // the local request result alone.
+      // Broker-side state is authoritative.
       if(IsClosed(ticket))
+      {
+         Print(
+            "Position closure confirmed. Ticket=",
+            ticket,
+            " Retcode=",
+            retcode
+         );
+
          return true;
+      }
 
       Print(
-         "Position remains open after close request. Ticket=",
+         "Position remains open after close request. ",
+         "Ticket=",
          ticket,
          " RequestAccepted=",
          requestAccepted,
          " Retcode=",
          retcode,
+         " SuccessfulRetcode=",
+         IsSuccessfulRetcode(retcode),
          " Description=",
          trade.ResultRetcodeDescription()
       );
@@ -75,7 +102,6 @@ public:
    {
       bool allClosed = true;
 
-      // Iterate backwards because closing positions changes the list.
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
          ulong ticket = PositionGetTicket(i);
@@ -114,6 +140,35 @@ public:
       }
 
       return allClosed;
+   }
+
+   // Check whether a specific position still belongs to this EA.
+   bool PositionIsManaged(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
+   {
+      return IsOurPosition(ticket, symbol, magic);
+   }
+
+   // Close a position only when its identity still matches.
+   bool CloseIfManaged(
+      CTrade &trade,
+      ulong ticket,
+      string symbol,
+      long magic
+   )
+   {
+      if(!IsOurPosition(ticket, symbol, magic))
+         return IsClosed(ticket);
+
+      return ClosePosition(
+         trade,
+         ticket,
+         symbol,
+         magic
+      );
    }
 };
 
