@@ -1290,12 +1290,53 @@ void PollCommands()
 
          applied=true;
       }
+      else if(commandName=="EMERGENCY_RESET")
+      {
+         // Reset never starts trading. It only clears the emergency
+         // latch when no CLOSE_ALL operation remains pending.
+         string closeKey="GoldCloseAll_"+(string)InpAccountId;
+         bool closeAllLatched=g_closeAllRequested;
+
+         if(
+            GlobalVariableCheck(closeKey) &&
+            GlobalVariableGet(closeKey)>0.5
+         )
+            closeAllLatched=true;
+
+         if(closeAllLatched)
+         {
+            g_startRequested=false;
+            g_enabled=false;
+
+            result=
+               "{\"accepted\":false,\"reason\":\"close_all_still_pending\"}";
+         }
+         else
+         {
+            g_startRequested=false;
+            g_emergency=false;
+            g_enabled=false;
+
+            GlobalVariableSet(
+               "GoldEmergency_"+(string)InpAccountId,
+               0.0
+            );
+
+            result=
+               "{\"emergency_lock_cleared\":true,\"start_required\":true,\"entries_enabled\":false}";
+
+            Print(
+               "EMERGENCY_RESET received. Emergency lock cleared. ",
+               "Trading remains stopped until a separate START command."
+            );
+         }
+
+         applied=true;
+      }
       else if(commandName=="RISK_RESET")
       {
-         // CRITICAL FIX:
          // Clear the previous START request as well as the risk lock.
-         // This prevents the permission refresh below from re-enabling
-         // entries using an old START request.
+         // A separate START command is required after this reset.
          g_startRequested=false;
 
          g_riskLocked=false;
@@ -1305,7 +1346,6 @@ void PollCommands()
             0.0
          );
 
-         // Effective entry permission remains disabled.
          g_enabled=false;
 
          result=
@@ -1329,6 +1369,13 @@ void PollCommands()
             "one_entry_per_m1_bar",
             g_oneEntryPerBar
          );
+
+         result=
+            "{\"settings_applied\":true,\"max_positions\":"+
+            (string)g_maxPositions+
+            ",\"one_entry_per_m1_bar\":"+
+            (g_oneEntryPerBar ? "true" : "false")+
+            "}";
 
          applied=true;
       }
