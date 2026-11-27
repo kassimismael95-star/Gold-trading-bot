@@ -1,6 +1,6 @@
 
 #property strict
-#property version "1.05"
+#property version "1.06"
 #property description "Gold Scalper EA - original entries; independent post-entry intelligence; demo and authorized live"
 
 #include <Trade/Trade.mqh>
@@ -62,11 +62,7 @@ CExitManager exitManager;
 // STATE
 //+------------------------------------------------------------------+
 
-// Effective permission to open new entries.
 bool g_enabled=false;
-
-// Explicit local/backend START intent.
-// This is deliberately separate from g_enabled.
 bool g_startRequested=false;
 
 bool g_emergency=false;
@@ -88,16 +84,14 @@ string g_symbol="";
 
 bool IsRealAccount()
 {
-   return
-      AccountInfoInteger(ACCOUNT_TRADE_MODE)==
-      ACCOUNT_TRADE_MODE_REAL;
+   return AccountInfoInteger(ACCOUNT_TRADE_MODE)==
+          ACCOUNT_TRADE_MODE_REAL;
 }
 
 bool IsDemoAccount()
 {
-   return
-      AccountInfoInteger(ACCOUNT_TRADE_MODE)==
-      ACCOUNT_TRADE_MODE_DEMO;
+   return AccountInfoInteger(ACCOUNT_TRADE_MODE)==
+          ACCOUNT_TRADE_MODE_DEMO;
 }
 
 string AccountModeName()
@@ -111,7 +105,6 @@ string AccountModeName()
    return "OTHER";
 }
 
-// Local permission is independent of backend permission.
 bool LocalEntryAuthorization()
 {
    ENUM_ACCOUNT_TRADE_MODE actualMode=
@@ -139,8 +132,7 @@ bool LocalEntryAuthorization()
    return true;
 }
 
-// Recalculate effective entry permission without changing
-// the explicit START/STOP intent.
+// Recalculate effective permission without changing START intent.
 void RefreshEntryPermission(bool backendAllowed)
 {
    g_enabled=
@@ -169,7 +161,7 @@ int OnInit()
    )
    {
       Print(
-         "Configure the API URL, account ID, account token ",
+         "Configure API URL, account ID, account token ",
          "and magic number before attaching the EA."
       );
 
@@ -186,8 +178,7 @@ int OnInit()
          "ACCOUNT MODE MISMATCH. Required=",
          (int)InpRequiredAccountMode,
          " Actual=",
-         (int)actualMode,
-         ". EA will not initialize on the wrong account."
+         (int)actualMode
       );
 
       return INIT_FAILED;
@@ -224,7 +215,7 @@ int OnInit()
 
    if(!trade.SetTypeFillingBySymbol(g_symbol))
    {
-      Print("Broker filling mode unavailable for symbol.");
+      Print("Broker filling mode unavailable.");
       return INIT_FAILED;
    }
 
@@ -244,14 +235,9 @@ int OnInit()
          currentBar
       );
 
-   string riskLockKey=
-      "GoldRiskLock_"+(string)InpAccountId;
-
-   string emergencyKey=
-      "GoldEmergency_"+(string)InpAccountId;
-
-   string closeKey=
-      "GoldCloseAll_"+(string)InpAccountId;
+   string riskLockKey="GoldRiskLock_"+(string)InpAccountId;
+   string emergencyKey="GoldEmergency_"+(string)InpAccountId;
+   string closeKey="GoldCloseAll_"+(string)InpAccountId;
 
    if(
       GlobalVariableCheck(riskLockKey) &&
@@ -274,8 +260,7 @@ int OnInit()
       g_emergency=true;
    }
 
-   // Store the requested start state separately.
-   // Backend permission will be checked by PollCommands().
+   // Never assume a previous START request survived a restart.
    g_startRequested=InpStartEnabled;
 
    g_enabled=
@@ -307,19 +292,9 @@ int OnInit()
       " Symbol=",g_symbol,
       " Account ID=",InpAccountId,
       " Account mode=",AccountModeName(),
-      " Local live authorization=",
-      (IsRealAccount() ? LocalEntryAuthorization() : false),
       " Start requested=",g_startRequested,
       " Entries enabled=",g_enabled
    );
-
-   if(IsRealAccount() && !LocalEntryAuthorization())
-   {
-      Print(
-         "REAL ACCOUNT DETECTED: entries remain disabled until ",
-         "both live authorization inputs and backend permission are enabled."
-      );
-   }
 
    return INIT_SUCCEEDED;
 }
@@ -335,15 +310,14 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-// TIMER: MANAGEMENT, COMMANDS AND HEARTBEAT
+// TIMER
 //+------------------------------------------------------------------+
 
 void OnTimer()
 {
-   // Backend commands and account permission.
    PollCommands();
 
-   // Existing positions remain managed even when entries are stopped.
+   // Continue managing existing positions even when entries stop.
    if(g_symbol!="")
    {
       positionManager.Manage(
@@ -355,7 +329,6 @@ void OnTimer()
       );
    }
 
-   // Manual close-all is handled on the timer as well as on ticks.
    if(g_closeAllRequested && g_symbol!="")
    {
       exitManager.CloseAll(
@@ -375,7 +348,7 @@ void OnTimer()
             0.0
          );
 
-         Print("Close-all request completed: no matching positions remain.");
+         Print("Close-all completed.");
       }
    }
 
@@ -406,16 +379,12 @@ void OnTick()
    if(!SymbolInfoTick(g_symbol,tick))
       return;
 
-   // Preserve original signal observation.
    signalEngine.Observe(tick.bid,tick.ask);
-
-   // Position management is performed by OnTimer.
-   // New entries are handled here only.
 
    if(!g_enabled)
       return;
 
-   if(g_closeAllRequested)
+   if(g_closeAllRequested || g_emergency || g_riskLocked)
       return;
 
    if(!LocalEntryAuthorization())
@@ -466,14 +435,12 @@ void OnTick()
    )
       return;
 
-   // ORIGINAL SIGNAL ENGINE: unchanged.
    int confidence=0;
    ENUM_ORDER_TYPE side;
 
    if(!signalEngine.GetSignal(side,confidence))
       return;
 
-   // Respect broker-supported direction.
    if(!brokerSpecification.AllowsDirection(side))
       return;
 
@@ -486,7 +453,6 @@ void OnTick()
    )
       return;
 
-   // ORIGINAL EQUITY-BASED LOT CALCULATION.
    double volume=riskManager.VolumeForPosition(
       g_symbol,
       equity,
@@ -517,12 +483,10 @@ void OnTick()
       return;
 
    double spreadPips=spreadPrice/goldPipSize;
-
    double recentMovement=signalEngine.RecentMovement();
 
    int positionNumber=positions+1;
 
-   // ORIGINAL STOP/TARGET STRATEGY: unchanged.
    if(
       !riskManager.BuildStops(
          g_symbol,
@@ -542,7 +506,6 @@ void OnTick()
       return;
    }
 
-   // ORIGINAL BUY/SELL EXECUTION.
    bool ok=
       (side==ORDER_TYPE_BUY)
       ?
@@ -609,17 +572,15 @@ void OnTick()
    else if(retcode==TRADE_RETCODE_PLACED)
    {
       Print(
-         "Broker accepted the order but has not confirmed a fill yet. ",
-         "Order=",
+         "Order accepted but fill not yet confirmed. Order=",
          orderTicket
       );
    }
    else if(ok)
    {
       Print(
-         "Trade request returned without a confirmed matching entry deal. ",
-         "Retcode=",
-         retcode
+         "Trade request returned without confirmed matching deal. ",
+         "Retcode=",retcode
       );
    }
 
@@ -636,7 +597,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-// CONFIRM A BROKER ENTRY DEAL
+// CONFIRM ENTRY DEAL
 //+------------------------------------------------------------------+
 
 bool EntryDealExists(
@@ -647,14 +608,9 @@ bool EntryDealExists(
 {
    datetime now=TimeCurrent();
 
-   if(now<=0)
+   if(now<=0 || !HistorySelect(now-600,now+60))
       return false;
 
-   if(!HistorySelect(now-600,now+60))
-      return false;
-
-   // A direct deal-ticket match must also belong to this order
-   // when an order ticket is available.
    if(dealTicket>0)
    {
       bool orderMatches=
@@ -744,8 +700,7 @@ bool EntryDealExists(
 }
 
 //+------------------------------------------------------------------+
-// SAVE BROKER-CONFIRMED ORIGINAL ENTRY CONTEXT
-// Aggregates partial fills belonging to the same position ID.
+// SAVE BROKER-CONFIRMED ENTRY CONTEXT
 //+------------------------------------------------------------------+
 
 bool SaveConfirmedEntryContext(
@@ -757,10 +712,7 @@ bool SaveConfirmedEntryContext(
 {
    datetime now=TimeCurrent();
 
-   if(now<=0)
-      return false;
-
-   if(!HistorySelect(now-600,now+60))
+   if(now<=0 || !HistorySelect(now-600,now+60))
    {
       Print("Cannot read recent deal history.");
       return false;
@@ -872,11 +824,7 @@ bool SaveConfirmedEntryContext(
 
    if(ArraySize(positionIds)==0)
    {
-      Print(
-         "No matching broker entry deals found for order ",
-         orderTicket
-      );
-
+      Print("No matching broker entry deals found.");
       return false;
    }
 
@@ -891,11 +839,8 @@ bool SaveConfirmedEntryContext(
       if(fillVolume<=0.0)
          continue;
 
-      double averageEntry=
-         weightedPrices[n]/fillVolume;
+      double averageEntry=weightedPrices[n]/fillVolume;
 
-      // Preserve the first stored context. Do not overwrite it
-      // with a later add-on deal.
       if(
          tradeRecovery.HasEntryContext(
             InpAccountId,
@@ -931,8 +876,7 @@ bool SaveConfirmedEntryContext(
          if(PositionGetString(POSITION_SYMBOL)!=g_symbol)
             continue;
 
-         long positionType=
-            PositionGetInteger(POSITION_TYPE);
+         long positionType=PositionGetInteger(POSITION_TYPE);
 
          if(
             side==ORDER_TYPE_BUY &&
@@ -958,33 +902,26 @@ bool SaveConfirmedEntryContext(
 
       if(!foundPosition)
       {
-         Print(
-            "Position not found after confirmed fill. ID=",
-            positionId
-         );
-
+         Print("Position not found after confirmed fill. ID=",positionId);
          continue;
       }
 
-      // On netting accounts, a new fill can merge into an older
-      // position. Never invent an original context from only the
-      // newest fill. If volumes differ, leave context unsaved.
       double volumeTolerance=
          MathMax(
             SymbolInfoDouble(g_symbol,SYMBOL_VOLUME_STEP)*0.5,
             0.00000001
          );
 
+      // Conservative netting handling:
+      // do not fabricate original context for a merged position.
       if(
          MathAbs(currentPositionVolume-fillVolume)>
          volumeTolerance
       )
       {
          Print(
-            "Context not saved: current net position volume differs ",
-            "from this order's confirmed fills. Existing broker SL/TP ",
-            "remain in place. Position ID=",
-            positionId
+            "Context not saved: net position volume differs ",
+            "from confirmed fills. Position ID=",positionId
          );
 
          continue;
@@ -993,8 +930,7 @@ bool SaveConfirmedEntryContext(
       if(initialSL<=0.0 || initialTP<=0.0)
       {
          Print(
-            "Context not saved: broker-confirmed initial SL/TP ",
-            "could not be verified. Position ID=",
+            "Context not saved: initial broker SL/TP unavailable. ID=",
             positionId
          );
 
@@ -1025,20 +961,12 @@ bool SaveConfirmedEntryContext(
          anyContextSaved=true;
 
          Print(
-            "Original entry context saved.",
-            " Account=",InpAccountId,
+            "Entry context saved. Account=",InpAccountId,
             " Position ID=",positionId,
             " Entry=",DoubleToString(averageEntry,_Digits),
             " SL=",DoubleToString(initialSL,_Digits),
             " TP=",DoubleToString(initialTP,_Digits),
             " Volume=",DoubleToString(fillVolume,2)
-         );
-      }
-      else
-      {
-         Print(
-            "TradeRecovery refused to save context. Position ID=",
-            positionId
          );
       }
    }
@@ -1056,7 +984,7 @@ string ResolveGoldSymbol(string requested)
    {
       if(!SymbolSelect(requested,true))
       {
-         Print("Requested symbol is unavailable: ",requested);
+         Print("Requested symbol unavailable: ",requested);
          return "";
       }
 
@@ -1316,16 +1244,11 @@ void PollCommands()
          if(
             LocalEntryAuthorization() &&
             !g_riskLocked &&
-            !g_closeAllRequested
+            !g_closeAllRequested &&
+            !g_emergency
          )
          {
             g_startRequested=true;
-            g_emergency=false;
-
-            GlobalVariableSet(
-               "GoldEmergency_"+(string)InpAccountId,
-               0.0
-            );
 
             result=
                "{\"accepted\":true,\"start_requested\":true}";
@@ -1333,6 +1256,7 @@ void PollCommands()
          else
          {
             g_startRequested=false;
+            g_enabled=false;
 
             result=
                "{\"accepted\":false,\"reason\":\"local_authorization_or_safety_lock\"}";
@@ -1368,6 +1292,12 @@ void PollCommands()
       }
       else if(commandName=="RISK_RESET")
       {
+         // CRITICAL FIX:
+         // Clear the previous START request as well as the risk lock.
+         // This prevents the permission refresh below from re-enabling
+         // entries using an old START request.
+         g_startRequested=false;
+
          g_riskLocked=false;
 
          GlobalVariableSet(
@@ -1375,14 +1305,19 @@ void PollCommands()
             0.0
          );
 
-         // Risk reset does not automatically restart entries.
-         // A separate START command is required.
+         // Effective entry permission remains disabled.
          g_enabled=false;
 
          result=
-            "{\"risk_lock_cleared\":true,\"start_required\":true}";
+            "{\"risk_lock_cleared\":true,\"start_required\":true,\"entries_enabled\":false}";
 
          applied=true;
+
+         Print(
+            "RISK_RESET received. Risk lock cleared. ",
+            "Previous START request cleared. ",
+            "A separate START command is required."
+         );
       }
       else if(commandName=="SETTINGS")
       {
@@ -1432,9 +1367,7 @@ void PollCommands()
    }
    else
    {
-      // Fail closed for new entries.
-      // Keep g_startRequested unchanged so a temporary backend
-      // outage does not erase the user's explicit START intent.
+      // Fail closed. Do not erase explicit START intent on outage.
       g_enabled=false;
    }
 }
@@ -1454,7 +1387,6 @@ void SyncRecentDeals()
       return;
 
    int total=HistoryDealsTotal();
-
    int first=(int)MathMax(0,total-1000);
 
    string deals="[";
