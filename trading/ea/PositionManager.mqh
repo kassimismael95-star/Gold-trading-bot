@@ -8,8 +8,8 @@
 #include "TrailingStopManager.mqh"
 #include "MarketAnalyzer.mqh"
 
-// Manages each broker-confirmed position independently.
-// Does not control entries or close positions as a basket.
+// Post-entry management only.
+// This class never opens, reverses, or changes new entries.
 class CPositionManager
 {
 private:
@@ -35,6 +35,11 @@ private:
       return digits;
    }
 
+   bool IsBuy(ENUM_POSITION_TYPE direction)
+   {
+      return direction == POSITION_TYPE_BUY;
+   }
+
    double MinimumStopDistance(string symbol)
    {
       double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
@@ -51,25 +56,6 @@ private:
       return ((double)MathMax(stops, freeze) + 2.0) * point;
    }
 
-   bool IsBuy(ENUM_POSITION_TYPE direction)
-   {
-      return direction == POSITION_TYPE_BUY;
-   }
-
-   bool MomentumAligned(
-      ENUM_POSITION_TYPE direction,
-      int score
-   )
-   {
-      if(direction == POSITION_TYPE_BUY)
-         return score >= 0;
-
-      if(direction == POSITION_TYPE_SELL)
-         return score <= 0;
-
-      return false;
-   }
-
    bool ImproveStop(
       CTrade &trade,
       ulong ticket,
@@ -81,42 +67,47 @@ private:
    )
    {
       double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
       if(candidate <= 0.0 || point <= 0.0)
          return false;
 
-      // A BUY stop may only move upward.
+      candidate = NormalizeDouble(candidate, digits);
+
+      // Never loosen an existing protective stop.
       if(IsBuy(direction))
       {
-         if(currentSL > 0.0 &&
-            candidate <= currentSL + point)
+         if(currentSL > 0.0 && candidate <= currentSL + point)
             return false;
       }
-      // A SELL stop may only move downward.
       else
       {
-         if(currentSL > 0.0 &&
-            candidate >= currentSL - point)
+         if(currentSL > 0.0 && candidate >= currentSL - point)
             return false;
       }
-
-      double minimumDistance = MinimumStopDistance(symbol);
 
       MqlTick tick;
 
       if(!SymbolInfoTick(symbol, tick))
          return false;
 
+      double minimumDistance = MinimumStopDistance(symbol);
+
       if(IsBuy(direction))
       {
-         if(tick.bid - candidate < minimumDistance)
+         if(candidate >= tick.bid ||
+            tick.bid - candidate < minimumDistance)
             return false;
       }
       else
       {
-         if(candidate - tick.ask < minimumDistance)
+         if(candidate <= tick.ask ||
+            candidate - tick.ask < minimumDistance)
             return false;
       }
+
+      if(!PositionSelectByTicket(ticket))
+         return false;
 
       bool requested =
          trade.PositionModify(ticket, candidate, currentTP);
@@ -124,23 +115,18 @@ private:
       if(!requested)
       {
          Print(
-            "Position stop modification rejected. Ticket=",
-            ticket,
-            " Retcode=",
-            trade.ResultRetcode(),
-            " ",
-            trade.ResultRetcodeDescription()
+            "Stop modification rejected. Ticket=", ticket,
+            " Retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription()
          );
-
          return false;
       }
 
-      // Verify the broker's actual position state.
+      // Confirm the actual broker-side stop.
       if(!PositionSelectByTicket(ticket))
          return false;
 
-      double confirmedSL =
-         PositionGetDouble(POSITION_SL);
+      double confirmedSL = PositionGetDouble(POSITION_SL);
 
       if(IsBuy(direction))
          return confirmedSL >= candidate - point;
@@ -161,9 +147,13 @@ private:
 
       string key = StateKey("InitialRisk", identifier);
 
-      // Terminal global variables survive normal EA restarts.
       if(GlobalVariableCheck(key))
-         return GlobalVariableGet(key);
+      {
+         double savedRisk = GlobalVariableGet(key);
+
+         if(savedRisk > 0.0)
+            return savedRisk;
+      }
 
       double openPrice =
          tracker.OpenPrice(ticket, symbol, magic);
@@ -171,16 +161,13 @@ private:
       double stopLoss =
          tracker.StopLoss(ticket, symbol, magic);
 
-      // Never invent a risk distance for a position without
-      // an initial broker-side stop.
+      // Do not invent an initial risk for an unprotected position.
       if(openPrice <= 0.0 || stopLoss <= 0.0)
       {
          Print(
-            "Position manager cannot establish initial risk. Ticket=",
-            ticket,
-            ". Existing position has no stop loss."
+            "Cannot establish initial risk. Ticket=", ticket,
+            ". No valid broker-side stop loss was found."
          );
-
          return 0.0;
       }
 
@@ -194,10 +181,7 @@ private:
       return risk;
    }
 
-   double PartialVolume(
-      string symbol,
-      double currentVolume
-   )
+   double PartialVolume(string symbol, double currentVolume)
    {
       double minimum =
          SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
@@ -208,11 +192,10 @@ private:
       double step =
          SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
 
-      if(minimum <= 0.0 ||
-         step <= 0.0 ||
-         maximum < minimum)
+      if(minimum <= 0.0 || step <= 0.0 || maximum < minimum)
          return 0.0;
 
+      // Leave at least the broker's minimum volume open.
       if(currentVolume < minimum * 2.0)
          return 0.0;
 
@@ -221,15 +204,9 @@ private:
       double volume =
          MathFloor(requested / step + 0.00000001) * step;
 
-      volume = NormalizeDouble(
-         volume,
-         VolumePrecision(step)
-      );
+      volume = NormalizeDouble(volume, VolumePrecision(step));
 
-      if(volume < minimum)
-         return 0.0;
-
-      if(volume > maximum)
+      if(volume < minimum || volume > maximum)
          return 0.0;
 
       if(currentVolume - volume < minimum - 0.00000001)
@@ -238,21 +215,49 @@ private:
       return volume;
    }
 
+   bool MarketSupportsPosition(
+      SMarketState &state,
+      ENUM_POSITION_TYPE direction
+   )
+   {
+      return market.SupportsDirection(state, direction);
+   }
+
+   bool StrongMomentumSupports(
+      SMarketState &state,
+      ENUM_POSITION_TYPE direction
+   )
+   {
+      if(!state.dataValid || state.atr <= 0.0)
+         return false;
+
+      double normalized =
+         market.NormalizedMomentum(state);
+
+      if(direction == POSITION_TYPE_BUY)
+         return normalized >= 0.60 && state.trend >= 0;
+
+      if(direction == POSITION_TYPE_SELL)
+         return normalized <= -0.60 && state.trend <= 0;
+
+      return false;
+   }
+
    void TryPartialProfit(
       CTrade &trade,
       ulong ticket,
       string symbol,
       ulong identifier,
-      int momentumScore,
-      ENUM_POSITION_TYPE direction
+      ENUM_POSITION_TYPE direction,
+      SMarketState &state
    )
    {
-      // Partial close is supported here only for hedging accounts.
+      // Partial close is deliberately limited to hedging accounts.
       if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) !=
          ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
          return;
 
-      if(!MomentumAligned(direction, momentumScore))
+      if(!MarketSupportsPosition(state, direction))
          return;
 
       string key = StateKey("PartialDone", identifier);
@@ -279,19 +284,14 @@ private:
       if(!requested)
       {
          Print(
-            "Partial close rejected. Ticket=",
-            ticket,
-            " Retcode=",
-            trade.ResultRetcode(),
-            " ",
-            trade.ResultRetcodeDescription()
+            "Partial close rejected. Ticket=", ticket,
+            " Retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription()
          );
-
          return;
       }
 
-      // Do not mark success until the broker confirms
-      // that the remaining position volume has decreased.
+      // Mark the action complete only after broker volume changes.
       if(!PositionSelectByTicket(ticket))
       {
          GlobalVariableSet(key, 1.0);
@@ -306,12 +306,9 @@ private:
          GlobalVariableSet(key, 1.0);
 
          Print(
-            "Partial profit confirmed. Ticket=",
-            ticket,
-            " Closed volume=",
-            closeVolume,
-            " Remaining volume=",
-            remaining
+            "Partial close confirmed. Ticket=", ticket,
+            " Previous volume=", currentVolume,
+            " Remaining volume=", remaining
          );
       }
    }
@@ -323,23 +320,13 @@ private:
       ulong identifier,
       ENUM_POSITION_TYPE direction,
       double initialRisk,
-      int momentumScore
+      SMarketState &state
    )
    {
       if(initialRisk <= 0.0)
          return;
 
-      // TP extension requires strong momentum in the
-      // same direction as the individual position.
-      bool strongMomentum = false;
-
-      if(direction == POSITION_TYPE_BUY)
-         strongMomentum = momentumScore >= 6;
-
-      if(direction == POSITION_TYPE_SELL)
-         strongMomentum = momentumScore <= -6;
-
-      if(!strongMomentum)
+      if(!StrongMomentumSupports(state, direction))
          return;
 
       string key = StateKey("TargetExtended", identifier);
@@ -351,20 +338,15 @@ private:
       if(!PositionSelectByTicket(ticket))
          return;
 
-      double currentTP =
-         PositionGetDouble(POSITION_TP);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double currentSL = PositionGetDouble(POSITION_SL);
 
-      double currentSL =
-         PositionGetDouble(POSITION_SL);
-
+      // Do not create a new TP if the original position had none.
       if(currentTP <= 0.0)
          return;
 
-      double point =
-         SymbolInfoDouble(symbol, SYMBOL_POINT);
-
-      int digits =
-         (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
       if(point <= 0.0)
          return;
@@ -382,23 +364,18 @@ private:
       if(!SymbolInfoTick(symbol, tick))
          return;
 
-      double minimumDistance =
-         MinimumStopDistance(symbol);
+      double minimumDistance = MinimumStopDistance(symbol);
 
       if(IsBuy(direction))
       {
-         if(candidate <= currentTP + point)
-            return;
-
-         if(candidate - tick.ask < minimumDistance)
+         if(candidate <= currentTP + point ||
+            candidate - tick.ask < minimumDistance)
             return;
       }
       else
       {
-         if(candidate >= currentTP - point)
-            return;
-
-         if(tick.bid - candidate < minimumDistance)
+         if(candidate >= currentTP - point ||
+            tick.bid - candidate < minimumDistance)
             return;
       }
 
@@ -408,22 +385,17 @@ private:
       if(!requested)
       {
          Print(
-            "Target extension rejected. Ticket=",
-            ticket,
-            " Retcode=",
-            trade.ResultRetcode(),
-            " ",
-            trade.ResultRetcodeDescription()
+            "TP extension rejected. Ticket=", ticket,
+            " Retcode=", trade.ResultRetcode(),
+            " ", trade.ResultRetcodeDescription()
          );
-
          return;
       }
 
       if(!PositionSelectByTicket(ticket))
          return;
 
-      double confirmedTP =
-         PositionGetDouble(POSITION_TP);
+      double confirmedTP = PositionGetDouble(POSITION_TP);
 
       bool confirmed = IsBuy(direction)
          ? confirmedTP >= candidate - point
@@ -434,10 +406,8 @@ private:
          GlobalVariableSet(key, 1.0);
 
          Print(
-            "TP extension confirmed. Ticket=",
-            ticket,
-            " New TP=",
-            confirmedTP
+            "TP extension confirmed. Ticket=", ticket,
+            " New TP=", confirmedTP
          );
       }
    }
@@ -447,8 +417,7 @@ private:
       string symbol,
       long magic,
       ulong ticket,
-      int momentumScore,
-      double atr
+      SMarketState &state
    )
    {
       if(!tracker.IsManagedPosition(ticket, symbol, magic))
@@ -499,10 +468,9 @@ private:
          ? currentPrice - openPrice
          : openPrice - currentPrice;
 
-      double rMultiple =
-         favorableMovement / initialRisk;
+      double rMultiple = favorableMovement / initialRisk;
 
-      // At +1R, protect a portion of the unrealized profit.
+      // At +1R, attempt to protect a small portion of the gain.
       if(rMultiple >= 1.0)
       {
          double protectedPrice = IsBuy(direction)
@@ -519,24 +487,21 @@ private:
             currentTP
          );
 
-         // Re-read broker values after a successful modification.
-         if(PositionSelectByTicket(ticket))
-         {
-            currentSL = PositionGetDouble(POSITION_SL);
-            currentTP = PositionGetDouble(POSITION_TP);
-         }
+         if(!PositionSelectByTicket(ticket))
+            return;
 
-         // Partial profit is attempted once at +1R.
+         currentSL = PositionGetDouble(POSITION_SL);
+         currentTP = PositionGetDouble(POSITION_TP);
+
          TryPartialProfit(
             trade,
             ticket,
             symbol,
             identifier,
-            momentumScore,
-            direction
+            direction,
+            state
          );
 
-         // Extend the target once if strong momentum supports it.
          TryExtendTarget(
             trade,
             ticket,
@@ -544,12 +509,12 @@ private:
             identifier,
             direction,
             initialRisk,
-            momentumScore
+            state
          );
       }
 
-      // Begin volatility-aware trailing after +0.5R.
-      if(rMultiple < 0.50 || atr <= 0.0)
+      // Do not trail before the position has moved +0.5R.
+      if(rMultiple < 0.50 || !state.dataValid || state.atr <= 0.0)
          return;
 
       if(!PositionSelectByTicket(ticket))
@@ -558,24 +523,34 @@ private:
       currentSL = PositionGetDouble(POSITION_SL);
       currentTP = PositionGetDouble(POSITION_TP);
 
-      double point =
-         SymbolInfoDouble(symbol, SYMBOL_POINT);
+      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
-      int digits =
-         (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      if(point <= 0.0)
+         return;
 
-      double distance =
-         trailing.Distance(symbol, atr);
+      // Adapt trailing distance to volatility.
+      double distance = trailing.AdaptiveDistance(
+         symbol,
+         state.atr,
+         state.volatilityRatio
+      );
 
-      double candidate =
-         trailing.ImprovedStop(
-            direction,
-            currentPrice,
-            currentSL,
-            distance,
-            point,
-            digits
+      // Tighten somewhat when momentum is weakening.
+      if(state.momentumWeakening)
+         distance = MathMax(
+            MinimumStopDistance(symbol),
+            distance * 0.80
          );
+
+      double candidate = trailing.ImprovedStop(
+         direction,
+         currentPrice,
+         currentSL,
+         distance,
+         point,
+         digits
+      );
 
       if(candidate <= 0.0)
          return;
@@ -593,7 +568,8 @@ private:
 
 public:
 
-   // This is the exact public interface expected by GoldScalperEA.mq5.
+   // Existing EA interface retained.
+   // This method only manages positions already confirmed by the broker.
    void Manage(
       CTrade &trade,
       string symbol,
@@ -604,17 +580,16 @@ public:
       if(symbol == "" || magic <= 0)
          return;
 
-      int momentumScore = 0;
+      SMarketState state;
 
-      // Do not interpret the engine's default BUY signal as
-      // live momentum until at least three observations exist.
-      if(signalEngine.GetTickCount() >= 3)
-         momentumScore = signalEngine.GetSignedMomentumScore();
+      bool marketReady =
+         market.Analyze(symbol, PERIOD_M1, state);
 
-      double atr =
-         market.ATR(symbol, PERIOD_M1, 14);
+      if(!marketReady)
+         return;
 
-      // Take a ticket snapshot before managing positions.
+      // Snapshot tickets before managing them because positions
+      // may change while broker operations are being processed.
       ulong tickets[];
 
       int total = PositionsTotal();
@@ -639,7 +614,6 @@ public:
 
       ArrayResize(tickets, used);
 
-      // Every position is managed separately.
       for(int j = 0; j < used; j++)
       {
          ManageOne(
@@ -647,8 +621,7 @@ public:
             symbol,
             magic,
             tickets[j],
-            momentumScore,
-            atr
+            state
          );
       }
    }
