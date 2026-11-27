@@ -1,10 +1,9 @@
 
 #property strict
 #property version "1.03"
-#property description "Gold Scalper EA - original entries; broker-confirmed entry context; demo and authorized live"
+#property description "Gold Scalper EA - original entries; independent post-entry intelligence; demo and authorized live"
 
 #include <Trade/Trade.mqh>
-
 #include "SignalEngine.mqh"
 #include "RiskManager.mqh"
 #include "PositionManager.mqh"
@@ -24,15 +23,12 @@ input string InpAccountToken="PASTE_ACCOUNT_TOKEN_HERE";
 input string InpSymbol="AUTO";
 input long InpMagic=9924102;
 
-// Real-money trading requires this explicit local permission
-// AND the backend account permission.
 input bool InpAllowLiveTrading=false;
 input bool InpStartEnabled=false;
 
 input int InpPollSeconds=3;
 input int InpMaxSlippagePoints=30;
 input int InpMaxPositionsOverride=0;
-
 input bool InpOneEntryPerM1Bar=false;
 
 CTrade trade;
@@ -82,7 +78,6 @@ int OnInit()
          "Set the API URL, account ID, account EA token ",
          "and magic number before attaching the EA."
       );
-
       return INIT_FAILED;
    }
 
@@ -102,11 +97,7 @@ int OnInit()
 
    if(!brokerSpecification.Validate(g_symbol))
    {
-      Print(
-         "Broker symbol specification is invalid; ",
-         "EA remains idle."
-      );
-
+      Print("Broker symbol specification is invalid; EA remains idle.");
       return INIT_FAILED;
    }
 
@@ -132,30 +123,21 @@ int OnInit()
          currentBar
       );
 
-   string riskLockKey=
-      "GoldRiskLock_"+(string)InpAccountId;
-
-   string emergencyKey=
-      "GoldEmergency_"+(string)InpAccountId;
+   string riskLockKey="GoldRiskLock_"+(string)InpAccountId;
+   string emergencyKey="GoldEmergency_"+(string)InpAccountId;
+   string closeKey="GoldCloseAll_"+(string)InpAccountId;
 
    if(
       GlobalVariableCheck(riskLockKey) &&
       GlobalVariableGet(riskLockKey)>0.5
    )
-   {
       g_riskLocked=true;
-   }
 
    if(
       GlobalVariableCheck(emergencyKey) &&
       GlobalVariableGet(emergencyKey)>0.5
    )
-   {
       g_emergency=true;
-   }
-
-   string closeKey=
-      "GoldCloseAll_"+(string)InpAccountId;
 
    if(
       GlobalVariableCheck(closeKey) &&
@@ -166,8 +148,7 @@ int OnInit()
       g_emergency=true;
    }
 
-   // Real-money execution is disabled by default.
-   // Existing positions are still managed by OnTick.
+   // Real accounts require explicit local authorization.
    g_enabled=
       InpStartEnabled &&
       (!IsRealAccount() || InpAllowLiveTrading);
@@ -239,17 +220,17 @@ void OnTick()
    if(SymbolInfoTick(g_symbol,tick))
       signalEngine.Observe(tick.bid,tick.ask);
 
-   // Existing broker-confirmed positions continue to be managed
-   // even when new entries are disabled.
+   // Manage open positions even when new entries are disabled.
+   // Pass the platform account ID so original context can be loaded.
    positionManager.Manage(
       trade,
       g_symbol,
       InpMagic,
+      InpAccountId,
       signalEngine
    );
 
-   // Manual emergency CLOSE_ALL remains available.
-   // There is no automatic basket-profit or basket-loss closure.
+   // Manual emergency close-all only.
    if(g_closeAllRequested)
    {
       exitManager.CloseAll(
@@ -271,30 +252,29 @@ void OnTick()
       return;
    }
 
-   // Real account execution requires explicit local authorization.
+   // Real-money trading must be explicitly authorized.
    if(IsRealAccount() && !InpAllowLiveTrading)
+      return;
+
+   // Verify terminal, EA and account trading permissions.
+   if(
+      !TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ||
+      !MQLInfoInteger(MQL_TRADE_ALLOWED) ||
+      !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)
+   )
       return;
 
    if(!SymbolInfoTick(g_symbol,tick))
       return;
 
-   int positions=
-      positionTracker.Count(g_symbol,InpMagic);
+   int positions=positionTracker.Count(g_symbol,InpMagic);
+   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
 
-   double equity=
-      AccountInfoDouble(ACCOUNT_EQUITY);
-
-   int allowedPositions=
-      riskManager.MaxPositions(equity);
+   int allowedPositions=riskManager.MaxPositions(equity);
 
    if(g_maxPositions>0)
-   {
-      allowedPositions=
-         (int)MathMin(allowedPositions,g_maxPositions);
-   }
+      allowedPositions=(int)MathMin(allowedPositions,g_maxPositions);
 
-   // Manual platform permission and position capacity.
-   // Post-entry intelligence does not participate in this decision.
    if(
       !entryManager.CanEnter(
          positions,
@@ -304,14 +284,10 @@ void OnTick()
          g_riskLocked
       )
    )
-   {
       return;
-   }
 
-   datetime currentBar=
-      iTime(g_symbol,PERIOD_M1,0);
+   datetime currentBar=iTime(g_symbol,PERIOD_M1,0);
 
-   // Prevent duplicate entry immediately after an EA restart.
    if(g_restartEntryBlock)
    {
       if(currentBar==g_lastEntryBar)
@@ -320,33 +296,20 @@ void OnTick()
       g_restartEntryBlock=false;
    }
 
-   // Optional operator-controlled entry frequency setting.
    if(
       g_oneEntryPerBar &&
       currentBar>0 &&
       g_lastEntryBar==currentBar
    )
-   {
       return;
-   }
 
-   // ORIGINAL ENTRY SIGNAL.
+   // ORIGINAL ENTRY SIGNAL: unchanged.
    int confidence=0;
    ENUM_ORDER_TYPE side;
 
    if(!signalEngine.GetSignal(side,confidence))
       return;
 
-   // Capture the original entry-time signal context.
-   // These are read-only values and do not change the signal.
-   int entryScore=signalEngine.GetCurrentScore();
-   double entryShortDelta=signalEngine.GetShortDelta();
-   double entryFullDelta=signalEngine.GetFullDelta();
-   double entryCandleDelta=signalEngine.GetCandleDelta();
-   double entryCandleOpen=signalEngine.GetCandleOpen();
-   datetime entryCandleMinute=signalEngine.GetCandleMinute();
-
-   // Broker quote and execution-cost validation.
    if(
       !executionManager.EntryCostOK(
          g_symbol,
@@ -354,27 +317,22 @@ void OnTick()
          confidence
       )
    )
-   {
       return;
-   }
 
-   // ORIGINAL EQUITY-BASED LOT CALCULATION.
-   // Intelligence cannot increase or decrease this volume.
-   double volume=
-      riskManager.VolumeForPosition(
-         g_symbol,
-         equity,
-         positions+1
-      );
+   // Original equity-based lot calculation.
+   double volume=riskManager.VolumeForPosition(
+      g_symbol,
+      equity,
+      positions+1
+   );
 
-   volume=
-      riskManager.FitVolumeToMargin(
-         g_symbol,
-         side,
-         volume,
-         (side==ORDER_TYPE_BUY ? tick.ask : tick.bid),
-         AccountInfoDouble(ACCOUNT_MARGIN_FREE)
-      );
+   volume=riskManager.FitVolumeToMargin(
+      g_symbol,
+      side,
+      volume,
+      (side==ORDER_TYPE_BUY ? tick.ask : tick.bid),
+      AccountInfoDouble(ACCOUNT_MARGIN_FREE)
+   );
 
    if(volume<=0.0)
       return;
@@ -382,25 +340,19 @@ void OnTick()
    double sl=0.0;
    double tp=0.0;
 
-   double entry=
-      (side==ORDER_TYPE_BUY ? tick.ask : tick.bid);
+   double entry=(side==ORDER_TYPE_BUY ? tick.ask : tick.bid);
 
-   // Original calculator spread conversion.
+   // Existing strategy conversion retained from the source EA.
    double spreadPrice=tick.ask-tick.bid;
    double goldPipSize=0.01;
 
    if(spreadPrice<0.0 || goldPipSize<=0.0)
       return;
 
-   double spreadPips=
-      spreadPrice/goldPipSize;
-
-   double recentMovement=
-      signalEngine.RecentMovement();
-
+   double spreadPips=spreadPrice/goldPipSize;
+   double recentMovement=signalEngine.RecentMovement();
    int positionNumber=positions+1;
 
-   // Original dynamic SL/TP calculation.
    if(
       !riskManager.BuildStops(
          g_symbol,
@@ -416,11 +368,7 @@ void OnTick()
       )
    )
    {
-      Print(
-         "Dynamic SL/TP calculation failed; ",
-         "no order sent."
-      );
-
+      Print("Dynamic SL/TP calculation failed; no order sent.");
       return;
    }
 
@@ -464,35 +412,13 @@ void OnTick()
       );
 
       g_lastEntryBar=currentBar;
-   }
 
-   // Save the original signal context only after locating
-   // the corresponding broker-confirmed entry deal.
-   if(executed)
-   {
-      bool contextSaved=SaveConfirmedEntryContext(
+      // Save the broker-confirmed position's original entry context.
+      SaveConfirmedEntryContext(
          trade.ResultOrder(),
          side,
-         confidence,
-         entryScore,
-         entryShortDelta,
-         entryFullDelta,
-         entryCandleDelta,
-         recentMovement,
-         entryCandleOpen,
-         entryCandleMinute
+         confidence
       );
-
-      if(!contextSaved)
-      {
-         Print(
-            "WARNING: Order was accepted but entry context ",
-            "was not persisted. Order=",
-            trade.ResultOrder(),
-            " Retcode=",
-            retcode
-         );
-      }
    }
 
    telemetry.TradeResult(
@@ -508,6 +434,166 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
+// SAVE BROKER-CONFIRMED ORIGINAL ENTRY CONTEXT
+//+------------------------------------------------------------------+
+
+void SaveConfirmedEntryContext(
+   ulong orderTicket,
+   ENUM_ORDER_TYPE side,
+   int confidence
+)
+{
+   if(orderTicket==0)
+      return;
+
+   datetime now=TimeCurrent();
+
+   if(now<=0)
+      return;
+
+   if(!HistorySelect(now-600,now+60))
+   {
+      Print("Cannot read recent deal history; entry context not saved.");
+      return;
+   }
+
+   ulong positionIdentifier=0;
+   double entryPrice=0.0;
+   double initialVolume=0.0;
+
+   int total=HistoryDealsTotal();
+
+   for(int i=total-1;i>=0;i--)
+   {
+      ulong deal=HistoryDealGetTicket(i);
+
+      if(deal==0)
+         continue;
+
+      if(HistoryDealGetInteger(deal,DEAL_ORDER)!=(long)orderTicket)
+         continue;
+
+      if(HistoryDealGetInteger(deal,DEAL_MAGIC)!=InpMagic)
+         continue;
+
+      if(HistoryDealGetString(deal,DEAL_SYMBOL)!=g_symbol)
+         continue;
+
+      long entryType=HistoryDealGetInteger(deal,DEAL_ENTRY);
+
+      if(entryType!=DEAL_ENTRY_IN && entryType!=DEAL_ENTRY_INOUT)
+         continue;
+
+      long dealType=HistoryDealGetInteger(deal,DEAL_TYPE);
+
+      if(
+         (side==ORDER_TYPE_BUY && dealType!=DEAL_TYPE_BUY) ||
+         (side==ORDER_TYPE_SELL && dealType!=DEAL_TYPE_SELL)
+      )
+         continue;
+
+      positionIdentifier=
+         (ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
+
+      entryPrice=HistoryDealGetDouble(deal,DEAL_PRICE);
+      initialVolume=HistoryDealGetDouble(deal,DEAL_VOLUME);
+
+      if(positionIdentifier>0 && entryPrice>0.0 && initialVolume>0.0)
+         break;
+   }
+
+   if(positionIdentifier==0 || entryPrice<=0.0 || initialVolume<=0.0)
+   {
+      Print(
+         "Broker confirmed order but matching entry deal was not found. ",
+         "Order=",
+         orderTicket
+      );
+      return;
+   }
+
+   double initialSL=0.0;
+   double initialTP=0.0;
+   bool foundPosition=false;
+
+   for(int p=PositionsTotal()-1;p>=0;p--)
+   {
+      ulong ticket=PositionGetTicket(p);
+
+      if(ticket==0)
+         continue;
+
+      if(PositionGetInteger(POSITION_IDENTIFIER)!=(long)positionIdentifier)
+         continue;
+
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic)
+         continue;
+
+      if(PositionGetString(POSITION_SYMBOL)!=g_symbol)
+         continue;
+
+      initialSL=PositionGetDouble(POSITION_SL);
+      initialTP=PositionGetDouble(POSITION_TP);
+      foundPosition=true;
+      break;
+   }
+
+   if(!foundPosition || initialSL<=0.0 || initialTP<=0.0)
+   {
+      Print(
+         "Entry context not saved because broker position or its original ",
+         "SL/TP could not be verified. Position ID=",
+         positionIdentifier
+      );
+      return;
+   }
+
+   bool saved=tradeRecovery.SaveEntryContext(
+      InpAccountId,
+      positionIdentifier,
+      side,
+      entryPrice,
+      initialSL,
+      initialTP,
+      initialVolume,
+      confidence,
+      signalEngine.GetCurrentScore(),
+      signalEngine.GetShortDelta(),
+      signalEngine.GetFullDelta(),
+      signalEngine.GetCandleDelta(),
+      signalEngine.RecentMovement(),
+      signalEngine.GetCandleOpen(),
+      signalEngine.GetCandleMinute(),
+      now
+   );
+
+   if(saved)
+   {
+      Print(
+         "Original entry context saved. Account=",
+         InpAccountId,
+         " Position ID=",
+         positionIdentifier,
+         " Entry=",
+         DoubleToString(entryPrice,_Digits),
+         " Initial SL=",
+         DoubleToString(initialSL,_Digits),
+         " Initial TP=",
+         DoubleToString(initialTP,_Digits),
+         " Initial volume=",
+         DoubleToString(initialVolume,2)
+      );
+   }
+   else
+   {
+      Print(
+         "TradeRecovery refused to save entry context. Position ID=",
+         positionIdentifier
+      );
+   }
+}
+
+//+------------------------------------------------------------------+
 // ACCOUNT TYPE
 //+------------------------------------------------------------------+
 
@@ -516,206 +602,6 @@ bool IsRealAccount()
    return
       AccountInfoInteger(ACCOUNT_TRADE_MODE)==
       ACCOUNT_TRADE_MODE_REAL;
-}
-
-//+------------------------------------------------------------------+
-// SAVE ORIGINAL ENTRY CONTEXT AFTER BROKER CONFIRMATION
-//+------------------------------------------------------------------+
-
-bool SaveConfirmedEntryContext(
-   ulong orderTicket,
-   ENUM_ORDER_TYPE requestedSide,
-   int confidence,
-   int signedScore,
-   double shortDelta,
-   double fullDelta,
-   double candleDelta,
-   double recentMovement,
-   double candleOpen,
-   datetime candleMinute
-)
-{
-   if(orderTicket==0)
-      return false;
-
-   datetime now=TimeCurrent();
-
-   if(now<=0 || !HistorySelect(now-86400,now+60))
-      return false;
-
-   int total=HistoryDealsTotal();
-
-   // Search newest deals first for the exact broker order.
-   for(int i=total-1;i>=0;i--)
-   {
-      ulong deal=HistoryDealGetTicket(i);
-
-      if(deal==0)
-         continue;
-
-      if(
-         (ulong)HistoryDealGetInteger(deal,DEAL_ORDER)
-         !=orderTicket
-      )
-      {
-         continue;
-      }
-
-      if(
-         HistoryDealGetInteger(deal,DEAL_MAGIC)
-         !=InpMagic
-      )
-      {
-         continue;
-      }
-
-      if(
-         HistoryDealGetString(deal,DEAL_SYMBOL)
-         !=g_symbol
-      )
-      {
-         continue;
-      }
-
-      long entryType=
-         HistoryDealGetInteger(deal,DEAL_ENTRY);
-
-      if(
-         entryType!=DEAL_ENTRY_IN &&
-         entryType!=DEAL_ENTRY_INOUT
-      )
-      {
-         continue;
-      }
-
-      long dealType=
-         HistoryDealGetInteger(deal,DEAL_TYPE);
-
-      ENUM_ORDER_TYPE actualSide;
-
-      if(dealType==DEAL_TYPE_BUY)
-         actualSide=ORDER_TYPE_BUY;
-      else if(dealType==DEAL_TYPE_SELL)
-         actualSide=ORDER_TYPE_SELL;
-      else
-         continue;
-
-      if(actualSide!=requestedSide)
-         continue;
-
-      ulong positionIdentifier=
-         (ulong)HistoryDealGetInteger(
-            deal,
-            DEAL_POSITION_ID
-         );
-
-      if(positionIdentifier==0)
-         continue;
-
-      // Do not overwrite the first context for an existing
-      // netting position. Hedging positions have separate IDs.
-      if(
-         tradeRecovery.HasEntryContext(
-            InpAccountId,
-            positionIdentifier
-         )
-      )
-      {
-         return true;
-      }
-
-      double actualEntry=
-         HistoryDealGetDouble(deal,DEAL_PRICE);
-
-      double actualVolume=
-         HistoryDealGetDouble(deal,DEAL_VOLUME);
-
-      double actualSL=
-         HistoryDealGetDouble(deal,DEAL_SL);
-
-      double actualTP=
-         HistoryDealGetDouble(deal,DEAL_TP);
-
-      // Prefer actual broker position properties when available.
-      ulong positionTicket=
-         positionTracker.FindTicketByIdentifier(
-            positionIdentifier,
-            g_symbol,
-            InpMagic
-         );
-
-      if(
-         positionTicket>0 &&
-         PositionSelectByTicket(positionTicket)
-      )
-      {
-         double brokerEntry=
-            PositionGetDouble(POSITION_PRICE_OPEN);
-
-         double brokerSL=
-            PositionGetDouble(POSITION_SL);
-
-         double brokerTP=
-            PositionGetDouble(POSITION_TP);
-
-         if(brokerEntry>0.0)
-            actualEntry=brokerEntry;
-
-         if(brokerSL>0.0)
-            actualSL=brokerSL;
-
-         if(brokerTP>0.0)
-            actualTP=brokerTP;
-      }
-
-      // Never invent missing broker-confirmed initial values.
-      if(
-         actualEntry<=0.0 ||
-         actualSL<=0.0 ||
-         actualTP<=0.0 ||
-         actualVolume<=0.0
-      )
-      {
-         Print(
-            "Broker fill found but entry context is incomplete. ",
-            "Position identifier=",
-            positionIdentifier
-         );
-
-         return false;
-      }
-
-      bool saved=tradeRecovery.SaveEntryContext(
-         InpAccountId,
-         positionIdentifier,
-         actualSide,
-         actualEntry,
-         actualSL,
-         actualTP,
-         actualVolume,
-         confidence,
-         signedScore,
-         shortDelta,
-         fullDelta,
-         candleDelta,
-         recentMovement,
-         candleOpen,
-         candleMinute,
-         now
-      );
-
-      if(saved)
-      {
-         Print(
-            "Original entry context saved. Position identifier=",
-            positionIdentifier
-         );
-      }
-
-      return saved;
-   }
-
-   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -740,9 +626,7 @@ string ResolveGoldSymbol(string requested)
       requested!="AUTO" &&
       SymbolSelect(requested,true)
    )
-   {
       return requested;
-   }
 
    for(int i=0;i<ArraySize(candidates);i++)
    {
@@ -755,8 +639,8 @@ string ResolveGoldSymbol(string requested)
    for(int i=0;i<total;i++)
    {
       string name=SymbolName(i,false);
-
       string upper=name;
+
       StringToUpper(upper);
 
       if(
@@ -794,9 +678,7 @@ string JsonStringValue(string json,string key)
          p<StringLen(json) &&
          StringGetCharacter(json,p)==' '
       )
-      {
          p++;
-      }
 
       if(
          p<StringLen(json) &&
@@ -804,7 +686,6 @@ string JsonStringValue(string json,string key)
       )
       {
          p++;
-
          int e=StringFind(json,"\"",p);
 
          if(e<0)
@@ -822,7 +703,6 @@ string JsonStringValue(string json,string key)
 long JsonLongValue(string json,string key)
 {
    string needle="\""+key+"\":";
-
    int p=StringFind(json,needle);
 
    if(p<0)
@@ -834,9 +714,7 @@ long JsonLongValue(string json,string key)
       p<StringLen(json) &&
       StringGetCharacter(json,p)==' '
    )
-   {
       p++;
-   }
 
    int e=p;
 
@@ -862,7 +740,6 @@ double JsonDoubleValue(
 )
 {
    string needle="\""+key+"\":";
-
    int p=StringFind(json,needle);
 
    if(p<0)
@@ -874,9 +751,7 @@ double JsonDoubleValue(
       p<StringLen(json) &&
       StringGetCharacter(json,p)==' '
    )
-   {
       p++;
-   }
 
    int e=p;
 
@@ -889,9 +764,7 @@ double JsonDoubleValue(
          c!='.' &&
          c!='-'
       )
-      {
          break;
-      }
 
       e++;
    }
@@ -911,7 +784,6 @@ bool JsonBoolValue(
 )
 {
    string needle="\""+key+"\":";
-
    int p=StringFind(json,needle);
 
    if(p<0)
@@ -923,9 +795,7 @@ bool JsonBoolValue(
       p<StringLen(json) &&
       StringGetCharacter(json,p)==' '
    )
-   {
       p++;
-   }
 
    if(StringSubstr(json,p,4)=="true")
       return true;
@@ -953,14 +823,10 @@ void PollCommands()
       )
    )
    {
-      long commandId=
-         JsonLongValue(response,"id");
-
-      string commandName=
-         JsonStringValue(response,"command");
+      long commandId=JsonLongValue(response,"id");
+      string commandName=JsonStringValue(response,"command");
 
       bool applied=false;
-
       string result="{\"applied\":true}";
 
       if(commandName=="CLOSE_ALL")
@@ -979,9 +845,7 @@ void PollCommands()
             1.0
          );
 
-         result=
-            "{\"requested\":true,\"new_entries_disabled\":true}";
-
+         result="{\"requested\":true,\"new_entries_disabled\":true}";
          applied=true;
       }
       else if(commandName=="START")
@@ -1031,12 +895,11 @@ void PollCommands()
          g_maxPositions=
             (int)JsonLongValue(response,"max_positions");
 
-         g_oneEntryPerBar=
-            JsonBoolValue(
-               response,
-               "one_entry_per_m1_bar",
-               g_oneEntryPerBar
-            );
+         g_oneEntryPerBar=JsonBoolValue(
+            response,
+            "one_entry_per_m1_bar",
+            g_oneEntryPerBar
+         );
 
          applied=true;
       }
@@ -1094,7 +957,6 @@ void SyncRecentDeals()
       return;
 
    int total=HistoryDealsTotal();
-
    int first=MathMax(0,total-1000);
 
    string deals="[";
@@ -1107,15 +969,10 @@ void SyncRecentDeals()
       if(deal==0 || !HistoryDealSelect(deal))
          continue;
 
-      if(
-         HistoryDealGetInteger(deal,DEAL_MAGIC)!=InpMagic
-      )
-      {
+      if(HistoryDealGetInteger(deal,DEAL_MAGIC)!=InpMagic)
          continue;
-      }
 
-      long entryType=
-         HistoryDealGetInteger(deal,DEAL_ENTRY);
+      long entryType=HistoryDealGetInteger(deal,DEAL_ENTRY);
 
       double dealPnl=
          HistoryDealGetDouble(deal,DEAL_PROFIT)+
@@ -1135,13 +992,10 @@ void SyncRecentDeals()
          );
       }
 
-      string symbol=
-         HistoryDealGetString(deal,DEAL_SYMBOL);
-
+      string symbol=HistoryDealGetString(deal,DEAL_SYMBOL);
       string side="OTHER";
 
-      long type=
-         HistoryDealGetInteger(deal,DEAL_TYPE);
+      long type=HistoryDealGetInteger(deal,DEAL_TYPE);
 
       if(type==DEAL_TYPE_BUY)
          side="BUY";
@@ -1173,7 +1027,7 @@ void SyncRecentDeals()
          ",\"time\":"+
          (string)HistoryDealGetInteger(deal,DEAL_TIME)+
          "}";
-      
+
       added++;
    }
 
