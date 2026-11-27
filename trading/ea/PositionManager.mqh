@@ -19,17 +19,83 @@ private:
    CMarketAnalyzer market;
    CTradeRecovery recovery;
 
+   // ---------------------------------------------------------
+   // ACCOUNT-SCOPED MANAGEMENT STATE
+   // ---------------------------------------------------------
+
    string StateKey(
       string name,
+      long accountId,
       ulong identifier
    )
    {
-      return "GoldPM_" + name + "_" + (string)identifier;
+      return "GoldPM_" +
+             name + "_" +
+             (string)accountId + "_" +
+             (string)identifier;
    }
+
+   bool StateDone(
+      string name,
+      long accountId,
+      ulong identifier
+   )
+   {
+      string key = StateKey(
+         name,
+         accountId,
+         identifier
+      );
+
+      return
+         GlobalVariableCheck(key) &&
+         GlobalVariableGet(key) > 0.5;
+   }
+
+   bool SaveState(
+      string name,
+      long accountId,
+      ulong identifier
+   )
+   {
+      string key = StateKey(
+         name,
+         accountId,
+         identifier
+      );
+
+      if(GlobalVariableSet(key, 1.0) == 0)
+         return false;
+
+      GlobalVariableFlush();
+
+      return true;
+   }
+
+   // ---------------------------------------------------------
+   // BASIC POSITION HELPERS
+   // ---------------------------------------------------------
 
    bool IsBuy(ENUM_POSITION_TYPE direction)
    {
       return direction == POSITION_TYPE_BUY;
+   }
+
+   bool ContextMatchesPosition(
+      SOriginalEntryContext &context,
+      ENUM_POSITION_TYPE direction
+   )
+   {
+      if(!context.valid)
+         return false;
+
+      if(direction == POSITION_TYPE_BUY)
+         return context.side == ORDER_TYPE_BUY;
+
+      if(direction == POSITION_TYPE_SELL)
+         return context.side == ORDER_TYPE_SELL;
+
+      return false;
    }
 
    int VolumePrecision(double step)
@@ -38,7 +104,9 @@ private:
 
       while(
          digits < 8 &&
-         MathAbs(step - NormalizeDouble(step, digits)) > 0.00000001
+         MathAbs(
+            step - NormalizeDouble(step, digits)
+         ) > 0.00000001
       )
       {
          digits++;
@@ -49,24 +117,32 @@ private:
 
    double MinimumStopDistance(string symbol)
    {
-      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+      double point =
+         SymbolInfoDouble(symbol, SYMBOL_POINT);
 
       if(point <= 0.0)
          return 0.0;
 
       long stops =
-         SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+         SymbolInfoInteger(
+            symbol,
+            SYMBOL_TRADE_STOPS_LEVEL
+         );
 
       long freeze =
-         SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+         SymbolInfoInteger(
+            symbol,
+            SYMBOL_TRADE_FREEZE_LEVEL
+         );
 
-      return ((double)MathMax(stops, freeze) + 2.0) * point;
+      return (
+         (double)MathMax(stops, freeze) + 2.0
+      ) * point;
    }
 
-   bool BrokerPositionExists(ulong ticket)
-   {
-      return ticket > 0 && PositionSelectByTicket(ticket);
-   }
+   // ---------------------------------------------------------
+   // PROTECTIVE STOP MANAGEMENT
+   // ---------------------------------------------------------
 
    bool ImproveStop(
       CTrade &trade,
@@ -78,24 +154,43 @@ private:
       double currentTP
    )
    {
-      double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      double point =
+         SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+      int digits =
+         (int)SymbolInfoInteger(
+            symbol,
+            SYMBOL_DIGITS
+         );
 
       if(candidate <= 0.0 || point <= 0.0)
          return false;
 
-      candidate = NormalizeDouble(candidate, digits);
+      candidate = NormalizeDouble(
+         candidate,
+         digits
+      );
 
       // Never loosen an existing protective stop.
       if(IsBuy(direction))
       {
-         if(currentSL > 0.0 && candidate <= currentSL + point)
+         if(
+            currentSL > 0.0 &&
+            candidate <= currentSL + point
+         )
+         {
             return false;
+         }
       }
       else
       {
-         if(currentSL > 0.0 && candidate >= currentSL - point)
+         if(
+            currentSL > 0.0 &&
+            candidate >= currentSL - point
+         )
+         {
             return false;
+         }
       }
 
       MqlTick tick;
@@ -103,7 +198,8 @@ private:
       if(!SymbolInfoTick(symbol, tick))
          return false;
 
-      double minimumDistance = MinimumStopDistance(symbol);
+      double minimumDistance =
+         MinimumStopDistance(symbol);
 
       if(IsBuy(direction))
       {
@@ -111,7 +207,9 @@ private:
             candidate >= tick.bid ||
             tick.bid - candidate < minimumDistance
          )
+         {
             return false;
+         }
       }
       else
       {
@@ -119,19 +217,25 @@ private:
             candidate <= tick.ask ||
             candidate - tick.ask < minimumDistance
          )
+         {
             return false;
+         }
       }
 
       if(!PositionSelectByTicket(ticket))
          return false;
 
       bool requested =
-         trade.PositionModify(ticket, candidate, currentTP);
+         trade.PositionModify(
+            ticket,
+            candidate,
+            currentTP
+         );
 
       if(!requested)
       {
          Print(
-            "Position stop modification rejected. Ticket=",
+            "Stop modification rejected. Ticket=",
             ticket,
             " Retcode=",
             trade.ResultRetcode(),
@@ -142,67 +246,66 @@ private:
          return false;
       }
 
+      // Broker-side position state is authoritative.
       if(!PositionSelectByTicket(ticket))
          return false;
 
       double confirmedSL =
          PositionGetDouble(POSITION_SL);
 
-      bool confirmed = IsBuy(direction)
-         ? confirmedSL >= candidate - point
-         : confirmedSL <= candidate + point;
+      bool confirmed = false;
+
+      if(IsBuy(direction))
+      {
+         confirmed =
+            confirmedSL > 0.0 &&
+            confirmedSL >= candidate - point;
+      }
+      else
+      {
+         confirmed =
+            confirmedSL > 0.0 &&
+            confirmedSL <= candidate + point;
+      }
 
       if(!confirmed)
       {
          Print(
-            "Broker did not confirm requested stop. Ticket=",
-            ticket
+            "Broker stop confirmation failed. Ticket=",
+            ticket,
+            " Requested=",
+            candidate,
+            " Actual=",
+            confirmedSL
          );
       }
 
       return confirmed;
    }
 
+   // ---------------------------------------------------------
+   // ORIGINAL RISK
+   // ---------------------------------------------------------
+
    double InitialRisk(
-      SManagedPositionSnapshot &snapshot,
       SOriginalEntryContext &context
    )
    {
-      // The saved original SL is authoritative for initial risk.
+      // Only saved original entry information is accepted.
+      // Current SL may already have been moved by management.
       if(
-         context.valid &&
-         context.entryPrice > 0.0 &&
-         context.initialStopLoss > 0.0
+         !context.valid ||
+         context.entryPrice <= 0.0 ||
+         context.initialStopLoss <= 0.0
       )
       {
-         double savedRisk =
-            MathAbs(
-               context.entryPrice -
-               context.initialStopLoss
-            );
-
-         if(savedRisk > 0.0)
-            return savedRisk;
+         return 0.0;
       }
 
-      // Fallback for older positions with no saved context.
-      // Never invent risk if the position has no valid SL.
-      if(
-         snapshot.openPrice > 0.0 &&
-         snapshot.stopLoss > 0.0
-      )
-      {
-         double brokerRisk =
-            MathAbs(
-               snapshot.openPrice -
-               snapshot.stopLoss
-            );
-
-         if(brokerRisk > 0.0)
-            return brokerRisk;
-      }
-
-      return 0.0;
+      return MathAbs(
+         context.entryPrice -
+         context.initialStopLoss
+      );
    }
 
    double PartialVolume(
@@ -211,13 +314,22 @@ private:
    )
    {
       double minimum =
-         SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+         SymbolInfoDouble(
+            symbol,
+            SYMBOL_VOLUME_MIN
+         );
 
       double maximum =
-         SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+         SymbolInfoDouble(
+            symbol,
+            SYMBOL_VOLUME_MAX
+         );
 
       double step =
-         SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+         SymbolInfoDouble(
+            symbol,
+            SYMBOL_VOLUME_STEP
+         );
 
       if(
          minimum <= 0.0 ||
@@ -231,7 +343,8 @@ private:
       if(currentVolume < minimum * 2.0)
          return 0.0;
 
-      double requested = currentVolume * 0.50;
+      double requested =
+         currentVolume * 0.50;
 
       double volume =
          MathFloor(
@@ -243,14 +356,28 @@ private:
          VolumePrecision(step)
       );
 
-      if(volume < minimum || volume > maximum)
+      if(
+         volume < minimum ||
+         volume > maximum
+      )
+      {
          return 0.0;
+      }
 
-      if(currentVolume - volume < minimum - 0.00000001)
+      if(
+         currentVolume - volume <
+         minimum - 0.00000001
+      )
+      {
          return 0.0;
+      }
 
       return volume;
    }
+
+   // ---------------------------------------------------------
+   // MARKET CONDITION HELPERS
+   // ---------------------------------------------------------
 
    bool StrongMomentumSupports(
       SMarketState &state,
@@ -265,16 +392,18 @@ private:
 
       if(direction == POSITION_TYPE_BUY)
       {
-         return
+         return (
             normalized >= 0.60 &&
-            state.trend >= 0;
+            state.trend >= 0
+         );
       }
 
       if(direction == POSITION_TYPE_SELL)
       {
-         return
+         return (
             normalized <= -0.60 &&
-            state.trend <= 0;
+            state.trend <= 0
+         );
       }
 
       return false;
@@ -294,34 +423,41 @@ private:
       double normalized =
          market.NormalizedMomentum(state);
 
-      // Require both strong opposite momentum and an opposite trend.
       if(direction == POSITION_TYPE_BUY)
       {
-         return
+         return (
             normalized <= -0.80 &&
-            state.trend < 0;
+            state.trend < 0
+         );
       }
 
       if(direction == POSITION_TYPE_SELL)
       {
-         return
+         return (
             normalized >= 0.80 &&
-            state.trend > 0;
+            state.trend > 0
+         );
       }
 
       return false;
    }
 
+   // ---------------------------------------------------------
+   // PARTIAL PROFIT
+   // ---------------------------------------------------------
+
    void TryPartialProfit(
       CTrade &trade,
       ulong ticket,
       string symbol,
+      long accountId,
       ulong identifier,
       ENUM_POSITION_TYPE direction,
       SMarketState &state
    )
    {
-      // Partial close is supported here only for hedging accounts.
+      // Partial closing is explicitly restricted to hedging
+      // accounts in this implementation.
       if(
          AccountInfoInteger(ACCOUNT_MARGIN_MODE) !=
          ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
@@ -330,15 +466,18 @@ private:
          return;
       }
 
+      if(!state.dataValid)
+         return;
+
       if(!market.SupportsDirection(state, direction))
          return;
 
-      string key =
-         StateKey("PartialDone", identifier);
-
       if(
-         GlobalVariableCheck(key) &&
-         GlobalVariableGet(key) > 0.5
+         StateDone(
+            "PartialDone",
+            accountId,
+            identifier
+         )
       )
       {
          return;
@@ -357,7 +496,10 @@ private:
          return;
 
       bool requested =
-         trade.PositionClosePartial(ticket, closeVolume);
+         trade.PositionClosePartial(
+            ticket,
+            closeVolume
+         );
 
       if(!requested)
       {
@@ -373,19 +515,36 @@ private:
          return;
       }
 
-      // Confirm the broker actually reduced the position.
+      // Confirm actual broker-side volume reduction.
       if(!PositionSelectByTicket(ticket))
       {
-         GlobalVariableSet(key, 1.0);
+         SaveState(
+            "PartialDone",
+            accountId,
+            identifier
+         );
+
+         Print(
+            "Position disappeared after partial close. Ticket=",
+            ticket
+         );
+
          return;
       }
 
       double remaining =
          PositionGetDouble(POSITION_VOLUME);
 
-      if(remaining < currentVolume - 0.00000001)
+      if(
+         remaining <
+         currentVolume - 0.00000001
+      )
       {
-         GlobalVariableSet(key, 1.0);
+         SaveState(
+            "PartialDone",
+            accountId,
+            identifier
+         );
 
          Print(
             "Partial close confirmed. Ticket=",
@@ -396,12 +555,24 @@ private:
             remaining
          );
       }
+      else
+      {
+         Print(
+            "Partial close was not confirmed by broker. Ticket=",
+            ticket
+         );
+      }
    }
+
+   // ---------------------------------------------------------
+   // TAKE-PROFIT EXTENSION
+   // ---------------------------------------------------------
 
    void TryExtendTarget(
       CTrade &trade,
       ulong ticket,
       string symbol,
+      long accountId,
       ulong identifier,
       ENUM_POSITION_TYPE direction,
       double initialRisk,
@@ -414,12 +585,12 @@ private:
       if(!StrongMomentumSupports(state, direction))
          return;
 
-      string key =
-         StateKey("TargetExtended", identifier);
-
       if(
-         GlobalVariableCheck(key) &&
-         GlobalVariableGet(key) > 0.5
+         StateDone(
+            "TargetExtended",
+            accountId,
+            identifier
+         )
       )
       {
          return;
@@ -434,7 +605,6 @@ private:
       double currentSL =
          PositionGetDouble(POSITION_SL);
 
-      // Never invent a target for a position without an original TP.
       if(currentTP <= 0.0)
          return;
 
@@ -442,18 +612,25 @@ private:
          SymbolInfoDouble(symbol, SYMBOL_POINT);
 
       int digits =
-         (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+         (int)SymbolInfoInteger(
+            symbol,
+            SYMBOL_DIGITS
+         );
 
       if(point <= 0.0)
          return;
 
-      double extension = initialRisk * 0.50;
+      double extension =
+         initialRisk * 0.50;
 
       double candidate = IsBuy(direction)
          ? currentTP + extension
          : currentTP - extension;
 
-      candidate = NormalizeDouble(candidate, digits);
+      candidate = NormalizeDouble(
+         candidate,
+         digits
+      );
 
       MqlTick tick;
 
@@ -517,7 +694,11 @@ private:
 
       if(confirmed)
       {
-         GlobalVariableSet(key, 1.0);
+         SaveState(
+            "TargetExtended",
+            accountId,
+            identifier
+         );
 
          Print(
             "TP extension confirmed. Ticket=",
@@ -526,30 +707,53 @@ private:
             confirmedTP
          );
       }
+      else
+      {
+         Print(
+            "TP extension not confirmed. Ticket=",
+            ticket,
+            " Requested=",
+            candidate,
+            " Actual=",
+            confirmedTP
+         );
+      }
    }
+
+   // ---------------------------------------------------------
+   // INVALIDATED TRADE THESIS
+   // ---------------------------------------------------------
 
    bool CloseInvalidatedPosition(
       CTrade &trade,
       ulong ticket,
+      long accountId,
       ulong identifier,
       SManagedPositionSnapshot &snapshot,
       SMarketState &state
    )
    {
-      if(!StrongOppositeThesis(state, snapshot.direction))
+      if(
+         !StrongOppositeThesis(
+            state,
+            snapshot.direction
+         )
+      )
+      {
          return false;
+      }
 
-      // Do not close a profitable trade solely because momentum
-      // briefly weakens. Require the position to be losing.
+      // Do not close a profitable position solely because
+      // momentum weakens.
       if(snapshot.floatingProfit >= 0.0)
          return false;
 
-      string key =
-         StateKey("ThesisExit", identifier);
-
       if(
-         GlobalVariableCheck(key) &&
-         GlobalVariableGet(key) > 0.5
+         StateDone(
+            "ThesisExit",
+            accountId,
+            identifier
+         )
       )
       {
          return false;
@@ -575,10 +779,14 @@ private:
          return false;
       }
 
-      // Verify that the broker actually removed this position.
+      // Confirm the broker actually removed the position.
       if(!PositionSelectByTicket(ticket))
       {
-         GlobalVariableSet(key, 1.0);
+         SaveState(
+            "ThesisExit",
+            accountId,
+            identifier
+         );
 
          Print(
             "Thesis invalidation close confirmed. Ticket=",
@@ -589,7 +797,7 @@ private:
       }
 
       Print(
-         "Thesis exit requested but position remains open. Ticket=",
+         "Thesis exit not confirmed. Ticket=",
          ticket,
          " Remaining volume=",
          PositionGetDouble(POSITION_VOLUME)
@@ -597,6 +805,10 @@ private:
 
       return false;
    }
+
+   // ---------------------------------------------------------
+   // MANAGE ONE BROKER-CONFIRMED POSITION
+   // ---------------------------------------------------------
 
    void ManageOne(
       CTrade &trade,
@@ -633,48 +845,70 @@ private:
             context
          );
 
-      if(!hasContext)
+      if(
+         hasContext &&
+         !ContextMatchesPosition(
+            context,
+            snapshot.direction
+         )
+      )
       {
+         hasContext = false;
          context.valid = false;
 
          Print(
-            "Original entry context unavailable. ",
-            "Position remains under broker-SL protection. ",
-            "Identifier=",
+            "Entry context direction mismatch. ",
+            "R-based management disabled. Identifier=",
             snapshot.identifier
          );
       }
 
+      if(!hasContext)
+      {
+         Print(
+            "Original entry context unavailable. ",
+            "Broker SL/TP remain active. ",
+            "Identifier=",
+            snapshot.identifier
+         );
+
+         return;
+      }
+
       double initialRisk =
-         InitialRisk(snapshot, context);
+         InitialRisk(context);
 
       if(initialRisk <= 0.0)
       {
          Print(
-            "Position cannot be managed using R-based rules ",
-            "because its original risk is unavailable. Ticket=",
+            "Invalid original risk. R-based management ",
+            "disabled. Ticket=",
             ticket
          );
 
          return;
       }
 
+      // Use the saved original entry price for R calculations.
+      double entryPrice =
+         context.entryPrice;
+
       double favorableMovement =
          IsBuy(snapshot.direction)
-         ? snapshot.currentPrice - snapshot.openPrice
-         : snapshot.openPrice - snapshot.currentPrice;
+         ? snapshot.currentPrice - entryPrice
+         : entryPrice - snapshot.currentPrice;
 
       double rMultiple =
          favorableMovement / initialRisk;
 
-      // Original thesis invalidation is evaluated only when
-      // the saved entry context exists.
-      if(hasContext && state.dataValid)
+      // Evaluate thesis invalidation only with valid analysis.
+      if(state.dataValid)
       {
          if(
             CloseInvalidatedPosition(
                trade,
                ticket,
+               accountId,
                snapshot.identifier,
                snapshot,
                state
@@ -685,12 +919,16 @@ private:
          }
       }
 
-      // At +1R, attempt to protect a small portion of profit.
+      // ------------------------------------------------------
+      // +1R PROFIT PROTECTION
+      // ------------------------------------------------------
+
       if(rMultiple >= 1.0)
       {
-         double protectedPrice = IsBuy(snapshot.direction)
-            ? snapshot.openPrice + initialRisk * 0.10
-            : snapshot.openPrice - initialRisk * 0.10;
+         double protectedPrice =
+            IsBuy(snapshot.direction)
+            ? entryPrice + initialRisk * 0.10
+            : entryPrice - initialRisk * 0.10;
 
          ImproveStop(
             trade,
@@ -705,27 +943,36 @@ private:
          if(!PositionSelectByTicket(ticket))
             return;
 
-         TryPartialProfit(
-            trade,
-            ticket,
-            symbol,
-            snapshot.identifier,
-            snapshot.direction,
-            state
-         );
+         // These operations require valid market analysis.
+         if(state.dataValid)
+         {
+            TryPartialProfit(
+               trade,
+               ticket,
+               symbol,
+               accountId,
+               snapshot.identifier,
+               snapshot.direction,
+               state
+            );
 
-         TryExtendTarget(
-            trade,
-            ticket,
-            symbol,
-            snapshot.identifier,
-            snapshot.direction,
-            initialRisk,
-            state
-         );
+            TryExtendTarget(
+               trade,
+               ticket,
+               symbol,
+               accountId,
+               snapshot.identifier,
+               snapshot.direction,
+               initialRisk,
+               state
+            );
+         }
       }
 
-      // Volatility-aware trailing begins after +0.5R.
+      // ------------------------------------------------------
+      // VOLATILITY-AWARE TRAILING AFTER +0.5R
+      // ------------------------------------------------------
+
       if(
          rMultiple < 0.50 ||
          !state.dataValid ||
@@ -748,7 +995,10 @@ private:
          SymbolInfoDouble(symbol, SYMBOL_POINT);
 
       int digits =
-         (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+         (int)SymbolInfoInteger(
+            symbol,
+            SYMBOL_DIGITS
+         );
 
       if(point <= 0.0)
          return;
@@ -796,6 +1046,10 @@ private:
       );
    }
 
+   // ---------------------------------------------------------
+   // MANAGE ALL POSITIONS FOR THIS ACCOUNT AND EA
+   // ---------------------------------------------------------
+
    void ManageAll(
       CTrade &trade,
       string symbol,
@@ -803,15 +1057,46 @@ private:
       long accountId
    )
    {
-      if(symbol == "" || magic <= 0 || accountId <= 0)
+      if(
+         symbol == "" ||
+         magic <= 0 ||
+         accountId <= 0
+      )
+      {
          return;
+      }
 
       SMarketState state;
 
-      // If market analysis is unavailable, do not invent signals.
-      // Broker-side SL and TP remain active.
-      if(!market.Analyze(symbol, PERIOD_M1, state))
-         return;
+      state.atr = 0.0;
+      state.averageRange = 0.0;
+      state.volatilityRatio = 0.0;
+      state.momentum = 0.0;
+      state.previousMomentum = 0.0;
+      state.trend = 0;
+      state.momentumStrengthening = false;
+      state.momentumWeakening = false;
+      state.dataValid = false;
+
+      // If analysis fails, continue basic R-based protection.
+      // Momentum-dependent operations remain disabled.
+      bool analysisAvailable =
+         market.Analyze(
+            symbol,
+            PERIOD_M1,
+            state
+         );
+
+      if(!analysisAvailable)
+      {
+         state.dataValid = false;
+
+         Print(
+            "Market analysis unavailable for ",
+            symbol,
+            ". Continuing basic position protection."
+         );
+      }
 
       ulong tickets[];
 
@@ -858,8 +1143,8 @@ private:
 
 public:
 
-   // Preferred interface: uses the platform account ID
-   // to recover the exact original entry context.
+   // Preferred interface: platform account ID is used
+   // to retrieve the saved original entry context.
    void Manage(
       CTrade &trade,
       string symbol,
@@ -876,8 +1161,7 @@ public:
       );
    }
 
-   // Compatibility interface for older EA callers.
-   // It cannot load platform-specific entry context.
+   // Compatibility interface for existing callers.
    void Manage(
       CTrade &trade,
       string symbol,
