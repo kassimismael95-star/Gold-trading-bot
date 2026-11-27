@@ -243,6 +243,34 @@ def create_app(settings=None):
         if s.app_env != "production" or auto_create:
             db.create_all()
 
+        # Safe PostgreSQL repair for the missing account column
+        if db.engine.dialect.name == "postgresql":
+            with db.engine.begin() as conn:
+                table_exists = conn.execute(
+                    text(
+                        "SELECT to_regclass('public.trading_account')"
+                    )
+                ).scalar()
+
+                if table_exists:
+                    conn.execute(
+                        text("""
+                            ALTER TABLE public.trading_account
+                            ADD COLUMN IF NOT EXISTS
+                            is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+                        """)
+                    )
+
+                    app.logger.info(
+                        "Database check: "
+                        "trading_account.is_deleted is ready"
+                    )
+                else:
+                    app.logger.warning(
+                        "Database repair skipped: "
+                        "public.trading_account does not exist"
+                    )
+
         email = s.bootstrap_admin_email
         password = s.bootstrap_admin_password
 
