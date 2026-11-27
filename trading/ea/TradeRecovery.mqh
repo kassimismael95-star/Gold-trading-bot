@@ -4,8 +4,8 @@
 
 #include <Trade/Trade.mqh>
 
-// Original information captured when an entry is confirmed
-// by the MT5 broker. Used only by post-entry management.
+// Original information captured after broker-confirmed entry.
+// Used exclusively by post-entry trade management.
 struct SOriginalEntryContext
 {
    long accountId;
@@ -118,10 +118,41 @@ private:
       return GlobalVariableGet(key);
    }
 
+   void ResetContext(
+      SOriginalEntryContext &context,
+      long accountId,
+      ulong positionIdentifier
+   )
+   {
+      context.accountId = accountId;
+      context.positionIdentifier = positionIdentifier;
+
+      context.side = ORDER_TYPE_BUY;
+
+      context.entryPrice = 0.0;
+      context.initialStopLoss = 0.0;
+      context.initialTakeProfit = 0.0;
+      context.initialVolume = 0.0;
+
+      context.confidence = 0;
+      context.signedScore = 0;
+
+      context.shortDelta = 0.0;
+      context.fullDelta = 0.0;
+      context.candleDelta = 0.0;
+      context.recentMovement = 0.0;
+      context.candleOpen = 0.0;
+
+      context.candleMinute = 0;
+      context.recordedAt = 0;
+
+      context.valid = false;
+   }
+
 public:
 
    // ---------------------------------------------------------
-   // EXISTING RESTART DUPLICATE-ENTRY PROTECTION
+   // RESTART DUPLICATE-ENTRY PROTECTION
    // ---------------------------------------------------------
 
    string GetEntryBarKey(long accountId)
@@ -131,6 +162,9 @@ public:
 
    datetime LastEntryBar(long accountId)
    {
+      if(accountId <= 0)
+         return 0;
+
       string key = EntryBarKey(accountId);
 
       if(!GlobalVariableCheck(key))
@@ -151,6 +185,8 @@ public:
          EntryBarKey(accountId),
          (double)barTime
       );
+
+      GlobalVariableFlush();
    }
 
    bool RestartDuplicateBlock(
@@ -209,110 +245,104 @@ public:
       if(recordedAt <= 0)
          recordedAt = TimeCurrent();
 
-      // Save each field independently. The final validity
-      // marker is written only after every field succeeds.
+      // Invalidate any previous record before updating fields.
+      // This prevents partially overwritten records being
+      // mistaken for complete, valid entry context.
+      if(!SaveValue(
+         accountId,
+         positionIdentifier,
+         "valid",
+         0.0
+      ))
+      {
+         Print(
+            "Could not invalidate old entry context. Account=",
+            accountId,
+            " Position=",
+            positionIdentifier
+         );
+
+         return false;
+      }
+
+      GlobalVariableFlush();
+
       bool ok = true;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "side",
-         (double)side
+         accountId, positionIdentifier,
+         "side", (double)side
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "entry",
-         entryPrice
+         accountId, positionIdentifier,
+         "entry", entryPrice
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "sl",
-         initialStopLoss
+         accountId, positionIdentifier,
+         "sl", initialStopLoss
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "tp",
-         initialTakeProfit
+         accountId, positionIdentifier,
+         "tp", initialTakeProfit
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "vol",
-         initialVolume
+         accountId, positionIdentifier,
+         "vol", initialVolume
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "conf",
-         (double)confidence
+         accountId, positionIdentifier,
+         "conf", (double)confidence
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "score",
-         (double)signedScore
+         accountId, positionIdentifier,
+         "score", (double)signedScore
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "short",
-         shortDelta
+         accountId, positionIdentifier,
+         "short", shortDelta
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "full",
-         fullDelta
+         accountId, positionIdentifier,
+         "full", fullDelta
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "candle",
-         candleDelta
+         accountId, positionIdentifier,
+         "candle", candleDelta
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "move",
-         recentMovement
+         accountId, positionIdentifier,
+         "move", recentMovement
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "open",
-         candleOpen
+         accountId, positionIdentifier,
+         "open", candleOpen
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "minute",
-         (double)candleMinute
+         accountId, positionIdentifier,
+         "minute", (double)candleMinute
       ) && ok;
 
       ok = SaveValue(
-         accountId,
-         positionIdentifier,
-         "time",
-         (double)recordedAt
+         accountId, positionIdentifier,
+         "time", (double)recordedAt
       ) && ok;
 
       if(!ok)
       {
+         GlobalVariableFlush();
+
          Print(
             "Entry context persistence failed. Account=",
             accountId,
@@ -323,7 +353,9 @@ public:
          return false;
       }
 
-      // Validity marker is deliberately written last.
+      // Persist all fields before publishing the valid marker.
+      GlobalVariableFlush();
+
       if(!SaveValue(
          accountId,
          positionIdentifier,
@@ -339,6 +371,8 @@ public:
 
          return false;
       }
+
+      GlobalVariableFlush();
 
       Print(
          "Original entry context saved. Account=",
@@ -364,29 +398,11 @@ public:
       SOriginalEntryContext &context
    )
    {
-      context.accountId = accountId;
-      context.positionIdentifier = positionIdentifier;
-
-      context.side = ORDER_TYPE_BUY;
-
-      context.entryPrice = 0.0;
-      context.initialStopLoss = 0.0;
-      context.initialTakeProfit = 0.0;
-      context.initialVolume = 0.0;
-
-      context.confidence = 0;
-      context.signedScore = 0;
-
-      context.shortDelta = 0.0;
-      context.fullDelta = 0.0;
-      context.candleDelta = 0.0;
-      context.recentMovement = 0.0;
-      context.candleOpen = 0.0;
-
-      context.candleMinute = 0;
-      context.recordedAt = 0;
-
-      context.valid = false;
+      ResetContext(
+         context,
+         accountId,
+         positionIdentifier
+      );
 
       if(accountId <= 0 || positionIdentifier == 0)
          return false;
@@ -409,8 +425,8 @@ public:
          return false;
       }
 
-      // Refuse incomplete records rather than reconstructing
-      // missing historical values from current market prices.
+      // Require every field. Never invent historical entry
+      // information using current prices or current SL/TP.
       string requiredFields[] =
       {
          "side",
@@ -456,88 +472,69 @@ public:
       context.side = (ENUM_ORDER_TYPE)storedSide;
 
       context.entryPrice = ReadValue(
-         accountId,
-         positionIdentifier,
-         "entry"
+         accountId, positionIdentifier, "entry"
       );
 
       context.initialStopLoss = ReadValue(
-         accountId,
-         positionIdentifier,
-         "sl"
+         accountId, positionIdentifier, "sl"
       );
 
       context.initialTakeProfit = ReadValue(
-         accountId,
-         positionIdentifier,
-         "tp"
+         accountId, positionIdentifier, "tp"
       );
 
       context.initialVolume = ReadValue(
-         accountId,
-         positionIdentifier,
-         "vol"
+         accountId, positionIdentifier, "vol"
       );
 
       context.confidence = (int)ReadValue(
-         accountId,
-         positionIdentifier,
-         "conf"
+         accountId, positionIdentifier, "conf"
       );
 
       context.signedScore = (int)ReadValue(
-         accountId,
-         positionIdentifier,
-         "score"
+         accountId, positionIdentifier, "score"
       );
 
       context.shortDelta = ReadValue(
-         accountId,
-         positionIdentifier,
-         "short"
+         accountId, positionIdentifier, "short"
       );
 
       context.fullDelta = ReadValue(
-         accountId,
-         positionIdentifier,
-         "full"
+         accountId, positionIdentifier, "full"
       );
 
       context.candleDelta = ReadValue(
-         accountId,
-         positionIdentifier,
-         "candle"
+         accountId, positionIdentifier, "candle"
       );
 
       context.recentMovement = ReadValue(
-         accountId,
-         positionIdentifier,
-         "move"
+         accountId, positionIdentifier, "move"
       );
 
       context.candleOpen = ReadValue(
-         accountId,
-         positionIdentifier,
-         "open"
+         accountId, positionIdentifier, "open"
       );
 
       context.candleMinute = (datetime)ReadValue(
-         accountId,
-         positionIdentifier,
-         "minute"
+         accountId, positionIdentifier, "minute"
       );
 
       context.recordedAt = (datetime)ReadValue(
-         accountId,
-         positionIdentifier,
-         "time"
+         accountId, positionIdentifier, "time"
       );
 
       if(context.entryPrice <= 0.0 ||
          context.initialStopLoss <= 0.0 ||
          context.initialTakeProfit <= 0.0 ||
-         context.initialVolume <= 0.0)
+         context.initialVolume <= 0.0 ||
+         context.recordedAt <= 0)
       {
+         ResetContext(
+            context,
+            accountId,
+            positionIdentifier
+         );
+
          return false;
       }
 
@@ -547,7 +544,7 @@ public:
    }
 
    // ---------------------------------------------------------
-   // CHECK WHETHER A POSITION HAS SAVED ENTRY CONTEXT
+   // CHECK WHETHER A COMPLETE ENTRY CONTEXT EXISTS
    // ---------------------------------------------------------
 
    bool HasEntryContext(
@@ -555,23 +552,13 @@ public:
       ulong positionIdentifier
    )
    {
-      if(accountId <= 0 || positionIdentifier == 0)
-         return false;
+      SOriginalEntryContext context;
 
-      if(!HasContextField(
+      return LoadEntryContext(
          accountId,
          positionIdentifier,
-         "valid"
-      ))
-      {
-         return false;
-      }
-
-      return ReadValue(
-         accountId,
-         positionIdentifier,
-         "valid"
-      ) > 0.5;
+         context
+      );
    }
 };
 
