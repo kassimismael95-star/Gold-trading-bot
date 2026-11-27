@@ -2,25 +2,58 @@
 #ifndef GOLD_TELEMETRY
 #define GOLD_TELEMETRY
 
+// Gold Scalper AI - account telemetry and API communication.
+// Preserves the existing public interface.
+
 class CTelemetry
 {
 private:
    string eaToken;
 
+   string JsonEscape(string value)
+   {
+      StringReplace(value, "\\", "\\\\");
+      StringReplace(value, "\"", "\\\"");
+      StringReplace(value, "\r", "\\r");
+      StringReplace(value, "\n", "\\n");
+      StringReplace(value, "\t", "\\t");
+      return value;
+   }
+
+   string JsonNumber(double value, int digits = 8)
+   {
+      return DoubleToString(value, digits);
+   }
+
    string Post(string url, string body)
    {
-      char data[], result[];
+      if(eaToken == "")
+      {
+         Print("Telemetry unavailable: EA token is not configured.");
+         return "";
+      }
+
+      char data[];
+      char result[];
 
       string headers =
-         "Content-Type: application/json\r\n"
+         "Content-Type: application/json\r\n" +
          "X-EA-Token: " + eaToken + "\r\n";
 
-      StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
+      StringToCharArray(
+         body,
+         data,
+         0,
+         WHOLE_ARRAY,
+         CP_UTF8
+      );
 
       if(ArraySize(data) > 0)
          ArrayResize(data, ArraySize(data) - 1);
 
-      string response_headers;
+      string responseHeaders;
+
+      ResetLastError();
 
       int code = WebRequest(
          "POST",
@@ -29,19 +62,35 @@ private:
          5000,
          data,
          result,
-         response_headers
+         responseHeaders
       );
 
       if(code < 200 || code >= 300)
       {
-         Print("API request failed HTTP ", code, " ", GetLastError());
+         Print(
+            "Telemetry POST failed. HTTP=",
+            code,
+            " Error=",
+            GetLastError()
+         );
+
          return "";
       }
 
-      return CharArrayToString(result, 0, -1, CP_UTF8);
+      return CharArrayToString(
+         result,
+         0,
+         -1,
+         CP_UTF8
+      );
    }
 
 public:
+
+   CTelemetry()
+   {
+      eaToken = "";
+   }
 
    void SetToken(string token)
    {
@@ -56,13 +105,19 @@ public:
       string payload
    )
    {
+      if(base == "" || agent == "" || account <= 0 || kind == "")
+         return;
+
       string body =
-         "{\"agent_id\":\"" + agent +
-         "\",\"account_id\":" + IntegerToString(account) +
-         ",\"event_type\":\"" + kind +
+         "{\"agent_id\":\"" + JsonEscape(agent) +
+         "\",\"account_id\":" + (string)account +
+         ",\"event_type\":\"" + JsonEscape(kind) +
          "\",\"payload\":" + payload + "}";
 
-      Post(base + "/api/ea/events", body);
+      Post(
+         base + "/api/ea/events",
+         body
+      );
    }
 
    void Heartbeat(
@@ -74,6 +129,9 @@ public:
       long magic
    )
    {
+      if(base == "" || agent == "" || account <= 0 || symbol == "")
+         return;
+
       int count = 0;
       double floating = 0.0;
 
@@ -84,43 +142,81 @@ public:
          if(ticket == 0)
             continue;
 
-         if(PositionGetString(POSITION_SYMBOL) == symbol &&
-            PositionGetInteger(POSITION_MAGIC) == magic)
-         {
-            count++;
+         if(!PositionSelectByTicket(ticket))
+            continue;
 
-            floating +=
-               PositionGetDouble(POSITION_PROFIT) +
-               PositionGetDouble(POSITION_SWAP);
-         }
+         if(PositionGetString(POSITION_SYMBOL) != symbol)
+            continue;
+
+         if(PositionGetInteger(POSITION_MAGIC) != magic)
+            continue;
+
+         count++;
+
+         floating +=
+            PositionGetDouble(POSITION_PROFIT) +
+            PositionGetDouble(POSITION_SWAP);
       }
 
       bool connected =
          (bool)TerminalInfoInteger(TERMINAL_CONNECTED);
 
-      string payload =
-         "{\"symbol\":\"" + symbol +
-         "\",\"entries_enabled\":" + (enabled ? "true" : "false") +
-         ",\"connected_to_broker\":" + (connected ? "true" : "false") +
-         ",\"balance\":" +
-         DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) +
-         ",\"equity\":" +
-         DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) +
-         ",\"free_margin\":" +
-         DoubleToString(AccountInfoDouble(ACCOUNT_MARGIN_FREE), 2) +
-         ",\"floating_pnl\":" + DoubleToString(floating, 2) +
-         ",\"open_positions_count\":" + (string)count + "}";
+      double balance =
+         AccountInfoDouble(ACCOUNT_BALANCE);
 
-      SendEvent(base, agent, account, "heartbeat", payload);
+      double equity =
+         AccountInfoDouble(ACCOUNT_EQUITY);
+
+      double freeMargin =
+         AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+
+      double margin =
+         AccountInfoDouble(ACCOUNT_MARGIN);
+
+      double marginLevel =
+         AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+
+      string payload =
+         "{\"symbol\":\"" + JsonEscape(symbol) +
+         "\",\"entries_enabled\":" +
+         (enabled ? "true" : "false") +
+         ",\"connected_to_broker\":" +
+         (connected ? "true" : "false") +
+         ",\"balance\":" + JsonNumber(balance, 2) +
+         ",\"equity\":" + JsonNumber(equity, 2) +
+         ",\"free_margin\":" + JsonNumber(freeMargin, 2) +
+         ",\"used_margin\":" + JsonNumber(margin, 2) +
+         ",\"margin_level\":" + JsonNumber(marginLevel, 2) +
+         ",\"floating_pnl\":" + JsonNumber(floating, 2) +
+         ",\"open_positions_count\":" + (string)count +
+         "}";
+
+      SendEvent(
+         base,
+         agent,
+         account,
+         "heartbeat",
+         payload
+      );
    }
 
-   void DealsBatch(string base, long account, string dealsJson)
+   void DealsBatch(
+      string base,
+      long account,
+      string dealsJson
+   )
    {
+      if(base == "" || account <= 0 || dealsJson == "")
+         return;
+
       string body =
-         "{\"account_id\":" + IntegerToString(account) +
+         "{\"account_id\":" + (string)account +
          ",\"deals\":" + dealsJson + "}";
 
-      Post(base + "/api/ea/deals/batch", body);
+      Post(
+         base + "/api/ea/deals/batch",
+         body
+      );
    }
 
    void TradeResult(
@@ -134,17 +230,26 @@ public:
       uint retcode
    )
    {
+      if(side != ORDER_TYPE_BUY && side != ORDER_TYPE_SELL)
+         return;
+
+      string sideText =
+         (side == ORDER_TYPE_BUY ? "BUY" : "SELL");
+
+      string payload =
+         "{\"symbol\":\"" + JsonEscape(symbol) +
+         "\",\"side\":\"" + sideText +
+         "\",\"volume\":" + JsonNumber(volume, 8) +
+         ",\"ok\":" + (ok ? "true" : "false") +
+         ",\"retcode\":" + (string)retcode +
+         "}";
+
       SendEvent(
          base,
          agent,
          account,
          "trade_result",
-         "{\"symbol\":\"" + symbol +
-         "\",\"side\":\"" +
-         (side == ORDER_TYPE_BUY ? "BUY" : "SELL") +
-         "\",\"volume\":" + DoubleToString(volume, 2) +
-         ",\"ok\":" + (ok ? "true" : "false") +
-         ",\"retcode\":" + (string)retcode + "}"
+         payload
       );
    }
 
@@ -155,20 +260,40 @@ public:
       string resultJson
    )
    {
+      if(base == "" || account <= 0 || commandId <= 0 ||
+         resultJson == "")
+         return false;
+
       string body =
-         "{\"account_id\":" + IntegerToString(account) +
-         ",\"command_id\":" + IntegerToString(commandId) +
+         "{\"account_id\":" + (string)account +
+         ",\"command_id\":" + (string)commandId +
          ",\"result\":" + resultJson + "}";
 
-      return Post(base + "/api/ea/ack", body) != "";
+      return Post(
+         base + "/api/ea/ack",
+         body
+      ) != "";
    }
 
-   bool Get(string url, string &response)
+   bool Get(
+      string url,
+      string &response
+   )
    {
-      char data[], result[];
+      response = "";
 
-      string headers = "X-EA-Token: " + eaToken + "\r\n";
-      string response_headers;
+      if(eaToken == "" || url == "")
+         return false;
+
+      char data[];
+      char result[];
+
+      string headers =
+         "X-EA-Token: " + eaToken + "\r\n";
+
+      string responseHeaders;
+
+      ResetLastError();
 
       int code = WebRequest(
          "GET",
@@ -177,13 +302,27 @@ public:
          5000,
          data,
          result,
-         response_headers
+         responseHeaders
       );
 
       if(code < 200 || code >= 300)
-         return false;
+      {
+         Print(
+            "Telemetry GET failed. HTTP=",
+            code,
+            " Error=",
+            GetLastError()
+         );
 
-      response = CharArrayToString(result, 0, -1, CP_UTF8);
+         return false;
+      }
+
+      response = CharArrayToString(
+         result,
+         0,
+         -1,
+         CP_UTF8
+      );
 
       return true;
    }
