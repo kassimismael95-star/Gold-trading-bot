@@ -6,10 +6,9 @@ class CDrawdownManager
 {
 public:
 
-   // Account percentage drawdown is not used as an automatic
-   // trading breaker in this strategy.
-   //
-   // Retained for compatibility with AccountRiskMonitor.mqh.
+   // Fixed account drawdown shutdown is disabled.
+   // Open positions must be managed individually by the
+   // post-entry intelligence supervisor.
    bool AccountDrawdownExceeded(
       double equity,
       double balance,
@@ -19,16 +18,15 @@ public:
       return false;
    }
 
-   // Keep the separately configured basket-loss protection.
+   // Fixed basket-loss shutdown is disabled.
+   // One losing position must not automatically close
+   // other positions managed by this EA.
    bool BasketLossExceeded(
       double basketProfit,
       double maxLossCurrency
    )
    {
-      if(maxLossCurrency <= 0.0)
-         return false;
-
-      return basketProfit <= -maxLossCurrency;
+      return false;
    }
 };
 
