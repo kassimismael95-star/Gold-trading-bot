@@ -2,10 +2,48 @@
 #ifndef GOLD_POSITION_TRACKER
 #define GOLD_POSITION_TRACKER
 
+// ============================================================
+// GOLD SCALPER AI - BROKER POSITION TRACKER
+// ============================================================
+// The MT5 broker is the authoritative source of position state.
+// This class does not open, modify or close trades.
+// ============================================================
+
+struct SManagedPositionSnapshot
+{
+   ulong ticket;
+   ulong identifier;
+
+   string symbol;
+   string comment;
+
+   long magic;
+   long openTime;
+
+   ENUM_POSITION_TYPE direction;
+
+   double openPrice;
+   double currentPrice;
+
+   double stopLoss;
+   double takeProfit;
+
+   double currentVolume;
+   double floatingProfit;
+   double swap;
+
+   bool valid;
+};
+
 class CPositionTracker
 {
 private:
-   bool Matches(ulong ticket, string symbol, long magic)
+
+   bool Matches(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       if(ticket == 0)
          return false;
@@ -24,7 +62,10 @@ private:
 
 public:
 
-   // Count broker-confirmed positions for this symbol and EA magic number.
+   // ---------------------------------------------------------
+   // Count broker-confirmed positions for this EA and symbol.
+   // ---------------------------------------------------------
+
    int Count(string symbol, long magic)
    {
       int count = 0;
@@ -40,9 +81,15 @@ public:
       return count;
    }
 
-   // Retrieve the ticket of a specific managed position by index.
-   // Returns 0 when the requested index does not exist.
-   ulong TicketAt(string symbol, long magic, int requestedIndex)
+   // ---------------------------------------------------------
+   // Retrieve a managed position ticket by index.
+   // ---------------------------------------------------------
+
+   ulong TicketAt(
+      string symbol,
+      long magic,
+      int requestedIndex
+   )
    {
       if(requestedIndex < 0)
          return 0;
@@ -65,14 +112,23 @@ public:
       return 0;
    }
 
-   // Check whether a ticket belongs to this EA and symbol.
-   bool IsManagedPosition(ulong ticket, string symbol, long magic)
+   // ---------------------------------------------------------
+   // Confirm whether a ticket belongs to this EA.
+   // ---------------------------------------------------------
+
+   bool IsManagedPosition(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       return Matches(ticket, symbol, magic);
    }
 
-   // Get the broker's stable position identifier.
-   // Returns 0 if the position cannot be selected.
+   // ---------------------------------------------------------
+   // Read the broker's stable position identifier.
+   // ---------------------------------------------------------
+
    ulong Identifier(ulong ticket)
    {
       if(ticket == 0 || !PositionSelectByTicket(ticket))
@@ -81,8 +137,10 @@ public:
       return (ulong)PositionGetInteger(POSITION_IDENTIFIER);
    }
 
-   // Find the current ticket using a previously stored position identifier.
-   // This helps recover position references after an EA restart.
+   // ---------------------------------------------------------
+   // Find the current ticket from a saved identifier.
+   // ---------------------------------------------------------
+
    ulong FindTicketByIdentifier(
       ulong identifier,
       string symbol,
@@ -109,8 +167,15 @@ public:
       return 0;
    }
 
-   // Read the current volume of a managed position.
-   double Volume(ulong ticket, string symbol, long magic)
+   // ---------------------------------------------------------
+   // Read current volume.
+   // ---------------------------------------------------------
+
+   double Volume(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       if(!Matches(ticket, symbol, magic))
          return 0.0;
@@ -118,19 +183,32 @@ public:
       return PositionGetDouble(POSITION_VOLUME);
    }
 
-   // Read the current floating profit including swap.
-   double FloatingProfit(ulong ticket, string symbol, long magic)
+   // ---------------------------------------------------------
+   // Read floating profit including swap.
+   // ---------------------------------------------------------
+
+   double FloatingProfit(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       if(!Matches(ticket, symbol, magic))
          return 0.0;
 
-      double profit = PositionGetDouble(POSITION_PROFIT);
-      double swap   = PositionGetDouble(POSITION_SWAP);
+      double profit =
+         PositionGetDouble(POSITION_PROFIT);
+
+      double swap =
+         PositionGetDouble(POSITION_SWAP);
 
       return profit + swap;
    }
 
-   // Read the position's current direction.
+   // ---------------------------------------------------------
+   // Read position direction.
+   // ---------------------------------------------------------
+
    ENUM_POSITION_TYPE Direction(
       ulong ticket,
       string symbol,
@@ -140,11 +218,19 @@ public:
       if(!Matches(ticket, symbol, magic))
          return (ENUM_POSITION_TYPE)-1;
 
-      return (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      return (ENUM_POSITION_TYPE)
+         PositionGetInteger(POSITION_TYPE);
    }
 
-   // Read the position's opening price.
-   double OpenPrice(ulong ticket, string symbol, long magic)
+   // ---------------------------------------------------------
+   // Read original broker entry price.
+   // ---------------------------------------------------------
+
+   double OpenPrice(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       if(!Matches(ticket, symbol, magic))
          return 0.0;
@@ -152,8 +238,15 @@ public:
       return PositionGetDouble(POSITION_PRICE_OPEN);
    }
 
-   // Read the current stop-loss.
-   double StopLoss(ulong ticket, string symbol, long magic)
+   // ---------------------------------------------------------
+   // Read current broker stop-loss.
+   // ---------------------------------------------------------
+
+   double StopLoss(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       if(!Matches(ticket, symbol, magic))
          return 0.0;
@@ -161,13 +254,125 @@ public:
       return PositionGetDouble(POSITION_SL);
    }
 
-   // Read the current take-profit.
-   double TakeProfit(ulong ticket, string symbol, long magic)
+   // ---------------------------------------------------------
+   // Read current broker take-profit.
+   // ---------------------------------------------------------
+
+   double TakeProfit(
+      ulong ticket,
+      string symbol,
+      long magic
+   )
    {
       if(!Matches(ticket, symbol, magic))
          return 0.0;
 
       return PositionGetDouble(POSITION_TP);
+   }
+
+   // ---------------------------------------------------------
+   // Capture a complete current broker position snapshot.
+   //
+   // Returns false if the position cannot be verified.
+   // ---------------------------------------------------------
+
+   bool ReadSnapshot(
+      ulong ticket,
+      string symbol,
+      long magic,
+      SManagedPositionSnapshot &snapshot
+   )
+   {
+      snapshot.ticket = 0;
+      snapshot.identifier = 0;
+
+      snapshot.symbol = "";
+      snapshot.comment = "";
+
+      snapshot.magic = 0;
+      snapshot.openTime = 0;
+
+      snapshot.direction = (ENUM_POSITION_TYPE)-1;
+
+      snapshot.openPrice = 0.0;
+      snapshot.currentPrice = 0.0;
+
+      snapshot.stopLoss = 0.0;
+      snapshot.takeProfit = 0.0;
+
+      snapshot.currentVolume = 0.0;
+      snapshot.floatingProfit = 0.0;
+      snapshot.swap = 0.0;
+
+      snapshot.valid = false;
+
+      if(!Matches(ticket, symbol, magic))
+         return false;
+
+      snapshot.ticket = ticket;
+
+      snapshot.identifier =
+         (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+
+      snapshot.symbol =
+         PositionGetString(POSITION_SYMBOL);
+
+      snapshot.comment =
+         PositionGetString(POSITION_COMMENT);
+
+      snapshot.magic =
+         PositionGetInteger(POSITION_MAGIC);
+
+      snapshot.openTime =
+         PositionGetInteger(POSITION_TIME);
+
+      snapshot.direction =
+         (ENUM_POSITION_TYPE)
+         PositionGetInteger(POSITION_TYPE);
+
+      snapshot.openPrice =
+         PositionGetDouble(POSITION_PRICE_OPEN);
+
+      snapshot.stopLoss =
+         PositionGetDouble(POSITION_SL);
+
+      snapshot.takeProfit =
+         PositionGetDouble(POSITION_TP);
+
+      snapshot.currentVolume =
+         PositionGetDouble(POSITION_VOLUME);
+
+      snapshot.floatingProfit =
+         PositionGetDouble(POSITION_PROFIT);
+
+      snapshot.swap =
+         PositionGetDouble(POSITION_SWAP);
+
+      MqlTick tick;
+
+      if(!SymbolInfoTick(symbol, tick))
+         return false;
+
+      if(snapshot.direction == POSITION_TYPE_BUY)
+         snapshot.currentPrice = tick.bid;
+      else if(snapshot.direction == POSITION_TYPE_SELL)
+         snapshot.currentPrice = tick.ask;
+      else
+         return false;
+
+      if(
+         snapshot.identifier == 0 ||
+         snapshot.openPrice <= 0.0 ||
+         snapshot.currentVolume <= 0.0 ||
+         snapshot.currentPrice <= 0.0
+      )
+      {
+         return false;
+      }
+
+      snapshot.valid = true;
+
+      return true;
    }
 };
 
