@@ -20,7 +20,7 @@ private:
    CTradeRecovery recovery;
 
    // ---------------------------------------------------------
-   // COMPACT, ACCOUNT-SCOPED PERSISTENT STATE
+   // PERSISTENT ACCOUNT-SCOPED STATE
    // ---------------------------------------------------------
 
    string StateKey(
@@ -29,7 +29,6 @@ private:
       ulong identifier
    )
    {
-      // Keep keys short enough for MT5 Global Variables.
       return "GPM_" +
              (string)accountId + "_" +
              (string)identifier + "_" +
@@ -42,11 +41,7 @@ private:
       ulong identifier
    )
    {
-      string key = StateKey(
-         name,
-         accountId,
-         identifier
-      );
+      string key = StateKey(name, accountId, identifier);
 
       return (
          GlobalVariableCheck(key) &&
@@ -60,11 +55,7 @@ private:
       ulong identifier
    )
    {
-      string key = StateKey(
-         name,
-         accountId,
-         identifier
-      );
+      string key = StateKey(name, accountId, identifier);
 
       if(GlobalVariableSet(key, 1.0) == 0)
          return false;
@@ -80,11 +71,7 @@ private:
       double &value
    )
    {
-      string key = StateKey(
-         name,
-         accountId,
-         identifier
-      );
+      string key = StateKey(name, accountId, identifier);
 
       if(!GlobalVariableCheck(key))
          return false;
@@ -104,11 +91,7 @@ private:
       if(!MathIsValidNumber(value))
          return false;
 
-      string key = StateKey(
-         name,
-         accountId,
-         identifier
-      );
+      string key = StateKey(name, accountId, identifier);
 
       if(GlobalVariableSet(key, value) == 0)
          return false;
@@ -118,7 +101,7 @@ private:
    }
 
    // ---------------------------------------------------------
-   // BASIC POSITION HELPERS
+   // BASIC HELPERS
    // ---------------------------------------------------------
 
    bool IsBuy(ENUM_POSITION_TYPE direction)
@@ -149,9 +132,8 @@ private:
 
       while(
          digits < 8 &&
-         MathAbs(
-            step - NormalizeDouble(step, digits)
-         ) > 0.00000001
+         MathAbs(step - NormalizeDouble(step, digits))
+            > 0.00000001
       )
       {
          digits++;
@@ -162,27 +144,91 @@ private:
 
    double MinimumStopDistance(string symbol)
    {
-      double point =
-         SymbolInfoDouble(symbol, SYMBOL_POINT);
+      double point = SymbolInfoDouble(
+         symbol,
+         SYMBOL_POINT
+      );
 
       if(point <= 0.0)
          return 0.0;
 
-      long stops =
-         SymbolInfoInteger(
-            symbol,
-            SYMBOL_TRADE_STOPS_LEVEL
-         );
+      long stops = SymbolInfoInteger(
+         symbol,
+         SYMBOL_TRADE_STOPS_LEVEL
+      );
 
-      long freeze =
-         SymbolInfoInteger(
-            symbol,
-            SYMBOL_TRADE_FREEZE_LEVEL
-         );
+      long freeze = SymbolInfoInteger(
+         symbol,
+         SYMBOL_TRADE_FREEZE_LEVEL
+      );
 
       return (
          (double)MathMax(stops, freeze) + 2.0
       ) * point;
+   }
+
+   // ---------------------------------------------------------
+   // CONFIRM BROKER POSITION STATE
+   // ---------------------------------------------------------
+
+   bool ConfirmPositionModification(
+      ulong ticket,
+      ENUM_POSITION_TYPE direction,
+      double requestedSL,
+      double requestedTP,
+      bool checkSL,
+      bool checkTP
+   )
+   {
+      if(!PositionSelectByTicket(ticket))
+         return false;
+
+      double point = SymbolInfoDouble(
+         PositionGetString(POSITION_SYMBOL),
+         SYMBOL_POINT
+      );
+
+      if(point <= 0.0)
+         point = 0.0000001;
+
+      double actualSL = PositionGetDouble(POSITION_SL);
+      double actualTP = PositionGetDouble(POSITION_TP);
+
+      if(checkSL)
+      {
+         if(requestedSL <= 0.0 || actualSL <= 0.0)
+            return false;
+
+         if(direction == POSITION_TYPE_BUY)
+         {
+            if(actualSL < requestedSL - point)
+               return false;
+         }
+         else
+         {
+            if(actualSL > requestedSL + point)
+               return false;
+         }
+      }
+
+      if(checkTP)
+      {
+         if(requestedTP <= 0.0 || actualTP <= 0.0)
+            return false;
+
+         if(direction == POSITION_TYPE_BUY)
+         {
+            if(actualTP < requestedTP - point)
+               return false;
+         }
+         else
+         {
+            if(actualTP > requestedTP + point)
+               return false;
+         }
+      }
+
+      return true;
    }
 
    // ---------------------------------------------------------
@@ -199,22 +245,20 @@ private:
       double currentTP
    )
    {
-      double point =
-         SymbolInfoDouble(symbol, SYMBOL_POINT);
+      double point = SymbolInfoDouble(
+         symbol,
+         SYMBOL_POINT
+      );
 
-      int digits =
-         (int)SymbolInfoInteger(
-            symbol,
-            SYMBOL_DIGITS
-         );
+      int digits = (int)SymbolInfoInteger(
+         symbol,
+         SYMBOL_DIGITS
+      );
 
       if(candidate <= 0.0 || point <= 0.0)
          return false;
 
-      candidate = NormalizeDouble(
-         candidate,
-         digits
-      );
+      candidate = NormalizeDouble(candidate, digits);
 
       // Never loosen an existing protective stop.
       if(IsBuy(direction))
@@ -243,8 +287,7 @@ private:
       if(!SymbolInfoTick(symbol, tick))
          return false;
 
-      double minimumDistance =
-         MinimumStopDistance(symbol);
+      double minimumDistance = MinimumStopDistance(symbol);
 
       if(IsBuy(direction))
       {
@@ -270,12 +313,11 @@ private:
       if(!PositionSelectByTicket(ticket))
          return false;
 
-      bool requested =
-         trade.PositionModify(
-            ticket,
-            candidate,
-            currentTP
-         );
+      bool requested = trade.PositionModify(
+         ticket,
+         candidate,
+         currentTP
+      );
 
       if(!requested)
       {
@@ -291,45 +333,37 @@ private:
          return false;
       }
 
-      // Broker-side position state is authoritative.
-      if(!PositionSelectByTicket(ticket))
-         return false;
-
-      double confirmedSL =
-         PositionGetDouble(POSITION_SL);
-
-      bool confirmed = false;
-
-      if(IsBuy(direction))
-      {
-         confirmed =
-            confirmedSL > 0.0 &&
-            confirmedSL >= candidate - point;
-      }
-      else
-      {
-         confirmed =
-            confirmedSL > 0.0 &&
-            confirmedSL <= candidate + point;
-      }
-
-      if(!confirmed)
+      if(!ConfirmPositionModification(
+         ticket,
+         direction,
+         candidate,
+         currentTP,
+         true,
+         false
+      ))
       {
          Print(
             "Broker stop confirmation failed. Ticket=",
             ticket,
             " Requested=",
-            candidate,
-            " Actual=",
-            confirmedSL
+            candidate
          );
+
+         return false;
       }
 
-      return confirmed;
+      Print(
+         "Protective stop confirmed. Ticket=",
+         ticket,
+         " SL=",
+         candidate
+      );
+
+      return true;
    }
 
    // ---------------------------------------------------------
-   // ORIGINAL RISK
+   // ORIGINAL RISK CALCULATION
    // ---------------------------------------------------------
 
    double InitialRisk(
@@ -356,23 +390,20 @@ private:
       double currentVolume
    )
    {
-      double minimum =
-         SymbolInfoDouble(
-            symbol,
-            SYMBOL_VOLUME_MIN
-         );
+      double minimum = SymbolInfoDouble(
+         symbol,
+         SYMBOL_VOLUME_MIN
+      );
 
-      double maximum =
-         SymbolInfoDouble(
-            symbol,
-            SYMBOL_VOLUME_MAX
-         );
+      double maximum = SymbolInfoDouble(
+         symbol,
+         SYMBOL_VOLUME_MAX
+      );
 
-      double step =
-         SymbolInfoDouble(
-            symbol,
-            SYMBOL_VOLUME_STEP
-         );
+      double step = SymbolInfoDouble(
+         symbol,
+         SYMBOL_VOLUME_STEP
+      );
 
       if(
          minimum <= 0.0 ||
@@ -386,26 +417,19 @@ private:
       if(currentVolume < minimum * 2.0)
          return 0.0;
 
-      double requested =
-         currentVolume * 0.50;
+      double requested = currentVolume * 0.50;
 
-      double volume =
-         MathFloor(
-            requested / step + 0.00000001
-         ) * step;
+      double volume = MathFloor(
+         requested / step + 0.00000001
+      ) * step;
 
       volume = NormalizeDouble(
          volume,
          VolumePrecision(step)
       );
 
-      if(
-         volume < minimum ||
-         volume > maximum
-      )
-      {
+      if(volume < minimum || volume > maximum)
          return 0.0;
-      }
 
       if(
          currentVolume - volume <
@@ -494,10 +518,6 @@ private:
       return true;
    }
 
-   // ---------------------------------------------------------
-   // PROFIT TRACKING CALCULATIONS
-   // ---------------------------------------------------------
-
    double FavorableDistance(
       ENUM_POSITION_TYPE direction,
       double entryPrice,
@@ -523,17 +543,13 @@ private:
       if(initialRisk <= 0.0)
          return 0.0;
 
-      double favorable =
-         FavorableDistance(
-            direction,
-            entryPrice,
-            peakPrice
-         );
-
-      return MathMax(
-         0.0,
-         favorable / initialRisk
+      double favorable = FavorableDistance(
+         direction,
+         entryPrice,
+         peakPrice
       );
+
+      return MathMax(0.0, favorable / initialRisk);
    }
 
    double CurrentProfitR(
@@ -546,18 +562,17 @@ private:
       if(initialRisk <= 0.0)
          return 0.0;
 
-      double favorable =
-         FavorableDistance(
-            direction,
-            entryPrice,
-            currentPrice
-         );
+      double favorable = FavorableDistance(
+         direction,
+         entryPrice,
+         currentPrice
+      );
 
       return favorable / initialRisk;
    }
 
    // ---------------------------------------------------------
-   // PROFIT-RETRACEMENT PROTECTION
+   // PROFIT RETRACEMENT PROTECTION
    // ---------------------------------------------------------
 
    void ProtectPeakProfit(
@@ -586,96 +601,70 @@ private:
 
       double peakPrice = 0.0;
 
-      if(
-         !UpdatePeakPrice(
-            accountId,
-            identifier,
-            direction,
-            currentPrice,
-            peakPrice
-         )
-      )
+      if(!UpdatePeakPrice(
+         accountId,
+         identifier,
+         direction,
+         currentPrice,
+         peakPrice
+      ))
       {
          Print(
-            "Peak-profit state could not be saved. ",
-            "Ticket=",
+            "Peak-profit state could not be saved. Ticket=",
             ticket
          );
 
          return;
       }
 
-      double peakR =
-         PeakProfitR(
-            direction,
-            entryPrice,
-            peakPrice,
-            initialRisk
-         );
+      double peakR = PeakProfitR(
+         direction,
+         entryPrice,
+         peakPrice,
+         initialRisk
+      );
 
-      double currentR =
-         CurrentProfitR(
-            direction,
-            entryPrice,
-            currentPrice,
-            initialRisk
-         );
+      double currentR = CurrentProfitR(
+         direction,
+         entryPrice,
+         currentPrice,
+         initialRisk
+      );
 
-      double givebackR =
-         peakR - currentR;
+      double givebackR = peakR - currentR;
 
-      // A trade must first develop meaningful profit.
       if(peakR < 0.75)
          return;
 
-      // Protect when a meaningful portion of peak profit
-      // has been surrendered or momentum is weakening.
-      bool retracementDetected =
-         givebackR >= 0.20;
+      bool retracementDetected = givebackR >= 0.20;
 
       bool momentumWarning =
          state.dataValid &&
          state.momentumWeakening;
 
-      if(
-         !retracementDetected &&
-         !momentumWarning
-      )
-      {
+      if(!retracementDetected && !momentumWarning)
          return;
-      }
 
-      // Retain at least 60% of the favourable price move
-      // measured from the original entry to the peak.
-      // The minimum lock is 0.10R.
-      double lockedDistance =
-         MathMax(
-            initialRisk * 0.10,
-            (peakPrice - entryPrice) *
-            (direction == POSITION_TYPE_BUY ? 0.60 : 0.0)
-         );
+      double favorableDistance = FavorableDistance(
+         direction,
+         entryPrice,
+         peakPrice
+      );
 
-      if(direction == POSITION_TYPE_SELL)
-      {
-         lockedDistance =
-            MathMax(
-               initialRisk * 0.10,
-               (entryPrice - peakPrice) * 0.60
-            );
-      }
+      if(favorableDistance <= 0.0)
+         return;
+
+      double lockedDistance = MathMax(
+         initialRisk * 0.10,
+         favorableDistance * 0.60
+      );
 
       double candidate = 0.0;
 
       if(direction == POSITION_TYPE_BUY)
-      {
-         candidate =
-            entryPrice + lockedDistance;
-      }
+         candidate = entryPrice + lockedDistance;
       else
-      {
-         candidate =
-            entryPrice - lockedDistance;
-      }
+         candidate = entryPrice - lockedDistance;
 
       candidate = NormalizeDouble(
          candidate,
@@ -685,22 +674,20 @@ private:
          )
       );
 
-      bool improved =
-         ImproveStop(
-            trade,
-            ticket,
-            symbol,
-            direction,
-            candidate,
-            currentSL,
-            currentTP
-         );
+      bool improved = ImproveStop(
+         trade,
+         ticket,
+         symbol,
+         direction,
+         candidate,
+         currentSL,
+         currentTP
+      );
 
       if(improved)
       {
          Print(
-            "Peak-profit protection confirmed. ",
-            "Ticket=",
+            "Peak-profit protection confirmed. Ticket=",
             ticket,
             " Peak R=",
             DoubleToString(peakR, 2),
@@ -726,8 +713,7 @@ private:
       if(!state.dataValid || state.atr <= 0.0)
          return false;
 
-      double normalized =
-         market.NormalizedMomentum(state);
+      double normalized = market.NormalizedMomentum(state);
 
       if(direction == POSITION_TYPE_BUY)
       {
@@ -759,8 +745,7 @@ private:
       if(!state.momentumStrengthening)
          return false;
 
-      double normalized =
-         market.NormalizedMomentum(state);
+      double normalized = market.NormalizedMomentum(state);
 
       if(direction == POSITION_TYPE_BUY)
       {
@@ -795,6 +780,7 @@ private:
       SMarketState &state
    )
    {
+      // Partial close is restricted to hedging accounts.
       if(
          AccountInfoInteger(ACCOUNT_MARGIN_MODE) !=
          ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
@@ -809,13 +795,11 @@ private:
       if(!market.SupportsDirection(state, direction))
          return;
 
-      if(
-         StateDone(
-            "PartialDone",
-            accountId,
-            identifier
-         )
-      )
+      if(StateDone(
+         "PartialDone",
+         accountId,
+         identifier
+      ))
       {
          return;
       }
@@ -823,20 +807,22 @@ private:
       if(!PositionSelectByTicket(ticket))
          return;
 
-      double currentVolume =
-         PositionGetDouble(POSITION_VOLUME);
+      double currentVolume = PositionGetDouble(
+         POSITION_VOLUME
+      );
 
-      double closeVolume =
-         PartialVolume(symbol, currentVolume);
+      double closeVolume = PartialVolume(
+         symbol,
+         currentVolume
+      );
 
       if(closeVolume <= 0.0)
          return;
 
-      bool requested =
-         trade.PositionClosePartial(
-            ticket,
-            closeVolume
-         );
+      bool requested = trade.PositionClosePartial(
+         ticket,
+         closeVolume
+      );
 
       if(!requested)
       {
@@ -868,13 +854,11 @@ private:
          return;
       }
 
-      double remaining =
-         PositionGetDouble(POSITION_VOLUME);
+      double remaining = PositionGetDouble(
+         POSITION_VOLUME
+      );
 
-      if(
-         remaining <
-         currentVolume - 0.00000001
-      )
+      if(remaining < currentVolume - 0.00000001)
       {
          SaveState(
             "PartialDone",
@@ -894,7 +878,7 @@ private:
       else
       {
          Print(
-            "Partial close was not confirmed by broker. Ticket=",
+            "Partial close not confirmed by broker. Ticket=",
             ticket
          );
       }
@@ -921,13 +905,11 @@ private:
       if(!StrongMomentumSupports(state, direction))
          return;
 
-      if(
-         StateDone(
-            "TargetExtended",
-            accountId,
-            identifier
-         )
-      )
+      if(StateDone(
+         "TargetExtended",
+         accountId,
+         identifier
+      ))
       {
          return;
       }
@@ -935,46 +917,39 @@ private:
       if(!PositionSelectByTicket(ticket))
          return;
 
-      double currentTP =
-         PositionGetDouble(POSITION_TP);
-
-      double currentSL =
-         PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double currentSL = PositionGetDouble(POSITION_SL);
 
       if(currentTP <= 0.0)
          return;
 
-      double point =
-         SymbolInfoDouble(symbol, SYMBOL_POINT);
+      double point = SymbolInfoDouble(
+         symbol,
+         SYMBOL_POINT
+      );
 
-      int digits =
-         (int)SymbolInfoInteger(
-            symbol,
-            SYMBOL_DIGITS
-         );
+      int digits = (int)SymbolInfoInteger(
+         symbol,
+         SYMBOL_DIGITS
+      );
 
       if(point <= 0.0)
          return;
 
-      double extension =
-         initialRisk * 0.50;
+      double extension = initialRisk * 0.50;
 
       double candidate = IsBuy(direction)
          ? currentTP + extension
          : currentTP - extension;
 
-      candidate = NormalizeDouble(
-         candidate,
-         digits
-      );
+      candidate = NormalizeDouble(candidate, digits);
 
       MqlTick tick;
 
       if(!SymbolInfoTick(symbol, tick))
          return;
 
-      double minimumDistance =
-         MinimumStopDistance(symbol);
+      double minimumDistance = MinimumStopDistance(symbol);
 
       if(IsBuy(direction))
       {
@@ -997,12 +972,11 @@ private:
          }
       }
 
-      bool requested =
-         trade.PositionModify(
-            ticket,
-            currentSL,
-            candidate
-         );
+      bool requested = trade.PositionModify(
+         ticket,
+         currentSL,
+         candidate
+      );
 
       if(!requested)
       {
@@ -1018,42 +992,37 @@ private:
          return;
       }
 
-      if(!PositionSelectByTicket(ticket))
-         return;
-
-      double confirmedTP =
-         PositionGetDouble(POSITION_TP);
-
-      bool confirmed = IsBuy(direction)
-         ? confirmedTP >= candidate - point
-         : confirmedTP <= candidate + point;
-
-      if(confirmed)
-      {
-         SaveState(
-            "TargetExtended",
-            accountId,
-            identifier
-         );
-
-         Print(
-            "TP extension confirmed. Ticket=",
-            ticket,
-            " New TP=",
-            confirmedTP
-         );
-      }
-      else
+      if(!ConfirmPositionModification(
+         ticket,
+         direction,
+         currentSL,
+         candidate,
+         false,
+         true
+      ))
       {
          Print(
             "TP extension not confirmed. Ticket=",
             ticket,
             " Requested=",
-            candidate,
-            " Actual=",
-            confirmedTP
+            candidate
          );
+
+         return;
       }
+
+      SaveState(
+         "TargetExtended",
+         accountId,
+         identifier
+      );
+
+      Print(
+         "TP extension confirmed. Ticket=",
+         ticket,
+         " New TP=",
+         candidate
+      );
    }
 
    // ---------------------------------------------------------
@@ -1069,12 +1038,10 @@ private:
       SMarketState &state
    )
    {
-      if(
-         !StrongOppositeThesis(
-            state,
-            snapshot.direction
-         )
-      )
+      if(!StrongOppositeThesis(
+         state,
+         snapshot.direction
+      ))
       {
          return false;
       }
@@ -1082,13 +1049,11 @@ private:
       if(snapshot.floatingProfit >= 0.0)
          return false;
 
-      if(
-         StateDone(
-            "ThesisExit",
-            accountId,
-            identifier
-         )
-      )
+      if(StateDone(
+         "ThesisExit",
+         accountId,
+         identifier
+      ))
       {
          return false;
       }
@@ -1096,8 +1061,7 @@ private:
       if(!PositionSelectByTicket(ticket))
          return false;
 
-      bool requested =
-         trade.PositionClose(ticket);
+      bool requested = trade.PositionClose(ticket);
 
       if(!requested)
       {
@@ -1140,7 +1104,7 @@ private:
    }
 
    // ---------------------------------------------------------
-   // MANAGE ONE BROKER-CONFIRMED POSITION
+   // MANAGE ONE POSITION
    // ---------------------------------------------------------
 
    void ManageOne(
@@ -1154,14 +1118,12 @@ private:
    {
       SManagedPositionSnapshot snapshot;
 
-      if(
-         !tracker.ReadSnapshot(
-            ticket,
-            symbol,
-            magic,
-            snapshot
-         )
-      )
+      if(!tracker.ReadSnapshot(
+         ticket,
+         symbol,
+         magic,
+         snapshot
+      ))
       {
          return;
       }
@@ -1171,12 +1133,41 @@ private:
 
       SOriginalEntryContext context;
 
-      bool hasContext =
-         recovery.LoadEntryContext(
+      bool hasContext = recovery.LoadEntryContext(
+         accountId,
+         snapshot.identifier,
+         context
+      );
+
+      // ------------------------------------------------------
+      // NEW: RECOVER MISSING CONTEXT FROM BROKER HISTORY
+      // ------------------------------------------------------
+
+      if(!hasContext)
+      {
+         hasContext = recovery.RecoverEntryContextFromHistory(
             accountId,
             snapshot.identifier,
+            magic,
+            symbol,
             context
          );
+
+         if(hasContext)
+         {
+            Print(
+               "Position manager restored entry context. ",
+               "Ticket=",
+               ticket,
+               " Identifier=",
+               snapshot.identifier,
+               " Recovered=",
+               context.historyRecovered,
+               " Signal context available=",
+               context.signalContextAvailable
+            );
+         }
+      }
 
       if(
          hasContext &&
@@ -1200,7 +1191,7 @@ private:
       {
          Print(
             "Original entry context unavailable. ",
-            "Broker SL/TP remain active. ",
+            "Existing broker SL/TP remain active. ",
             "Identifier=",
             snapshot.identifier
          );
@@ -1208,8 +1199,7 @@ private:
          return;
       }
 
-      double initialRisk =
-         InitialRisk(context);
+      double initialRisk = InitialRisk(context);
 
       if(initialRisk <= 0.0)
       {
@@ -1222,44 +1212,50 @@ private:
          return;
       }
 
-      double entryPrice =
-         context.entryPrice;
+      double entryPrice = context.entryPrice;
 
-      double favorableMovement =
-         FavorableDistance(
-            snapshot.direction,
-            entryPrice,
-            snapshot.currentPrice
-         );
+      double favorableMovement = FavorableDistance(
+         snapshot.direction,
+         entryPrice,
+         snapshot.currentPrice
+      );
 
-      double rMultiple =
-         favorableMovement / initialRisk;
+      double rMultiple = favorableMovement / initialRisk;
 
-      // Update the persistent peak even before a profit
-      // protection trigger is reached.
+      // ------------------------------------------------------
+      // UPDATE PEAK PRICE EVERY MANAGEMENT CYCLE
+      // ------------------------------------------------------
+
       double peakPrice = 0.0;
 
-      UpdatePeakPrice(
+      if(!UpdatePeakPrice(
          accountId,
          snapshot.identifier,
          snapshot.direction,
          snapshot.currentPrice,
          peakPrice
-      );
+      ))
+      {
+         Print(
+            "Could not update peak-price state. Ticket=",
+            ticket
+         );
+      }
 
-      // Evaluate thesis invalidation only with valid analysis.
+      // ------------------------------------------------------
+      // INVALIDATED TRADE THESIS
+      // ------------------------------------------------------
+
       if(state.dataValid)
       {
-         if(
-            CloseInvalidatedPosition(
-               trade,
-               ticket,
-               accountId,
-               snapshot.identifier,
-               snapshot,
-               state
-            )
-         )
+         if(CloseInvalidatedPosition(
+            trade,
+            ticket,
+            accountId,
+            snapshot.identifier,
+            snapshot,
+            state
+         ))
          {
             return;
          }
@@ -1271,8 +1267,7 @@ private:
 
       if(rMultiple >= 1.0)
       {
-         double protectedPrice =
-            IsBuy(snapshot.direction)
+         double protectedPrice = IsBuy(snapshot.direction)
             ? entryPrice + initialRisk * 0.10
             : entryPrice - initialRisk * 0.10;
 
@@ -1315,35 +1310,34 @@ private:
       }
 
       // ------------------------------------------------------
-      // PROFIT PEAK / RETRACEMENT PROTECTION
+      // PEAK-PROFIT PROTECTION
+      //
+      // IMPORTANT:
+      // This is evaluated even if current R has fallen below
+      // +0.5R. A previously profitable position can therefore
+      // still trigger protection after a retracement.
       // ------------------------------------------------------
 
-      if(rMultiple >= 0.50)
-      {
-         if(!PositionSelectByTicket(ticket))
-            return;
+      if(!PositionSelectByTicket(ticket))
+         return;
 
-         double latestSL =
-            PositionGetDouble(POSITION_SL);
+      double latestSL = PositionGetDouble(POSITION_SL);
+      double latestTP = PositionGetDouble(POSITION_TP);
 
-         double latestTP =
-            PositionGetDouble(POSITION_TP);
-
-         ProtectPeakProfit(
-            trade,
-            ticket,
-            symbol,
-            accountId,
-            snapshot.identifier,
-            snapshot.direction,
-            entryPrice,
-            initialRisk,
-            snapshot.currentPrice,
-            latestSL,
-            latestTP,
-            state
-         );
-      }
+      ProtectPeakProfit(
+         trade,
+         ticket,
+         symbol,
+         accountId,
+         snapshot.identifier,
+         snapshot.direction,
+         entryPrice,
+         initialRisk,
+         snapshot.currentPrice,
+         latestSL,
+         latestTP,
+         state
+      );
 
       // ------------------------------------------------------
       // VOLATILITY-AWARE TRAILING AFTER +0.5R
@@ -1361,30 +1355,27 @@ private:
       if(!PositionSelectByTicket(ticket))
          return;
 
-      double currentSL =
-         PositionGetDouble(POSITION_SL);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
 
-      double currentTP =
-         PositionGetDouble(POSITION_TP);
+      double point = SymbolInfoDouble(
+         symbol,
+         SYMBOL_POINT
+      );
 
-      double point =
-         SymbolInfoDouble(symbol, SYMBOL_POINT);
-
-      int digits =
-         (int)SymbolInfoInteger(
-            symbol,
-            SYMBOL_DIGITS
-         );
+      int digits = (int)SymbolInfoInteger(
+         symbol,
+         SYMBOL_DIGITS
+      );
 
       if(point <= 0.0)
          return;
 
-      double distance =
-         trailing.AdaptiveDistance(
-            symbol,
-            state.atr,
-            state.volatilityRatio
-         );
+      double distance = trailing.AdaptiveDistance(
+         symbol,
+         state.atr,
+         state.volatilityRatio
+      );
 
       if(distance <= 0.0)
          return;
@@ -1397,15 +1388,14 @@ private:
          );
       }
 
-      double candidate =
-         trailing.ImprovedStop(
-            snapshot.direction,
-            snapshot.currentPrice,
-            currentSL,
-            distance,
-            point,
-            digits
-         );
+      double candidate = trailing.ImprovedStop(
+         snapshot.direction,
+         snapshot.currentPrice,
+         currentSL,
+         distance,
+         point,
+         digits
+      );
 
       if(candidate <= 0.0)
          return;
@@ -1422,7 +1412,7 @@ private:
    }
 
    // ---------------------------------------------------------
-   // MANAGE ALL POSITIONS FOR THIS ACCOUNT AND EA
+   // MANAGE ALL POSITIONS
    // ---------------------------------------------------------
 
    void ManageAll(
@@ -1453,12 +1443,11 @@ private:
       state.momentumWeakening = false;
       state.dataValid = false;
 
-      bool analysisAvailable =
-         market.Analyze(
-            symbol,
-            PERIOD_M1,
-            state
-         );
+      bool analysisAvailable = market.Analyze(
+         symbol,
+         PERIOD_M1,
+         state
+      );
 
       if(!analysisAvailable)
       {
@@ -1486,13 +1475,11 @@ private:
          if(ticket == 0)
             continue;
 
-         if(
-            tracker.IsManagedPosition(
-               ticket,
-               symbol,
-               magic
-            )
-         )
+         if(tracker.IsManagedPosition(
+            ticket,
+            symbol,
+            magic
+         ))
          {
             tickets[used] = ticket;
             used++;
@@ -1516,6 +1503,7 @@ private:
 
 public:
 
+   // Existing interface used by GoldScalperEA.mq5.
    void Manage(
       CTrade &trade,
       string symbol,
@@ -1540,8 +1528,7 @@ public:
       CSignalEngine &signalEngine
    )
    {
-      long login =
-         AccountInfoInteger(ACCOUNT_LOGIN);
+      long login = AccountInfoInteger(ACCOUNT_LOGIN);
 
       ManageAll(
          trade,
