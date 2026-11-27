@@ -1,7 +1,7 @@
 
 #property strict
-#property version "1.01"
-#property description "Gold Scalper EA - individual position management; demo-first"
+#property version "1.02"
+#property description "Gold Scalper EA - original entries; independent post-entry intelligence; demo and authorized live"
 
 #include <Trade/Trade.mqh>
 
@@ -11,15 +11,16 @@
 #include "ExecutionManager.mqh"
 #include "AdaptiveManager.mqh"
 #include "Telemetry.mqh"
-#include "NewsFilter.mqh"
-#include "SessionFilter.mqh"
-#include "SignalConfirmation.mqh"
-#include "EntryFilter.mqh"
 #include "BrokerSpecification.mqh"
 #include "PositionTracker.mqh"
 #include "EntryManager.mqh"
 #include "TradeRecovery.mqh"
 #include "ExitManager.mqh"
+
+// Adaptive learning records completed outcomes only.
+// It never changes the original entry signal or lot size.
+// Demo accounts can run with backend permission.
+// Real accounts additionally require InpAllowLiveTrading=true.
 
 input string InpApiBaseUrl="https://YOUR-API.onrender.com";
 input string InpAgentId="oracle-agent-1";
@@ -37,16 +38,6 @@ input int InpMaxPositionsOverride=0;
 
 input bool InpOneEntryPerM1Bar=false;
 
-input bool InpNewsFilterEnabled=false;
-input int InpNewsMinutesBefore=15;
-input int InpNewsMinutesAfter=15;
-
-input bool InpSessionFilterEnabled=false;
-input int InpSessionStartHour=0;
-input int InpSessionEndHour=24;
-
-input bool InpRequireCandleConfirmation=true;
-
 CTrade trade;
 CSignalEngine signalEngine;
 CRiskManager riskManager;
@@ -59,9 +50,6 @@ CPositionTracker positionTracker;
 CEntryManager entryManager;
 CTradeRecovery tradeRecovery;
 CExitManager exitManager;
-CNewsFilter newsFilter;
-CSessionFilter sessionFilter;
-CEntryFilter entryFilter;
 
 bool g_enabled=false;
 bool g_emergency=false;
@@ -71,15 +59,6 @@ bool g_riskLocked=false;
 int g_maxPositions=0;
 
 bool g_oneEntryPerBar=false;
-bool g_newsFilterEnabled=false;
-bool g_sessionFilterEnabled=false;
-bool g_requireCandleConfirmation=true;
-
-int g_newsMinutesBefore=15;
-int g_newsMinutesAfter=15;
-
-int g_sessionStartHour=0;
-int g_sessionEndHour=24;
 
 datetime g_lastEntryBar=0;
 bool g_restartEntryBlock=false;
@@ -147,16 +126,6 @@ int OnInit()
    g_oneEntryPerBar=InpOneEntryPerM1Bar;
    g_maxPositions=InpMaxPositionsOverride;
 
-   g_newsFilterEnabled=InpNewsFilterEnabled;
-   g_newsMinutesBefore=InpNewsMinutesBefore;
-   g_newsMinutesAfter=InpNewsMinutesAfter;
-
-   g_sessionFilterEnabled=InpSessionFilterEnabled;
-   g_sessionStartHour=InpSessionStartHour;
-   g_sessionEndHour=InpSessionEndHour;
-
-   g_requireCandleConfirmation=InpRequireCandleConfirmation;
-
    datetime currentBar=iTime(g_symbol,PERIOD_M1,0);
 
    g_lastEntryBar=tradeRecovery.LastEntryBar(InpAccountId);
@@ -201,7 +170,7 @@ int OnInit()
       g_emergency=true;
    }
 
-   // Live trading remains disabled unless explicitly permitted.
+   // Real-money execution is disabled by default.
    g_enabled=
       InpStartEnabled &&
       (!IsRealAccount() || InpAllowLiveTrading);
@@ -220,7 +189,9 @@ int OnInit()
       "Gold Scalper initialized on ",
       g_symbol,
       "; entries enabled=",
-      g_enabled
+      g_enabled,
+      "; real account=",
+      IsRealAccount()
    );
 
    return INIT_SUCCEEDED;
@@ -266,8 +237,7 @@ void OnTick()
    if(g_symbol=="")
       return;
 
-   // Record the newest available price BEFORE position management.
-   // This gives the supervisor the freshest momentum information.
+   // Observe the newest available price before position management.
    MqlTick tick;
 
    if(SymbolInfoTick(g_symbol,tick))
@@ -275,8 +245,8 @@ void OnTick()
       signalEngine.Observe(tick.bid,tick.ask);
    }
 
-   // Existing positions are always managed independently.
-   // This continues even when new entries are disabled.
+   // Manage existing broker-confirmed positions independently.
+   // This continues even if new entries are disabled.
    positionManager.Manage(
       trade,
       g_symbol,
@@ -284,8 +254,8 @@ void OnTick()
       signalEngine
    );
 
-   // A manual emergency CLOSE_ALL command remains supported.
-   // This is not an automatic basket-profit or basket-loss rule.
+   // Manual emergency CLOSE_ALL remains available.
+   // There is no automatic basket-profit or basket-loss closure.
    if(g_closeAllRequested)
    {
       exitManager.CloseAll(
@@ -307,8 +277,7 @@ void OnTick()
       return;
    }
 
-   // Do not open new positions on a real account unless
-   // live trading was explicitly enabled.
+   // Real account execution requires explicit local authorization.
    if(IsRealAccount() && !InpAllowLiveTrading)
       return;
 
@@ -321,19 +290,19 @@ void OnTick()
    double equity=
       AccountInfoDouble(ACCOUNT_EQUITY);
 
-   // Position management has already run above.
-   // No fixed account drawdown or basket-loss close-all
-   // is performed here.
-
+   // Existing positions have already been managed.
+   // No automatic account drawdown or basket-loss close-all.
    int allowedPositions=
       riskManager.MaxPositions(equity);
 
    if(g_maxPositions>0)
    {
       allowedPositions=
-         MathMin(allowedPositions,g_maxPositions);
+         (int)MathMin(allowedPositions,g_maxPositions);
    }
 
+   // Manual platform permission and position capacity.
+   // Adaptive intelligence does not participate in this decision.
    if(
       !entryManager.CanEnter(
          positions,
@@ -350,6 +319,7 @@ void OnTick()
    datetime currentBar=
       iTime(g_symbol,PERIOD_M1,0);
 
+   // Prevent duplicate entry immediately after an EA restart.
    if(g_restartEntryBlock)
    {
       if(currentBar==g_lastEntryBar)
@@ -358,6 +328,7 @@ void OnTick()
       g_restartEntryBlock=false;
    }
 
+   // Optional operator-controlled entry frequency setting.
    if(
       g_oneEntryPerBar &&
       currentBar>0 &&
@@ -367,50 +338,16 @@ void OnTick()
       return;
    }
 
-   // Original entry signal calculation is preserved.
+   // ORIGINAL ENTRY SIGNAL.
+   // No adaptive confidence restriction or signal veto.
    int confidence=0;
    ENUM_ORDER_TYPE side;
 
    if(!signalEngine.GetSignal(side,confidence))
       return;
 
-   if(confidence<adaptiveManager.MinimumConfidence())
-      return;
-
-   if(
-      !entryFilter.Allowed(
-         g_symbol,
-         side,
-         g_requireCandleConfirmation
-      )
-   )
-   {
-      return;
-   }
-
-   if(
-      !sessionFilter.Allowed(
-         g_sessionFilterEnabled,
-         g_sessionStartHour,
-         g_sessionEndHour
-      )
-   )
-   {
-      return;
-   }
-
-   if(
-      newsFilter.IsBlocked(
-         g_newsFilterEnabled,
-         "USD",
-         g_newsMinutesBefore,
-         g_newsMinutesAfter
-      )
-   )
-   {
-      return;
-   }
-
+   // Require a valid live broker quote.
+   // No arbitrary spread ceiling or confidence-based rejection.
    if(
       !executionManager.EntryCostOK(
          g_symbol,
@@ -422,7 +359,8 @@ void OnTick()
       return;
    }
 
-   // Original equity-based volume calculation.
+   // ORIGINAL EQUITY-BASED LOT CALCULATION.
+   // Intelligence cannot increase or decrease this volume.
    double volume=
       riskManager.VolumeForPosition(
          g_symbol,
@@ -430,13 +368,7 @@ void OnTick()
          positions+1
       );
 
-   volume=
-      riskManager.NormalizeVolume(
-         g_symbol,
-         volume*adaptiveManager.VolumeMultiplier()
-      );
-
-   // Check actual broker margin requirements.
+   // Check the broker's actual margin requirement.
    volume=
       riskManager.FitVolumeToMargin(
          g_symbol,
@@ -455,6 +387,24 @@ void OnTick()
    double entry=
       (side==ORDER_TYPE_BUY ? tick.ask : tick.bid);
 
+   // Original Python calculator expects spread in pips.
+   // Conventional XAUUSD pip size is $0.01.
+   // Confirm this against the broker's symbol specification.
+   double spreadPrice=tick.ask-tick.bid;
+   double goldPipSize=0.01;
+
+   if(spreadPrice<0.0 || goldPipSize<=0.0)
+      return;
+
+   double spreadPips=
+      spreadPrice/goldPipSize;
+
+   double recentMovement=
+      signalEngine.RecentMovement();
+
+   int positionNumber=positions+1;
+
+   // Use the complete original dynamic TP/SL formula.
    if(
       !riskManager.BuildStops(
          g_symbol,
@@ -462,15 +412,23 @@ void OnTick()
          entry,
          volume,
          confidence,
+         spreadPips,
+         recentMovement,
+         positionNumber,
          sl,
          tp
       )
    )
    {
+      Print(
+         "Dynamic SL/TP calculation failed; ",
+         "no order sent."
+      );
+
       return;
    }
 
-   // Original BUY/SELL execution.
+   // ORIGINAL BUY/SELL EXECUTION.
    bool ok=
       (side==ORDER_TYPE_BUY)
       ?
@@ -849,44 +807,11 @@ void PollCommands()
          g_maxPositions=
             (int)JsonLongValue(response,"max_positions");
 
-         g_newsMinutesBefore=
-            (int)JsonLongValue(response,"news_minutes_before");
-
-         g_newsMinutesAfter=
-            (int)JsonLongValue(response,"news_minutes_after");
-
-         g_sessionStartHour=
-            (int)JsonLongValue(response,"session_start_hour");
-
-         g_sessionEndHour=
-            (int)JsonLongValue(response,"session_end_hour");
-
          g_oneEntryPerBar=
             JsonBoolValue(
                response,
                "one_entry_per_m1_bar",
                g_oneEntryPerBar
-            );
-
-         g_newsFilterEnabled=
-            JsonBoolValue(
-               response,
-               "news_filter_enabled",
-               g_newsFilterEnabled
-            );
-
-         g_sessionFilterEnabled=
-            JsonBoolValue(
-               response,
-               "session_filter_enabled",
-               g_sessionFilterEnabled
-            );
-
-         g_requireCandleConfirmation=
-            JsonBoolValue(
-               response,
-               "require_candle_confirmation",
-               g_requireCandleConfirmation
             );
 
          applied=true;
