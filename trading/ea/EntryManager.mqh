@@ -6,6 +6,12 @@ class CEntryManager
 {
 public:
 
+   CEntryManager()
+   {
+   }
+
+   // Original entry authorization.
+   // The intelligence supervisor must not filter or delay entries.
    bool CanEnter(
       int currentPositions,
       int maximumPositions,
@@ -14,20 +20,22 @@ public:
       bool riskLocked
    )
    {
-      // Manual controls remain authoritative.
+      // Manual start/stop and emergency controls remain authoritative.
       if(!enabled || emergency)
          return false;
 
-      // Position capacity remains part of the original entry rules.
+      // Preserve the existing position-capacity rule.
       if(maximumPositions <= 0)
+         return false;
+
+      if(currentPositions < 0)
          return false;
 
       if(currentPositions >= maximumPositions)
          return false;
 
-      // riskLocked is intentionally not used as an intelligence
-      // entry filter. It is retained in the signature for compatibility
-      // with the current GoldScalperEA.mq5.
+      // Retained for compatibility with GoldScalperEA.mq5.
+      // No additional intelligence-based entry filter.
       return true;
    }
 };
