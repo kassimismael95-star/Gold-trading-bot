@@ -1,7 +1,7 @@
 
 #property strict
-#property version "1.02"
-#property description "Gold Scalper EA - original entries; independent post-entry intelligence; demo and authorized live"
+#property version "1.03"
+#property description "Gold Scalper EA - original entries; broker-confirmed entry context; demo and authorized live"
 
 #include <Trade/Trade.mqh>
 
@@ -17,11 +17,6 @@
 #include "TradeRecovery.mqh"
 #include "ExitManager.mqh"
 
-// Adaptive learning records completed outcomes only.
-// It never changes the original entry signal or lot size.
-// Demo accounts can run with backend permission.
-// Real accounts additionally require InpAllowLiveTrading=true.
-
 input string InpApiBaseUrl="https://YOUR-API.onrender.com";
 input string InpAgentId="oracle-agent-1";
 input long InpAccountId=0;
@@ -29,6 +24,8 @@ input string InpAccountToken="PASTE_ACCOUNT_TOKEN_HERE";
 input string InpSymbol="AUTO";
 input long InpMagic=9924102;
 
+// Real-money trading requires this explicit local permission
+// AND the backend account permission.
 input bool InpAllowLiveTrading=false;
 input bool InpStartEnabled=false;
 
@@ -57,7 +54,6 @@ bool g_closeAllRequested=false;
 bool g_riskLocked=false;
 
 int g_maxPositions=0;
-
 bool g_oneEntryPerBar=false;
 
 datetime g_lastEntryBar=0;
@@ -171,6 +167,7 @@ int OnInit()
    }
 
    // Real-money execution is disabled by default.
+   // Existing positions are still managed by OnTick.
    g_enabled=
       InpStartEnabled &&
       (!IsRealAccount() || InpAllowLiveTrading);
@@ -237,16 +234,13 @@ void OnTick()
    if(g_symbol=="")
       return;
 
-   // Observe the newest available price before position management.
    MqlTick tick;
 
    if(SymbolInfoTick(g_symbol,tick))
-   {
       signalEngine.Observe(tick.bid,tick.ask);
-   }
 
-   // Manage existing broker-confirmed positions independently.
-   // This continues even if new entries are disabled.
+   // Existing broker-confirmed positions continue to be managed
+   // even when new entries are disabled.
    positionManager.Manage(
       trade,
       g_symbol,
@@ -290,8 +284,6 @@ void OnTick()
    double equity=
       AccountInfoDouble(ACCOUNT_EQUITY);
 
-   // Existing positions have already been managed.
-   // No automatic account drawdown or basket-loss close-all.
    int allowedPositions=
       riskManager.MaxPositions(equity);
 
@@ -302,7 +294,7 @@ void OnTick()
    }
 
    // Manual platform permission and position capacity.
-   // Adaptive intelligence does not participate in this decision.
+   // Post-entry intelligence does not participate in this decision.
    if(
       !entryManager.CanEnter(
          positions,
@@ -339,15 +331,22 @@ void OnTick()
    }
 
    // ORIGINAL ENTRY SIGNAL.
-   // No adaptive confidence restriction or signal veto.
    int confidence=0;
    ENUM_ORDER_TYPE side;
 
    if(!signalEngine.GetSignal(side,confidence))
       return;
 
-   // Require a valid live broker quote.
-   // No arbitrary spread ceiling or confidence-based rejection.
+   // Capture the original entry-time signal context.
+   // These are read-only values and do not change the signal.
+   int entryScore=signalEngine.GetCurrentScore();
+   double entryShortDelta=signalEngine.GetShortDelta();
+   double entryFullDelta=signalEngine.GetFullDelta();
+   double entryCandleDelta=signalEngine.GetCandleDelta();
+   double entryCandleOpen=signalEngine.GetCandleOpen();
+   datetime entryCandleMinute=signalEngine.GetCandleMinute();
+
+   // Broker quote and execution-cost validation.
    if(
       !executionManager.EntryCostOK(
          g_symbol,
@@ -368,7 +367,6 @@ void OnTick()
          positions+1
       );
 
-   // Check the broker's actual margin requirement.
    volume=
       riskManager.FitVolumeToMargin(
          g_symbol,
@@ -387,9 +385,7 @@ void OnTick()
    double entry=
       (side==ORDER_TYPE_BUY ? tick.ask : tick.bid);
 
-   // Original Python calculator expects spread in pips.
-   // Conventional XAUUSD pip size is $0.01.
-   // Confirm this against the broker's symbol specification.
+   // Original calculator spread conversion.
    double spreadPrice=tick.ask-tick.bid;
    double goldPipSize=0.01;
 
@@ -404,7 +400,7 @@ void OnTick()
 
    int positionNumber=positions+1;
 
-   // Use the complete original dynamic TP/SL formula.
+   // Original dynamic SL/TP calculation.
    if(
       !riskManager.BuildStops(
          g_symbol,
@@ -470,6 +466,35 @@ void OnTick()
       g_lastEntryBar=currentBar;
    }
 
+   // Save the original signal context only after locating
+   // the corresponding broker-confirmed entry deal.
+   if(executed)
+   {
+      bool contextSaved=SaveConfirmedEntryContext(
+         trade.ResultOrder(),
+         side,
+         confidence,
+         entryScore,
+         entryShortDelta,
+         entryFullDelta,
+         entryCandleDelta,
+         recentMovement,
+         entryCandleOpen,
+         entryCandleMinute
+      );
+
+      if(!contextSaved)
+      {
+         Print(
+            "WARNING: Order was accepted but entry context ",
+            "was not persisted. Order=",
+            trade.ResultOrder(),
+            " Retcode=",
+            retcode
+         );
+      }
+   }
+
    telemetry.TradeResult(
       InpApiBaseUrl,
       InpAgentId,
@@ -491,6 +516,206 @@ bool IsRealAccount()
    return
       AccountInfoInteger(ACCOUNT_TRADE_MODE)==
       ACCOUNT_TRADE_MODE_REAL;
+}
+
+//+------------------------------------------------------------------+
+// SAVE ORIGINAL ENTRY CONTEXT AFTER BROKER CONFIRMATION
+//+------------------------------------------------------------------+
+
+bool SaveConfirmedEntryContext(
+   ulong orderTicket,
+   ENUM_ORDER_TYPE requestedSide,
+   int confidence,
+   int signedScore,
+   double shortDelta,
+   double fullDelta,
+   double candleDelta,
+   double recentMovement,
+   double candleOpen,
+   datetime candleMinute
+)
+{
+   if(orderTicket==0)
+      return false;
+
+   datetime now=TimeCurrent();
+
+   if(now<=0 || !HistorySelect(now-86400,now+60))
+      return false;
+
+   int total=HistoryDealsTotal();
+
+   // Search newest deals first for the exact broker order.
+   for(int i=total-1;i>=0;i--)
+   {
+      ulong deal=HistoryDealGetTicket(i);
+
+      if(deal==0)
+         continue;
+
+      if(
+         (ulong)HistoryDealGetInteger(deal,DEAL_ORDER)
+         !=orderTicket
+      )
+      {
+         continue;
+      }
+
+      if(
+         HistoryDealGetInteger(deal,DEAL_MAGIC)
+         !=InpMagic
+      )
+      {
+         continue;
+      }
+
+      if(
+         HistoryDealGetString(deal,DEAL_SYMBOL)
+         !=g_symbol
+      )
+      {
+         continue;
+      }
+
+      long entryType=
+         HistoryDealGetInteger(deal,DEAL_ENTRY);
+
+      if(
+         entryType!=DEAL_ENTRY_IN &&
+         entryType!=DEAL_ENTRY_INOUT
+      )
+      {
+         continue;
+      }
+
+      long dealType=
+         HistoryDealGetInteger(deal,DEAL_TYPE);
+
+      ENUM_ORDER_TYPE actualSide;
+
+      if(dealType==DEAL_TYPE_BUY)
+         actualSide=ORDER_TYPE_BUY;
+      else if(dealType==DEAL_TYPE_SELL)
+         actualSide=ORDER_TYPE_SELL;
+      else
+         continue;
+
+      if(actualSide!=requestedSide)
+         continue;
+
+      ulong positionIdentifier=
+         (ulong)HistoryDealGetInteger(
+            deal,
+            DEAL_POSITION_ID
+         );
+
+      if(positionIdentifier==0)
+         continue;
+
+      // Do not overwrite the first context for an existing
+      // netting position. Hedging positions have separate IDs.
+      if(
+         tradeRecovery.HasEntryContext(
+            InpAccountId,
+            positionIdentifier
+         )
+      )
+      {
+         return true;
+      }
+
+      double actualEntry=
+         HistoryDealGetDouble(deal,DEAL_PRICE);
+
+      double actualVolume=
+         HistoryDealGetDouble(deal,DEAL_VOLUME);
+
+      double actualSL=
+         HistoryDealGetDouble(deal,DEAL_SL);
+
+      double actualTP=
+         HistoryDealGetDouble(deal,DEAL_TP);
+
+      // Prefer actual broker position properties when available.
+      ulong positionTicket=
+         positionTracker.FindTicketByIdentifier(
+            positionIdentifier,
+            g_symbol,
+            InpMagic
+         );
+
+      if(
+         positionTicket>0 &&
+         PositionSelectByTicket(positionTicket)
+      )
+      {
+         double brokerEntry=
+            PositionGetDouble(POSITION_PRICE_OPEN);
+
+         double brokerSL=
+            PositionGetDouble(POSITION_SL);
+
+         double brokerTP=
+            PositionGetDouble(POSITION_TP);
+
+         if(brokerEntry>0.0)
+            actualEntry=brokerEntry;
+
+         if(brokerSL>0.0)
+            actualSL=brokerSL;
+
+         if(brokerTP>0.0)
+            actualTP=brokerTP;
+      }
+
+      // Never invent missing broker-confirmed initial values.
+      if(
+         actualEntry<=0.0 ||
+         actualSL<=0.0 ||
+         actualTP<=0.0 ||
+         actualVolume<=0.0
+      )
+      {
+         Print(
+            "Broker fill found but entry context is incomplete. ",
+            "Position identifier=",
+            positionIdentifier
+         );
+
+         return false;
+      }
+
+      bool saved=tradeRecovery.SaveEntryContext(
+         InpAccountId,
+         positionIdentifier,
+         actualSide,
+         actualEntry,
+         actualSL,
+         actualTP,
+         actualVolume,
+         confidence,
+         signedScore,
+         shortDelta,
+         fullDelta,
+         candleDelta,
+         recentMovement,
+         candleOpen,
+         candleMinute,
+         now
+      );
+
+      if(saved)
+      {
+         Print(
+            "Original entry context saved. Position identifier=",
+            positionIdentifier
+         );
+      }
+
+      return saved;
+   }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -525,7 +750,6 @@ string ResolveGoldSymbol(string requested)
          return candidates[i];
    }
 
-   // Discover broker prefix/suffix variants.
    int total=SymbolsTotal(false);
 
    for(int i=0;i<total;i++)
@@ -949,7 +1173,7 @@ void SyncRecentDeals()
          ",\"time\":"+
          (string)HistoryDealGetInteger(deal,DEAL_TIME)+
          "}";
-
+      
       added++;
    }
 
