@@ -20,7 +20,7 @@ private:
    CTradeRecovery recovery;
 
    // ---------------------------------------------------------
-   // ACCOUNT-SCOPED MANAGEMENT STATE
+   // COMPACT, ACCOUNT-SCOPED PERSISTENT STATE
    // ---------------------------------------------------------
 
    string StateKey(
@@ -29,10 +29,11 @@ private:
       ulong identifier
    )
    {
-      return "GoldPM_" +
-             name + "_" +
+      // Keep keys short enough for MT5 Global Variables.
+      return "GPM_" +
              (string)accountId + "_" +
-             (string)identifier;
+             (string)identifier + "_" +
+             name;
    }
 
    bool StateDone(
@@ -47,9 +48,10 @@ private:
          identifier
       );
 
-      return
+      return (
          GlobalVariableCheck(key) &&
-         GlobalVariableGet(key) > 0.5;
+         GlobalVariableGet(key) > 0.5
+      );
    }
 
    bool SaveState(
@@ -68,7 +70,50 @@ private:
          return false;
 
       GlobalVariableFlush();
+      return true;
+   }
 
+   bool LoadNumber(
+      string name,
+      long accountId,
+      ulong identifier,
+      double &value
+   )
+   {
+      string key = StateKey(
+         name,
+         accountId,
+         identifier
+      );
+
+      if(!GlobalVariableCheck(key))
+         return false;
+
+      value = GlobalVariableGet(key);
+
+      return MathIsValidNumber(value);
+   }
+
+   bool SaveNumber(
+      string name,
+      long accountId,
+      ulong identifier,
+      double value
+   )
+   {
+      if(!MathIsValidNumber(value))
+         return false;
+
+      string key = StateKey(
+         name,
+         accountId,
+         identifier
+      );
+
+      if(GlobalVariableSet(key, value) == 0)
+         return false;
+
+      GlobalVariableFlush();
       return true;
    }
 
@@ -291,8 +336,6 @@ private:
       SOriginalEntryContext &context
    )
    {
-      // Only saved original entry information is accepted.
-      // Current SL may already have been moved by management.
       if(
          !context.valid ||
          context.entryPrice <= 0.0 ||
@@ -376,6 +419,302 @@ private:
    }
 
    // ---------------------------------------------------------
+   // PERSISTENT PEAK-PROFIT TRACKER
+   // ---------------------------------------------------------
+
+   bool UpdatePeakPrice(
+      long accountId,
+      ulong identifier,
+      ENUM_POSITION_TYPE direction,
+      double currentPrice,
+      double &peakPrice
+   )
+   {
+      if(
+         accountId <= 0 ||
+         identifier == 0 ||
+         currentPrice <= 0.0
+      )
+      {
+         return false;
+      }
+
+      double savedPeak = 0.0;
+
+      bool exists = LoadNumber(
+         "PeakPrice",
+         accountId,
+         identifier,
+         savedPeak
+      );
+
+      if(!exists || savedPeak <= 0.0)
+      {
+         peakPrice = currentPrice;
+
+         return SaveNumber(
+            "PeakPrice",
+            accountId,
+            identifier,
+            peakPrice
+         );
+      }
+
+      peakPrice = savedPeak;
+
+      bool improved = false;
+
+      if(direction == POSITION_TYPE_BUY)
+      {
+         if(currentPrice > peakPrice)
+         {
+            peakPrice = currentPrice;
+            improved = true;
+         }
+      }
+      else if(direction == POSITION_TYPE_SELL)
+      {
+         if(currentPrice < peakPrice)
+         {
+            peakPrice = currentPrice;
+            improved = true;
+         }
+      }
+
+      if(improved)
+      {
+         return SaveNumber(
+            "PeakPrice",
+            accountId,
+            identifier,
+            peakPrice
+         );
+      }
+
+      return true;
+   }
+
+   // ---------------------------------------------------------
+   // PROFIT TRACKING CALCULATIONS
+   // ---------------------------------------------------------
+
+   double FavorableDistance(
+      ENUM_POSITION_TYPE direction,
+      double entryPrice,
+      double marketPrice
+   )
+   {
+      if(direction == POSITION_TYPE_BUY)
+         return marketPrice - entryPrice;
+
+      if(direction == POSITION_TYPE_SELL)
+         return entryPrice - marketPrice;
+
+      return 0.0;
+   }
+
+   double PeakProfitR(
+      ENUM_POSITION_TYPE direction,
+      double entryPrice,
+      double peakPrice,
+      double initialRisk
+   )
+   {
+      if(initialRisk <= 0.0)
+         return 0.0;
+
+      double favorable =
+         FavorableDistance(
+            direction,
+            entryPrice,
+            peakPrice
+         );
+
+      return MathMax(
+         0.0,
+         favorable / initialRisk
+      );
+   }
+
+   double CurrentProfitR(
+      ENUM_POSITION_TYPE direction,
+      double entryPrice,
+      double currentPrice,
+      double initialRisk
+   )
+   {
+      if(initialRisk <= 0.0)
+         return 0.0;
+
+      double favorable =
+         FavorableDistance(
+            direction,
+            entryPrice,
+            currentPrice
+         );
+
+      return favorable / initialRisk;
+   }
+
+   // ---------------------------------------------------------
+   // PROFIT-RETRACEMENT PROTECTION
+   // ---------------------------------------------------------
+
+   void ProtectPeakProfit(
+      CTrade &trade,
+      ulong ticket,
+      string symbol,
+      long accountId,
+      ulong identifier,
+      ENUM_POSITION_TYPE direction,
+      double entryPrice,
+      double initialRisk,
+      double currentPrice,
+      double currentSL,
+      double currentTP,
+      SMarketState &state
+   )
+   {
+      if(
+         initialRisk <= 0.0 ||
+         entryPrice <= 0.0 ||
+         currentPrice <= 0.0
+      )
+      {
+         return;
+      }
+
+      double peakPrice = 0.0;
+
+      if(
+         !UpdatePeakPrice(
+            accountId,
+            identifier,
+            direction,
+            currentPrice,
+            peakPrice
+         )
+      )
+      {
+         Print(
+            "Peak-profit state could not be saved. ",
+            "Ticket=",
+            ticket
+         );
+
+         return;
+      }
+
+      double peakR =
+         PeakProfitR(
+            direction,
+            entryPrice,
+            peakPrice,
+            initialRisk
+         );
+
+      double currentR =
+         CurrentProfitR(
+            direction,
+            entryPrice,
+            currentPrice,
+            initialRisk
+         );
+
+      double givebackR =
+         peakR - currentR;
+
+      // A trade must first develop meaningful profit.
+      if(peakR < 0.75)
+         return;
+
+      // Protect when a meaningful portion of peak profit
+      // has been surrendered or momentum is weakening.
+      bool retracementDetected =
+         givebackR >= 0.20;
+
+      bool momentumWarning =
+         state.dataValid &&
+         state.momentumWeakening;
+
+      if(
+         !retracementDetected &&
+         !momentumWarning
+      )
+      {
+         return;
+      }
+
+      // Retain at least 60% of the favourable price move
+      // measured from the original entry to the peak.
+      // The minimum lock is 0.10R.
+      double lockedDistance =
+         MathMax(
+            initialRisk * 0.10,
+            (peakPrice - entryPrice) *
+            (direction == POSITION_TYPE_BUY ? 0.60 : 0.0)
+         );
+
+      if(direction == POSITION_TYPE_SELL)
+      {
+         lockedDistance =
+            MathMax(
+               initialRisk * 0.10,
+               (entryPrice - peakPrice) * 0.60
+            );
+      }
+
+      double candidate = 0.0;
+
+      if(direction == POSITION_TYPE_BUY)
+      {
+         candidate =
+            entryPrice + lockedDistance;
+      }
+      else
+      {
+         candidate =
+            entryPrice - lockedDistance;
+      }
+
+      candidate = NormalizeDouble(
+         candidate,
+         (int)SymbolInfoInteger(
+            symbol,
+            SYMBOL_DIGITS
+         )
+      );
+
+      bool improved =
+         ImproveStop(
+            trade,
+            ticket,
+            symbol,
+            direction,
+            candidate,
+            currentSL,
+            currentTP
+         );
+
+      if(improved)
+      {
+         Print(
+            "Peak-profit protection confirmed. ",
+            "Ticket=",
+            ticket,
+            " Peak R=",
+            DoubleToString(peakR, 2),
+            " Current R=",
+            DoubleToString(currentR, 2),
+            " Giveback R=",
+            DoubleToString(givebackR, 2),
+            " New SL=",
+            candidate
+         );
+      }
+   }
+
+   // ---------------------------------------------------------
    // MARKET CONDITION HELPERS
    // ---------------------------------------------------------
 
@@ -456,8 +795,6 @@ private:
       SMarketState &state
    )
    {
-      // Partial closing is explicitly restricted to hedging
-      // accounts in this implementation.
       if(
          AccountInfoInteger(ACCOUNT_MARGIN_MODE) !=
          ACCOUNT_MARGIN_MODE_RETAIL_HEDGING
@@ -515,7 +852,6 @@ private:
          return;
       }
 
-      // Confirm actual broker-side volume reduction.
       if(!PositionSelectByTicket(ticket))
       {
          SaveState(
@@ -743,8 +1079,6 @@ private:
          return false;
       }
 
-      // Do not close a profitable position solely because
-      // momentum weakens.
       if(snapshot.floatingProfit >= 0.0)
          return false;
 
@@ -779,7 +1113,6 @@ private:
          return false;
       }
 
-      // Confirm the broker actually removed the position.
       if(!PositionSelectByTicket(ticket))
       {
          SaveState(
@@ -889,17 +1222,30 @@ private:
          return;
       }
 
-      // Use the saved original entry price for R calculations.
       double entryPrice =
          context.entryPrice;
 
       double favorableMovement =
-         IsBuy(snapshot.direction)
-         ? snapshot.currentPrice - entryPrice
-         : entryPrice - snapshot.currentPrice;
+         FavorableDistance(
+            snapshot.direction,
+            entryPrice,
+            snapshot.currentPrice
+         );
 
       double rMultiple =
          favorableMovement / initialRisk;
+
+      // Update the persistent peak even before a profit
+      // protection trigger is reached.
+      double peakPrice = 0.0;
+
+      UpdatePeakPrice(
+         accountId,
+         snapshot.identifier,
+         snapshot.direction,
+         snapshot.currentPrice,
+         peakPrice
+      );
 
       // Evaluate thesis invalidation only with valid analysis.
       if(state.dataValid)
@@ -943,7 +1289,6 @@ private:
          if(!PositionSelectByTicket(ticket))
             return;
 
-         // These operations require valid market analysis.
          if(state.dataValid)
          {
             TryPartialProfit(
@@ -967,6 +1312,37 @@ private:
                state
             );
          }
+      }
+
+      // ------------------------------------------------------
+      // PROFIT PEAK / RETRACEMENT PROTECTION
+      // ------------------------------------------------------
+
+      if(rMultiple >= 0.50)
+      {
+         if(!PositionSelectByTicket(ticket))
+            return;
+
+         double latestSL =
+            PositionGetDouble(POSITION_SL);
+
+         double latestTP =
+            PositionGetDouble(POSITION_TP);
+
+         ProtectPeakProfit(
+            trade,
+            ticket,
+            symbol,
+            accountId,
+            snapshot.identifier,
+            snapshot.direction,
+            entryPrice,
+            initialRisk,
+            snapshot.currentPrice,
+            latestSL,
+            latestTP,
+            state
+         );
       }
 
       // ------------------------------------------------------
@@ -1013,7 +1389,6 @@ private:
       if(distance <= 0.0)
          return;
 
-      // Tighten cautiously when momentum weakens.
       if(state.momentumWeakening)
       {
          distance = MathMax(
@@ -1078,8 +1453,6 @@ private:
       state.momentumWeakening = false;
       state.dataValid = false;
 
-      // If analysis fails, continue basic R-based protection.
-      // Momentum-dependent operations remain disabled.
       bool analysisAvailable =
          market.Analyze(
             symbol,
@@ -1143,8 +1516,6 @@ private:
 
 public:
 
-   // Preferred interface: platform account ID is used
-   // to retrieve the saved original entry context.
    void Manage(
       CTrade &trade,
       string symbol,
