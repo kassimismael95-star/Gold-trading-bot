@@ -29,14 +29,11 @@ private:
 
 public:
 
-   // Original equity-based lot calculation.
    double BaseLot(double equity)
    {
       return money.BaseLot(equity);
    }
 
-   // Original maximum-position tiers.
-   // This signature is retained for compatibility with the current EA.
    int MaxPositions(double equity)
    {
       if(equity < 4.0)      return 2;
@@ -51,44 +48,11 @@ public:
       return 18;
    }
 
-   // Confidence-aware version of the original position tiers.
-   // Connect this overload when GoldScalperEA.mq5 is updated.
-   int MaxPositions(double equity, int confidence)
-   {
-      if(equity < 4.0)
-         return (confidence >= 7 ? 2 : 1);
-
-      if(equity < 10.0)
-         return (confidence >= 6 ? 3 : 2);
-
-      if(equity < 25.0)
-         return (confidence >= 7 ? 5 : 3);
-
-      if(equity < 50.0)
-         return (confidence >= 6 ? 7 : 5);
-
-      if(equity < 100.0)
-         return (confidence >= 6 ? 9 : 7);
-
-      if(equity < 250.0)
-         return (confidence >= 6 ? 12 : 9);
-
-      if(equity < 500.0)
-         return (confidence >= 6 ? 14 : 12);
-
-      if(equity < 1000.0)
-         return (confidence >= 6 ? 16 : 14);
-
-      if(equity < 2000.0)
-         return (confidence >= 6 ? 18 : 16);
-
-      return 18;
-   }
-
-   // Original add-position sizing:
-   // Base equity tier plus 0.01 for each pair of additional positions
-   // when equity is at least 25.
-   double VolumeForPosition(string symbol, double equity, int number)
+   double VolumeForPosition(
+      string symbol,
+      double equity,
+      int number
+   )
    {
       if(number < 1)
          number = 1;
@@ -109,8 +73,6 @@ public:
       return money.NormalizeVolume(symbol, volume);
    }
 
-   // Check the broker's actual margin requirement before an order.
-   // No arbitrary fixed 20% free-margin reserve is imposed here.
    double FitVolumeToMargin(
       string symbol,
       ENUM_ORDER_TYPE side,
@@ -160,31 +122,54 @@ public:
       return 0.0;
    }
 
-   // Retained for compatibility with existing callers.
-   bool DrawdownExceeded(
-      double equity,
-      double balance,
-      double limit
-   )
-   {
-      if(balance <= 0.0 || limit <= 0.0)
-         return false;
-
-      double drawdown =
-         ((balance - equity) / balance) * 100.0;
-
-      return drawdown >= limit;
-   }
-
-   // Calculate broker-compatible initial SL and TP.
-   // The monetary distances are converted using the broker's
-   // actual tick value, tick size and trade volume.
+   // Compatibility method for older callers.
    bool BuildStops(
       string symbol,
       ENUM_ORDER_TYPE side,
       double entry,
       double volume,
       int confidence,
+      double &sl,
+      double &tp
+   )
+   {
+      return BuildStops(
+         symbol,
+         side,
+         entry,
+         volume,
+         confidence,
+         0.0,
+         0.0,
+         1,
+         sl,
+         tp
+      );
+   }
+
+   // Original dynamic SL/TP formula.
+   //
+   // spreadUsd:
+   // Actual bid/ask difference expressed in the gold
+   // instrument's price units.
+   //
+   // recentMovement:
+   // Absolute price movement from the original
+   // three-observation momentum calculation.
+   //
+   // positionNumber:
+   // Number of this position in the account's
+   // current managed sequence, starting at 1.
+
+   bool BuildStops(
+      string symbol,
+      ENUM_ORDER_TYPE side,
+      double entry,
+      double volume,
+      int confidence,
+      double spreadUsd,
+      double recentMovement,
+      int positionNumber,
       double &sl,
       double &tp
    )
@@ -205,33 +190,51 @@ public:
          tickSize <= 0.0 ||
          tickValue <= 0.0 ||
          volume <= 0.0 ||
-         entry <= 0.0)
+         entry <= 0.0 ||
+         spreadUsd < 0.0 ||
+         recentMovement < 0.0)
       {
          return false;
       }
 
-      // Original base monetary stop and target.
-      double slMoney = 2.0;
-      double tpMoney = 2.2;
+      if(positionNumber < 1)
+         positionNumber = 1;
 
-      // Original confidence adjustments.
+      // Original position-number adjustment.
+      double positionAdjustment =
+         (double)(positionNumber - 1) * 0.08;
+
+      // Original recent-movement multiplier.
+      double movementMultiplier = 1.0;
+
+      if(recentMovement > 0.50)
+         movementMultiplier = 1.30;
+      else if(recentMovement > 0.25)
+         movementMultiplier = 1.15;
+      else if(recentMovement > 0.10)
+         movementMultiplier = 1.05;
+
+      // Original confidence multiplier.
+      double confidenceMultiplier = 1.0;
+
       if(confidence >= 8)
-      {
-         slMoney *= 1.15;
-         tpMoney *= 1.15;
-      }
+         confidenceMultiplier = 1.15;
       else if(confidence >= 6)
-      {
-         slMoney *= 1.08;
-         tpMoney *= 1.08;
-      }
+         confidenceMultiplier = 1.08;
       else if(confidence <= 2)
-      {
-         slMoney *= 0.90;
-         tpMoney *= 0.90;
-      }
+         confidenceMultiplier = 0.90;
 
-      // Preserve the original distance boundaries.
+      // Original dynamic monetary distances.
+      double slMoney =
+         (2.0 + (0.5 * spreadUsd) + positionAdjustment)
+         * movementMultiplier;
+
+      double tpMoney =
+         (2.2 + (0.3 * spreadUsd) + positionAdjustment)
+         * movementMultiplier
+         * confidenceMultiplier;
+
+      // Original distance boundaries.
       slMoney = MathMax(1.5, MathMin(3.0, slMoney));
 
       tpMoney = MathMax(
@@ -239,6 +242,7 @@ public:
          MathMin(3.5, MathMax(slMoney, tpMoney))
       );
 
+      // Convert monetary distance into price distance.
       double moneyPerPriceUnit = tickValue * volume;
 
       if(moneyPerPriceUnit <= 0.0)
@@ -250,7 +254,10 @@ public:
       double tpDistance =
          (tpMoney / moneyPerPriceUnit) * tickSize;
 
-      // Respect the broker's minimum stop and freeze distances.
+      if(slDistance <= 0.0 || tpDistance <= 0.0)
+         return false;
+
+      // Respect broker stop and freeze levels.
       long stopLevel =
          SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
 
@@ -258,7 +265,8 @@ public:
          SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
 
       double minimumDistance =
-         ((double)MathMax(stopLevel, freezeLevel) + 2.0) * point;
+         ((double)MathMax(stopLevel, freezeLevel) + 2.0)
+         * point;
 
       slDistance = MathMax(slDistance, minimumDistance);
       tpDistance = MathMax(tpDistance, minimumDistance);
