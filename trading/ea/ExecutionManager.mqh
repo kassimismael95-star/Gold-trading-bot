@@ -4,6 +4,16 @@
 
 class CExecutionManager
 {
+private:
+
+   bool ValidSide(ENUM_ORDER_TYPE side)
+   {
+      return (
+         side == ORDER_TYPE_BUY ||
+         side == ORDER_TYPE_SELL
+      );
+   }
+
 public:
 
    CExecutionManager()
@@ -12,7 +22,7 @@ public:
 
    void Init(string symbol)
    {
-      // Symbol validation and broker configuration are handled
+      // Symbol and broker configuration remain handled
       // by BrokerSpecification.mqh.
    }
 
@@ -20,15 +30,14 @@ public:
    {
    }
 
-   bool EntryCostOK(
-      string symbol,
-      ENUM_ORDER_TYPE side,
-      int confidence
-   )
+   // Validate that a usable broker quote is available.
+   bool QuoteAvailable(string symbol)
    {
+      if(symbol == "")
+         return false;
+
       MqlTick tick;
 
-      // A valid current broker quote is required.
       if(!SymbolInfoTick(symbol, tick))
          return false;
 
@@ -38,13 +47,29 @@ public:
       if(tick.ask < tick.bid)
          return false;
 
-      if(side != ORDER_TYPE_BUY &&
-         side != ORDER_TYPE_SELL)
+      if(tick.time <= 0)
          return false;
 
-      // No arbitrary spread ceiling.
-      // No confidence-based spread rejection.
-      // No invented movement multiplier.
+      return true;
+   }
+
+   // Preserve the original entry-cost behavior.
+   // No arbitrary spread ceiling.
+   // No confidence-based entry rejection.
+   bool EntryCostOK(
+      string symbol,
+      ENUM_ORDER_TYPE side,
+      int confidence
+   )
+   {
+      if(!ValidSide(side))
+         return false;
+
+      if(!QuoteAvailable(symbol))
+         return false;
+
+      // Confidence remains available to the original
+      // strategy but is not used as a new entry filter.
 
       return true;
    }
