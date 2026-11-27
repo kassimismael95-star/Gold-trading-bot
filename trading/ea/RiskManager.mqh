@@ -48,24 +48,19 @@ public:
       return 18;
    }
 
+   // Preserve the original equity-based lot tier.
+   // Do not increase lot size because of intelligence,
+   // confidence or the number of open positions.
    double VolumeForPosition(
       string symbol,
       double equity,
       int number
    )
    {
-      if(number < 1)
-         number = 1;
-
-      double volume = BaseLot(equity);
-
-      if(equity >= 25.0)
-      {
-         int additionalSteps = (number - 1) / 2;
-         volume += (double)additionalSteps * 0.01;
-      }
-
-      return money.NormalizeVolume(symbol, volume);
+      return money.NormalizeVolume(
+         symbol,
+         BaseLot(equity)
+      );
    }
 
    double NormalizeVolume(string symbol, double volume)
@@ -122,7 +117,22 @@ public:
       return 0.0;
    }
 
-   // Compatibility method for older callers.
+   bool DrawdownExceeded(
+      double equity,
+      double balance,
+      double limit
+   )
+   {
+      if(balance <= 0.0 || limit <= 0.0)
+         return false;
+
+      double drawdown =
+         ((balance - equity) / balance) * 100.0;
+
+      return drawdown >= limit;
+   }
+
+   // Compatibility overload for existing callers.
    bool BuildStops(
       string symbol,
       ENUM_ORDER_TYPE side,
@@ -147,19 +157,13 @@ public:
       );
    }
 
-   // Original dynamic SL/TP formula.
+   // Original Python dynamic TP/SL formula.
    //
-   // spreadUsd:
-   // Actual bid/ask difference expressed in the gold
-   // instrument's price units.
+   // spreadPips is converted using the original
+   // spread_usd = current_spread_pips * 0.10.
    //
-   // recentMovement:
-   // Absolute price movement from the original
-   // three-observation momentum calculation.
-   //
-   // positionNumber:
-   // Number of this position in the account's
-   // current managed sequence, starting at 1.
+   // recentMovement is the original three-tick movement.
+   // positionNumber starts at 1.
 
    bool BuildStops(
       string symbol,
@@ -167,7 +171,7 @@ public:
       double entry,
       double volume,
       int confidence,
-      double spreadUsd,
+      double spreadPips,
       double recentMovement,
       int positionNumber,
       double &sl,
@@ -177,21 +181,13 @@ public:
       double point =
          SymbolInfoDouble(symbol, SYMBOL_POINT);
 
-      double tickSize =
-         SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-
-      double tickValue =
-         SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-
       int digits =
          (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
       if(point <= 0.0 ||
-         tickSize <= 0.0 ||
-         tickValue <= 0.0 ||
-         volume <= 0.0 ||
          entry <= 0.0 ||
-         spreadUsd < 0.0 ||
+         volume <= 0.0 ||
+         spreadPips < 0.0 ||
          recentMovement < 0.0)
       {
          return false;
@@ -200,12 +196,11 @@ public:
       if(positionNumber < 1)
          positionNumber = 1;
 
-      // Original position-number adjustment.
-      double positionAdjustment =
-         (double)(positionNumber - 1) * 0.08;
+      // Original spread conversion.
+      double spreadUsd = spreadPips * 0.10;
 
-      // Original recent-movement multiplier.
-      double movementMultiplier = 1.0;
+      // Original movement multiplier.
+      double movementMultiplier = 1.00;
 
       if(recentMovement > 0.50)
          movementMultiplier = 1.30;
@@ -215,7 +210,7 @@ public:
          movementMultiplier = 1.05;
 
       // Original confidence multiplier.
-      double confidenceMultiplier = 1.0;
+      double confidenceMultiplier = 1.00;
 
       if(confidence >= 8)
          confidenceMultiplier = 1.15;
@@ -224,40 +219,37 @@ public:
       else if(confidence <= 2)
          confidenceMultiplier = 0.90;
 
-      // Original dynamic monetary distances.
-      double slMoney =
-         (2.0 + (0.5 * spreadUsd) + positionAdjustment)
+      // Original position-number adjustment.
+      double positionAdjustment =
+         (double)(positionNumber - 1) * 0.08;
+
+      // Original stop-loss distance.
+      double slDistance =
+         (2.00 + spreadUsd * 0.50 + positionAdjustment)
          * movementMultiplier;
 
-      double tpMoney =
-         (2.2 + (0.3 * spreadUsd) + positionAdjustment)
+      // Original take-profit distance.
+      double tpDistance =
+         (2.20 + spreadUsd * 0.30 + positionAdjustment)
          * movementMultiplier
          * confidenceMultiplier;
 
-      // Original distance boundaries.
-      slMoney = MathMax(1.5, MathMin(3.0, slMoney));
-
-      tpMoney = MathMax(
-         1.8,
-         MathMin(3.5, MathMax(slMoney, tpMoney))
+      // Original SL boundaries.
+      slDistance = MathMax(
+         1.50,
+         MathMin(3.00, slDistance)
       );
 
-      // Convert monetary distance into price distance.
-      double moneyPerPriceUnit = tickValue * volume;
+      // Original TP boundaries.
+      tpDistance = MathMax(
+         1.80,
+         MathMin(3.50, tpDistance)
+      );
 
-      if(moneyPerPriceUnit <= 0.0)
-         return false;
+      // Original rule: TP must be at least as far as SL.
+      tpDistance = MathMax(tpDistance, slDistance);
 
-      double slDistance =
-         (slMoney / moneyPerPriceUnit) * tickSize;
-
-      double tpDistance =
-         (tpMoney / moneyPerPriceUnit) * tickSize;
-
-      if(slDistance <= 0.0 || tpDistance <= 0.0)
-         return false;
-
-      // Respect broker stop and freeze levels.
+      // Broker minimum stop distance.
       long stopLevel =
          SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
 
@@ -268,6 +260,8 @@ public:
          ((double)MathMax(stopLevel, freezeLevel) + 2.0)
          * point;
 
+      // Broker restrictions take priority if their
+      // minimum distance exceeds the strategy distance.
       slDistance = MathMax(slDistance, minimumDistance);
       tpDistance = MathMax(tpDistance, minimumDistance);
 
@@ -276,23 +270,18 @@ public:
          sl = NormalizeDouble(entry - slDistance, digits);
          tp = NormalizeDouble(entry + tpDistance, digits);
 
-         if(sl >= entry || tp <= entry)
-            return false;
+         return (sl < entry && tp > entry);
       }
-      else if(side == ORDER_TYPE_SELL)
+
+      if(side == ORDER_TYPE_SELL)
       {
          sl = NormalizeDouble(entry + slDistance, digits);
          tp = NormalizeDouble(entry - tpDistance, digits);
 
-         if(sl <= entry || tp >= entry)
-            return false;
-      }
-      else
-      {
-         return false;
+         return (sl > entry && tp < entry);
       }
 
-      return true;
+      return false;
    }
 };
 
