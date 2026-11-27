@@ -1,10 +1,5 @@
 
-"""Authenticated Oracle agent assignment and credential-delivery endpoints.
-
-Credentials are decrypted only for an agent assigned to the account.
-Never log responses from /credentials and always use HTTPS outside
-local development.
-"""
+"""Authenticated Oracle agent assignment and credential delivery."""
 
 import hashlib
 import hmac
@@ -15,18 +10,24 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, request, jsonify, current_app
 
-# These modules are in apps/api/, one directory above this file.
 from ..extensions import db
-from ..models import Agent, TradingAccount, AccountCredential, AccountTelemetry
-
+from ..models import (
+    Agent,
+    TradingAccount,
+    AccountCredential,
+    AccountTelemetry,
+)
 
 bp = Blueprint("agent_control", __name__, url_prefix="/api/agent")
+
+
+def utcnow():
+    return datetime.now(timezone.utc)
 
 
 def _bootstrap_authorized():
     supplied = request.headers.get("X-Agent-Secret", "")
     expected = str(current_app.config.get("AGENT_SHARED_SECRET", ""))
-
     return bool(
         expected
         and supplied
@@ -42,18 +43,15 @@ def _authorized():
         return False
 
     agent = Agent.query.filter_by(agent_id=agent_id).first()
-
     if not agent or not agent.secret_hash:
         return False
 
     candidate = hashlib.sha256(supplied.encode()).hexdigest()
-
     return hmac.compare_digest(candidate, agent.secret_hash)
 
 
 @bp.before_request
 def require_agent_secret():
-    # The shared bootstrap secret is accepted only during enrollment.
     if request.endpoint == "agent_control.register_agent":
         if not _bootstrap_authorized():
             return jsonify(error="agent_bootstrap_unauthorized"), 401
@@ -86,11 +84,10 @@ def register_agent():
         row = Agent(agent_id=agent_id)
 
     secret = secrets.token_urlsafe(48)
-
     row.secret_hash = hashlib.sha256(secret.encode()).hexdigest()
     row.hostname = str(data.get("hostname", ""))[:120]
     row.status = "ONLINE"
-    row.last_seen = datetime.now(timezone.utc)
+    row.last_seen = utcnow()
 
     db.session.add(row)
     db.session.commit()
@@ -98,7 +95,7 @@ def register_agent():
     return jsonify(
         agent_id=agent_id,
         agent_secret=secret,
-        notice="Store this secret securely; it is shown only once."
+        notice="Store this secret securely; it is shown only once.",
     ), 201
 
 
@@ -121,8 +118,6 @@ def heartbeat():
 
     if row is None:
         return jsonify(error="agent_not_registered"), 404
-
-    row.hostname = str(data.get("hostname", ""))[:120]
 
     metrics = data.get("metrics") or {}
 
@@ -171,14 +166,15 @@ def heartbeat():
 
         safe[key] = int(number) if key in integer_keys else number
 
+    row.hostname = str(data.get("hostname", ""))[:120]
     row.metrics = safe
     row.status = "ONLINE"
-    row.last_seen = datetime.now(timezone.utc)
+    row.last_seen = utcnow()
 
     db.session.add(row)
     db.session.commit()
 
-    return jsonify(ok=True, agent_id=agent_id)
+    return jsonify(ok=True, agent_id=agent_id), 200
 
 
 @bp.get("/accounts")
@@ -193,13 +189,13 @@ def assigned_accounts():
 
     agent = Agent.query.filter_by(
         agent_id=agent_id,
-        status="ONLINE"
+        status="ONLINE",
     ).first()
 
     if not agent:
         return jsonify(error="agent_not_registered"), 409
 
-    now = datetime.now(timezone.utc)
+    now = utcnow()
 
     assigned_rows = TradingAccount.query.filter_by(
         agent_id=agent_id
@@ -208,8 +204,8 @@ def assigned_accounts():
     rows = []
     cleanup_ids = []
 
-    # Deleted accounts remain assigned until a recent EA telemetry
-    # update confirms that the broker has no open positions.
+    # Keep deleted accounts assigned until fresh broker telemetry confirms
+    # that the account is connected and has zero open positions.
     for account in assigned_rows:
         if account.is_deleted:
             telemetry = AccountTelemetry.query.filter_by(
@@ -225,7 +221,9 @@ def assigned_accounts():
                     updated = updated.replace(tzinfo=timezone.utc)
 
                 recent = (
-                    timedelta(0) <= now - updated <= timedelta(seconds=90)
+                    timedelta(0)
+                    <= now - updated
+                    <= timedelta(seconds=90)
                 )
 
             if (
@@ -249,10 +247,8 @@ def assigned_accounts():
                 account.ea_token_hash = hashlib.sha256(
                     secrets.token_urlsafe(32).encode()
                 ).hexdigest()
-
                 account.ea_token_ciphertext = None
                 account.ea_token_version += 1
-
                 continue
 
         rows.append(account)
@@ -267,26 +263,23 @@ def assigned_accounts():
                 "account",
                 removed_id,
                 {"agent_id": agent_id},
-                None
+                None,
             )
 
         db.session.commit()
 
-    assigned_count = len(rows)
-
-    configured = max(1, int(agent.capacity or 20))
-
-    resource_cap = int(
+    configured_capacity = max(1, int(agent.capacity or 20))
+    resource_capacity = int(
         (agent.metrics or {}).get("recommended_capacity", 0) or 0
     )
 
     effective_capacity = (
-        min(configured, resource_cap)
-        if resource_cap > 0
-        else configured
+        min(configured_capacity, resource_capacity)
+        if resource_capacity > 0
+        else configured_capacity
     )
 
-    available = max(0, effective_capacity - assigned_count)
+    available = max(0, effective_capacity - len(rows))
 
     pending = []
 
@@ -295,7 +288,7 @@ def assigned_accounts():
             TradingAccount.query
             .filter(
                 TradingAccount.agent_id.is_(None),
-                TradingAccount.is_deleted.is_(False)
+                TradingAccount.is_deleted.is_(False),
             )
             .order_by(TradingAccount.id)
             .with_for_update(skip_locked=True)
@@ -319,6 +312,10 @@ def assigned_accounts():
             account_id=account.id
         ).first()
 
+        telemetry = AccountTelemetry.query.filter_by(
+            account_id=account.id
+        ).first()
+
         accounts.append({
             "id": account.id,
             "login": account.login,
@@ -329,11 +326,23 @@ def assigned_accounts():
             "desired_state": account.desired_state,
             "ea_token_hash": account.ea_token_hash,
             "ea_token_version": account.ea_token_version,
-            "credential_version": credential.version if credential else 0,
+            "credential_version": (
+                credential.version if credential else 0
+            ),
             "risk_settings": account.risk_settings or {},
             "live_trading_allowed": bool(
                 account.mode == "live"
-                and current_app.config.get("ALLOW_LIVE_TRADING", False)
+                and current_app.config.get(
+                    "ALLOW_LIVE_TRADING",
+                    False,
+                )
+            ),
+            # None means telemetry is unavailable. The scheduler must not
+            # interpret missing telemetry as proof that the account is flat.
+            "open_positions_count": (
+                telemetry.open_positions_count
+                if telemetry is not None
+                else None
             ),
             "credential_ready": bool(
                 credential and not credential.revoked
@@ -343,13 +352,12 @@ def assigned_accounts():
             "agent_assigned_count": assigned_count,
         })
 
-    return jsonify(accounts=accounts)
+    return jsonify(accounts=accounts), 200
 
 
 @bp.get("/accounts/<int:account_id>/credentials")
 def account_credentials(account_id):
     agent_id = request.headers.get("X-Agent-ID", "").strip()[:80]
-
     requested_agent_id = request.args.get("agent_id")
 
     if requested_agent_id and str(requested_agent_id) != agent_id:
@@ -357,7 +365,7 @@ def account_credentials(account_id):
 
     account = TradingAccount.query.filter_by(
         id=account_id,
-        agent_id=agent_id
+        agent_id=agent_id,
     ).first()
 
     if not account:
@@ -365,18 +373,20 @@ def account_credentials(account_id):
 
     credential = AccountCredential.query.filter_by(
         account_id=account_id,
-        revoked=False
+        revoked=False,
     ).first()
 
     if not credential:
         return jsonify(error="credential_missing_or_revoked"), 404
 
-    # These security modules are in apps/api/security/.
     from ..security.credential_vault import (
         open_mt5_password,
-        seal_mt5_password
+        seal_mt5_password,
     )
-    from ..security.encryption import decrypt_secret, encrypt_secret
+    from ..security.encryption import (
+        decrypt_secret,
+        encrypt_secret,
+    )
 
     try:
         from cryptography.exceptions import InvalidTag
@@ -384,7 +394,7 @@ def account_credentials(account_id):
         try:
             password = open_mt5_password(
                 credential.password_ciphertext,
-                account.id
+                account.id,
             )
         except InvalidTag:
             # Upgrade legacy unbound ciphertext after authenticated retrieval.
@@ -393,14 +403,14 @@ def account_credentials(account_id):
             )
             credential.password_ciphertext = seal_mt5_password(
                 password,
-                account.id
+                account.id,
             )
 
         try:
             ea_token = (
                 decrypt_secret(
                     account.ea_token_ciphertext,
-                    f"ea-token:{account.id}"
+                    f"ea-token:{account.id}",
                 )
                 if account.ea_token_ciphertext
                 else None
@@ -409,8 +419,12 @@ def account_credentials(account_id):
             ea_token = decrypt_secret(account.ea_token_ciphertext)
             account.ea_token_ciphertext = encrypt_secret(
                 ea_token,
-                f"ea-token:{account.id}"
+                f"ea-token:{account.id}",
             )
+
+        if not ea_token:
+            db.session.rollback()
+            return jsonify(error="ea_token_unavailable"), 503
 
         db.session.commit()
 
@@ -418,16 +432,16 @@ def account_credentials(account_id):
         db.session.rollback()
         current_app.logger.exception(
             "credential decrypt failed for account_id=%s",
-            account_id
+            account_id,
         )
         return jsonify(error="credential_unavailable"), 503
 
-    # Secret-bearing response: never log its contents.
+    # Never log this secret-bearing response.
     return jsonify(
         account_id=account.id,
         login=account.login,
         server=account.server,
         password=password,
         ea_token=ea_token,
-        credential_version=credential.version
-    )
+        credential_version=credential.version,
+    ), 200
